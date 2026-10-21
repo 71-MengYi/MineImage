@@ -38,6 +38,7 @@ from app.graph.commands import (
     SetNodeParamsCommand,
 )
 from app.graph.layout import compute_layout
+from app.graph.node_item import NodeItem
 from app.graph.view import GraphView
 from app.operators.spec import OperatorSpec, ParamSpec, PortSpec, param_defaults
 
@@ -69,6 +70,14 @@ SPLIT_SPEC = OperatorSpec(
     outputs=(PortSpec("left", "左"), PortSpec("right", "右")),
 )
 
+OUTPUT_SPEC = OperatorSpec(
+    id="output.display",
+    name="输出预览",
+    category=("其他", "可视化"),
+    inputs=(PortSpec("data", "任意数据", any_type=True),),
+    outputs=(PortSpec("data", "任意数据", any_type=True),),
+)
+
 
 class FakeRegistry:
     """仅实现 GraphView 需要的 ``spec`` 查询接口。"""
@@ -87,7 +96,7 @@ class FakeRegistry:
 
 
 def make_registry() -> FakeRegistry:
-    return FakeRegistry(BLUR_SPEC, MERGE_SPEC, SPLIT_SPEC)
+    return FakeRegistry(BLUR_SPEC, MERGE_SPEC, SPLIT_SPEC, OUTPUT_SPEC)
 
 
 def setUpModule() -> None:
@@ -606,6 +615,215 @@ class GraphViewTestCase(unittest.TestCase):
         self.undo.undo()
         self.assertFalse(self.graph.connections)
         self.assertFalse(self.view._connections)
+
+    def test_output_drag_to_blank_creates_output_node(self) -> None:
+        """从输出端口拖到空白处：自动创建输出节点并连接，整次一步撤销。"""
+
+        source = self.add_source("源", pos=(0.0, 0.0))
+        self._show_and_focus_node(source)
+        out_port = self.view._nodes[source.id].output_ports["image"]
+        start = self.view.mapFromScene(out_port.center_scene_pos())
+        drop_scene = out_port.center_scene_pos() + QPointF(220.0, 160.0)
+        end = self.view.mapFromScene(drop_scene)
+        self.assertIsNone(self.view.itemAt(end))
+        middle = QPoint((start.x() + end.x()) // 2, (start.y() + end.y()) // 2)
+
+        QTest.mousePress(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            start,
+        )
+        QTest.mouseMove(self.view.viewport(), middle)
+        QTest.mouseMove(self.view.viewport(), end)
+        QTest.mouseRelease(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            end,
+        )
+        if _APP is not None:
+            _APP.processEvents()
+
+        new_nodes = [node for node in self.graph.nodes.values() if node.id != source.id]
+        self.assertEqual(len(new_nodes), 1)
+        node = new_nodes[0]
+        self.assertEqual(node.op_id, "output.display")
+        self.assertEqual(len(self.graph.connections), 1)
+        connection = next(iter(self.graph.connections.values()))
+        self.assertEqual((connection.src_node, connection.src_port), (source.id, "image"))
+        self.assertEqual((connection.dst_node, connection.dst_port), (node.id, "data"))
+        self.assertIn(node.id, self.view._nodes)
+        self.assertEqual(self.view.selected_node_id(), node.id)
+        # 屏幕坐标取整会让落点有不到 1px 的偏差。
+        self.assertAlmostEqual(node.pos[0], drop_scene.x() - NodeItem.WIDTH / 2.0, delta=1.0)
+        self.assertAlmostEqual(node.pos[1], drop_scene.y(), delta=1.0)
+
+        # 创建节点 + 连线属于同一步撤销。
+        self.assertEqual(self.undo.count(), 1)
+        self.undo.undo()
+        self.assertNotIn(node.id, self.graph.nodes)
+        self.assertFalse(self.graph.connections)
+        self.undo.redo()
+        self.assertIn(node.id, self.graph.nodes)
+        self.assertEqual(len(self.graph.connections), 1)
+
+    def test_port_drag_onto_node_body_does_not_create_output_node(self) -> None:
+        """拖到已有节点上（不是输入端口）时不应自动创建输出节点。"""
+
+        first = self.add_node(pos=(0.0, 0.0))
+        second = self.add_node(pos=(500.0, 500.0))
+        self._show_and_focus_node(first)
+        out_port = self.view._nodes[first.id].output_ports["image"]
+        start = self.view.mapFromScene(out_port.center_scene_pos())
+        end_scene = self.view._nodes[second.id].sceneBoundingRect().center()
+        end = self.view.mapFromScene(end_scene)
+        middle = QPoint((start.x() + end.x()) // 2, (start.y() + end.y()) // 2)
+
+        QTest.mousePress(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            start,
+        )
+        QTest.mouseMove(self.view.viewport(), middle)
+        QTest.mouseMove(self.view.viewport(), end)
+        QTest.mouseRelease(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            end,
+        )
+        if _APP is not None:
+            _APP.processEvents()
+
+        self.assertEqual(len(self.graph.nodes), 2)
+        self.assertFalse(self.graph.connections)
+
+    def test_drag_node_near_edge_auto_scrolls_canvas(self) -> None:
+        """拖动节点到视口边缘时，画布应持续朝该方向滚动。"""
+
+        node = self.add_node(pos=(0.0, 0.0))
+        self.view.resize(900, 600)
+        self.view.show()
+        if _APP is not None:
+            _APP.processEvents()
+        item = self.view._nodes[node.id]
+        self.view.centerOn(item.sceneBoundingRect().center())
+        if _APP is not None:
+            _APP.processEvents()
+        hbar = self.view.horizontalScrollBar()
+        h_before = hbar.value()
+        start = self.view.mapFromScene(item.sceneBoundingRect().center())
+        edge = QPoint(self.view.viewport().width() - 4, start.y())
+
+        QTest.mousePress(
+            self.view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, start
+        )
+        QTest.mouseMove(self.view.viewport(), QPoint(start.x() + 20, start.y()))
+        QTest.qWait(120)
+        self.assertTrue(self.view._edge_scroll_timer.isActive())
+        self.assertEqual(hbar.value(), h_before, "鼠标在画布中间时不应自动滚动")
+
+        QTest.mouseMove(self.view.viewport(), edge)
+        QTest.qWait(180)
+        self.assertGreater(hbar.value(), h_before, "鼠标靠近右边缘时应自动向右滚动")
+
+        QTest.mouseRelease(
+            self.view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, edge
+        )
+        if _APP is not None:
+            _APP.processEvents()
+        self.assertFalse(self.view._edge_scroll_timer.isActive())
+        self.assertTrue(self.undo.canUndo())
+
+    def test_drag_beyond_canvas_keeps_auto_scrolling(self) -> None:
+        """鼠标拖出画布范围后，只要左键未松开就继续自动滚动。"""
+
+        node = self.add_node(pos=(0.0, 0.0))
+        self.view.resize(900, 600)
+        self.view.show()
+        if _APP is not None:
+            _APP.processEvents()
+        item = self.view._nodes[node.id]
+        self.view.centerOn(item.sceneBoundingRect().center())
+        if _APP is not None:
+            _APP.processEvents()
+        hbar = self.view.horizontalScrollBar()
+        start = self.view.mapFromScene(item.sceneBoundingRect().center())
+        outside = QPoint(self.view.viewport().width() + 120, start.y())
+
+        QTest.mousePress(
+            self.view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, start
+        )
+        QTest.mouseMove(self.view.viewport(), QPoint(start.x() + 20, start.y()))
+        QTest.mouseMove(self.view.viewport(), outside)
+        h_before = hbar.value()
+        QTest.qWait(200)
+        self.assertGreater(hbar.value(), h_before, "鼠标在画布外仍应继续滚动")
+        self.assertTrue(self.view._edge_scroll_timer.isActive())
+
+        # 回到画布中间（仍在拖动）后不再继续滚动。
+        center = QPoint(self.view.viewport().width() // 2, self.view.viewport().height() // 2)
+        QTest.mouseMove(self.view.viewport(), center)
+        h_paused = hbar.value()
+        QTest.qWait(120)
+        self.assertEqual(hbar.value(), h_paused)
+
+        QTest.mouseRelease(
+            self.view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, center
+        )
+        if _APP is not None:
+            _APP.processEvents()
+        self.assertFalse(self.view._edge_scroll_timer.isActive())
+
+    def test_connection_drag_near_edge_auto_scrolls_canvas(self) -> None:
+        """拖动连线到视口边缘时画布自动滚动，临时连线末端跟随光标。"""
+
+        source = self.add_source("源", pos=(0.0, 0.0))
+        self.view.resize(900, 600)
+        self.view.show()
+        if _APP is not None:
+            _APP.processEvents()
+        item = self.view._nodes[source.id]
+        self.view.centerOn(item.sceneBoundingRect().center())
+        if _APP is not None:
+            _APP.processEvents()
+        out_port = item.output_ports["image"]
+        start = self.view.mapFromScene(out_port.center_scene_pos())
+        hbar = self.view.horizontalScrollBar()
+        h_before = hbar.value()
+        edge = QPoint(self.view.viewport().width() - 4, start.y() + 30)
+
+        QTest.mousePress(
+            self.view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, start
+        )
+        QTest.mouseMove(self.view.viewport(), QPoint(start.x() + 20, start.y() + 30))
+        QTest.mouseMove(self.view.viewport(), edge)
+        QTest.qWait(180)
+        self.assertTrue(self.view._scene.dragging_connection)
+        self.assertGreater(hbar.value(), h_before)
+
+        temp = self.view._scene._temp_connection
+        self.assertIsNotNone(temp)
+        cursor_scene = self.view.mapToScene(edge)
+        self.assertLess(
+            (temp.path().pointAtPercent(1.0) - cursor_scene).manhattanLength(),
+            2.0,
+            "自动滚动后临时连线末端应仍停在光标处",
+        )
+
+        # 松手在源节点上取消连线，避免落点触发“空白处自动建输出节点”。
+        release_pos = self.view.mapFromScene(item.sceneBoundingRect().center())
+        QTest.mouseRelease(
+            self.view.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, release_pos
+        )
+        if _APP is not None:
+            _APP.processEvents()
+        self.assertFalse(self.view._edge_scroll_timer.isActive())
+        self.assertFalse(self.view._scene.dragging_connection)
+        self.assertEqual(len(self.graph.nodes), 1)
+        self.assertFalse(self.graph.connections)
 
     def test_add_operator_at_inserts_on_edge_and_layouts(self) -> None:
         first = self.add_node("test.blur", pos=(0.0, 0.0))

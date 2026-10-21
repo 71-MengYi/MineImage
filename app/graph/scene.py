@@ -167,6 +167,9 @@ class GraphScene(QGraphicsScene):
                     target.node_item.node_id,
                     target.key,
                 )
+            elif source is not None:
+                # 拖到空白处：自动创建一个输出节点并接上，省去手动找输出节点。
+                self._view.drop_connection_on_blank(source, event.scenePos())
             event.accept()
             return
         super().mouseReleaseEvent(event)

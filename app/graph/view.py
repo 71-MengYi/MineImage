@@ -17,12 +17,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QCursor,
     QFont,
     QKeySequence,
+    QMouseEvent,
     QPainter,
     QUndoCommand,
     QUndoStack,
@@ -71,6 +72,14 @@ AUTO_CONNECT_GAP = 48.0
 NODE_CLIPBOARD_KIND = "mineimage/nodes"
 #: 粘贴时相对原位置的级联偏移。
 PASTE_CASCADE = 36.0
+#: 从输出端口拖到空白处时自动创建的输出节点算子。
+OUTPUT_NODE_OP_ID = "output.display"
+#: 拖动节点 / 连线时，鼠标进入视口边缘多少像素内开始自动滚动。
+EDGE_SCROLL_MARGIN = 36.0
+#: 自动滚动每个 tick 的最大像素步长（越靠近边缘越快）。
+EDGE_SCROLL_STEP = 16
+#: 自动滚动定时器间隔（毫秒）。
+EDGE_SCROLL_INTERVAL_MS = 30
 
 
 @dataclass(frozen=True)
@@ -133,6 +142,7 @@ class GraphView(QGraphicsView):
         self._panning = False
         self._pan_last = QPointF()
         self._pan_dragged = False
+        self._last_drag_view_pos = QPointF()
         self._move_start: dict[str, QPointF] = {}
         self._pending_move_target: _MoveTarget | None = None
         self._pending_move_reason: str | None = None
@@ -167,6 +177,11 @@ class GraphView(QGraphicsView):
         self._selection_timer.setInterval(int(SINGLE_CLICK_DELAY_MS))
         self._selection_timer.timeout.connect(self._emit_selection_changed)
         self._scene.selectionChanged.connect(self._on_scene_selection_changed)
+
+        # 拖动节点 / 连线 / 框选时，靠近视口边缘自动滚动画布。
+        self._edge_scroll_timer = QTimer(self)
+        self._edge_scroll_timer.setInterval(EDGE_SCROLL_INTERVAL_MS)
+        self._edge_scroll_timer.timeout.connect(self._auto_scroll_during_drag)
 
         self.graph.node_added.connect(self._on_node_added)
         self.graph.node_removed.connect(self._on_node_removed)
@@ -432,6 +447,68 @@ class GraphView(QGraphicsView):
         self.set_selected_node(node.id)
         self.node_created.emit(node.id)
         self.status_message.emit(f"已添加节点“{spec.name}”")
+        return node.id
+
+    def drop_connection_on_blank(self, source: PortItem, scene_pos: QPointF) -> str | None:
+        """输出端口拖到空白处：自动创建输出节点并连接。"""
+
+        if not self.viewport().rect().contains(self.mapFromScene(scene_pos)):
+            return None
+        if self.item_at_scene(scene_pos) is not None:
+            return None
+        return self.add_output_node_at(source.node_item.node_id, source.key, scene_pos)
+
+    def add_output_node_at(
+        self, src_node_id: str, src_port: str, scene_pos: QPointF
+    ) -> str | None:
+        """在指定场景位置创建输出节点，并接到该输出端口上（整次一步撤销）。"""
+
+        spec = self._registry.spec(OUTPUT_NODE_OP_ID)
+        src_node = self.graph.nodes.get(src_node_id)
+        if spec is None or src_node is None:
+            self.status_message.emit("未找到“输出预览”算子，无法自动创建输出节点")
+            return None
+        if not self._port_exists(src_node, src_port, is_input=False):
+            return None
+        src_spec = self.port_spec(src_node_id, src_port, False)
+        input_key = next(
+            (
+                port.key
+                for port in spec.inputs
+                if src_spec is None or port_types_compatible(src_spec, port)
+            ),
+            None,
+        )
+        if input_key is None:
+            self.status_message.emit("输出节点没有能接收该数据的输入端口，未自动创建")
+            return None
+
+        scene_pos = QPointF(scene_pos)
+        node = NodeModel(
+            id=new_id("n"),
+            op_id=OUTPUT_NODE_OP_ID,
+            title=spec.name,
+            # 输入端口在节点上边缘且单端口居中：让落点正好落在输入端口上。
+            pos=(scene_pos.x() - NodeItem.WIDTH / 2.0, scene_pos.y()),
+            params=param_defaults(spec),
+        )
+        self._undo_stack.beginMacro("添加输出节点并连接")
+        try:
+            self._undo_stack.push(AddNodeCommand(self.graph, node))
+            self._undo_stack.push(
+                AddConnectionCommand(self.graph, src_node_id, src_port, node.id, input_key)
+            )
+        except GraphError as exc:
+            self._undo_stack.endMacro()
+            self.status_message.emit(f"自动创建输出节点失败：{exc}")
+            return None
+        self._undo_stack.endMacro()
+
+        self._update_scene_rect()
+        self._select_nodes([node.id], node.id)
+        self.status_message.emit(
+            f"已添加输出节点并连接：{src_node.display_title()} → {spec.name}"
+        )
         return node.id
 
     def refresh_all(self) -> None:
@@ -1411,6 +1488,8 @@ class GraphView(QGraphicsView):
             event.accept()
             return
         super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._last_drag_view_pos = QPointF(event.position())
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt 接口
         if self._panning:
@@ -1429,6 +1508,12 @@ class GraphView(QGraphicsView):
                 )
             event.accept()
             return
+        self._last_drag_view_pos = QPointF(event.position())
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            if not self._edge_scroll_timer.isActive():
+                self._edge_scroll_timer.start()
+        elif self._edge_scroll_timer.isActive():
+            self._edge_scroll_timer.stop()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt 接口
@@ -1440,11 +1525,14 @@ class GraphView(QGraphicsView):
                 self._scene.clearSelection()
             event.accept()
             return
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._edge_scroll_timer.stop()
         super().mouseReleaseEvent(event)
 
     def _finish_canvas_pan(self) -> None:
         self._panning = False
         self._pan_dragged = False
+        self._edge_scroll_timer.stop()
         self.viewport().unsetCursor()
 
     def _scroll_canvas(self, dx: int, dy: int) -> None:
@@ -1454,6 +1542,57 @@ class GraphView(QGraphicsView):
         vbar = self.verticalScrollBar()
         hbar.setValue(hbar.value() + dx)
         vbar.setValue(vbar.value() + dy)
+
+    # ----------------------------------------------------------- 边缘自动滚动
+    def _auto_scroll_during_drag(self) -> None:
+        """拖动状态下鼠标靠近视口边缘时持续滚动画布。"""
+
+        if self._panning or not (QApplication.mouseButtons() & Qt.MouseButton.LeftButton):
+            self._edge_scroll_timer.stop()
+            return
+        rect = self.viewport().rect()
+        position = self._last_drag_view_pos
+        if rect.isNull():
+            return
+        # 鼠标可以拖出画布范围：只要左键没松开就继续滚动，越往外速度越快
+        # （最多按边缘的满速滚动），避免可用触发区域太小。
+        margin = min(EDGE_SCROLL_MARGIN, max(8.0, min(rect.width(), rect.height()) / 3.0))
+        dx = self._edge_scroll_delta(position.x() - rect.left(), rect.width(), margin)
+        dy = self._edge_scroll_delta(position.y() - rect.top(), rect.height(), margin)
+        if not dx and not dy:
+            return
+        hbar = self.horizontalScrollBar()
+        vbar = self.verticalScrollBar()
+        before = (hbar.value(), vbar.value())
+        self._scroll_canvas(dx, dy)
+        if (hbar.value(), vbar.value()) == before:
+            return
+        # 画布滚动后补发移动事件，让节点 / 拖出中的连线继续跟随光标。
+        self._dispatch_drag_move()
+
+    @staticmethod
+    def _edge_scroll_delta(offset: float, extent: float, margin: float) -> int:
+        """按鼠标离边缘的深度返回滚动像素；负值向左 / 上，正值向右 / 下。"""
+
+        if offset < margin:
+            depth = min(1.0, (margin - offset) / margin)
+            return -max(1, int(round(EDGE_SCROLL_STEP * depth)))
+        if offset > extent - margin:
+            depth = min(1.0, (offset - (extent - margin)) / margin)
+            return max(1, int(round(EDGE_SCROLL_STEP * depth)))
+        return 0
+
+    def _dispatch_drag_move(self) -> None:
+        position = self._last_drag_view_pos
+        event = QMouseEvent(
+            QEvent.Type.MouseMove,
+            position,
+            self.viewport().mapToGlobal(position.toPoint()),
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton,
+            QApplication.keyboardModifiers(),
+        )
+        QApplication.sendEvent(self.viewport(), event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt 接口
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1490,6 +1629,7 @@ class GraphView(QGraphicsView):
             self._clear_target_highlight()
             self._scene.cancel_connection_drag()
             self._scene.clearSelection()
+            self._edge_scroll_timer.stop()
             event.accept()
             return
         super().keyPressEvent(event)
