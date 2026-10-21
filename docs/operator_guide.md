@@ -4,7 +4,8 @@
 
 * 写一个 `.py` 文件放进 `operators/`，重启或按 **F5** 后出现在左侧算子库；
 * 用声明式 `OperatorSpec / PortSpec / ParamSpec` 自动生成参数界面与校验；
-* 支持多输入 / 多输出、数组 dtype 约定、参数联动与预览交互拾取；
+* 支持多输入 / 多输出、类型化端口（图像 / 数值 / 边缘特征 / 轮廓特征 /
+  连通域）、数组 dtype 约定、参数联动与预览交互拾取；
 * 知道常见错误如何定位。
 
 > 本文以 MineImage 0.1.0（Python 3.13 / PySide6 6.10.1 实测）为准。
@@ -81,7 +82,10 @@ OPERATOR = Gain          # 推荐：类
 * 递归扫描 `*.py`；
 * 文件名以 `_` 开头的文件会被跳过（例如 `_template.py`、`_utils.py`）；
 * 路径中带 `__pycache__` 的会被跳过；
-* **同一个模块级 `OPERATOR` 对应一个算子**，没有 `OPERATOR` 只产生 warning。
+* **模块级 `OPERATOR` 注册一个算子**；也可以写 `OPERATORS = (A, B, ...)` 一次注册
+  多个算子（内置目录 `app/operators/builtin/catalog/` 采用这个约定），两者可同时
+  存在，但同一个模块内算子 `id` 不能重复。
+* 没有 `OPERATOR` / `OPERATORS` 只产生 warning。
 * 同一个算子 `id` 后扫描的会覆盖先扫描的（用户目录可以覆盖内置算子），并记录
   warning。覆盖是刻意支持的本地定制手段，不是报错。
 
@@ -94,11 +98,11 @@ OPERATOR = Gain          # 推荐：类
    `operators/滤波/高级/双边.py` → `("滤波", "高级")`；
 3. 仍为空时归入 `("其他",)`。
 
-分类的**第一级**是算子库顶部并排的分类按钮，第二级及以后是折叠分组（可逐级展开 /
-折叠）。一级分类的常用顺序由 `app/core/constants.py` 的 `CATEGORY_ORDER` 决定，
-未知分类按名称排在后面：
+分类的**第一级**是算子库中整行折叠的分类分组（默认收起，可同时展开多个），
+第二级及以后是折叠子分组（可逐级展开 / 折叠）。一级分类的常用顺序由
+`app/core/constants.py` 的 `CATEGORY_ORDER` 决定，未知分类按名称排在后面：
 
-`基础调整 / 滤波与平滑 / 阈值与分割 / 边缘检测 / 形态学 / 几何变换 / 通道与色彩 / 交互处理 / 其他`
+`基础调整 / 滤波与平滑 / 阈值与分割 / 边缘检测 / 形态学 / 几何变换 / 通道与色彩 / 特征与分析 / 交互处理 / 其他`
 
 ### 2.4 刷新与热加载
 
@@ -156,7 +160,7 @@ OperatorSpec(
 
 ---
 
-## 4. `PortSpec` 与图像约定
+## 4. `PortSpec` 与端口类型
 
 ### 4.1 端口字段
 
@@ -167,6 +171,7 @@ PortSpec(
     accepts=("L", "BGR", "BGRA"),
     optional=False,
     description="端口说明",
+    data_type="image",       # 默认值，可省略
 )
 ```
 
@@ -174,9 +179,13 @@ PortSpec(
 | --- | --- | --- |
 | `key` | 必填 | `process()` 的关键字参数名 |
 | `label` | 必填 | 界面显示名 |
-| `accepts` | `("L", "BGR", "BGRA")` | 允许的颜色空间；空元组表示任意 |
+| `data_type` | `DataType.IMAGE` / `"image"` | 端口数据类型，见 4.2；可写枚举或中英文别名 |
+| `accepts` | `("L", "BGR", "BGRA")` | **仅图像端口**：允许的颜色空间；空元组表示任意 |
 | `optional` | `False` | 未连接时是否允许执行 |
 | `description` | `""` | 端口提示 |
+
+`data_type` 是端口的唯一类型约束。未显式声明时端口是图像端口；**非图像端口
+会忽略 `accepts`**（构造 `PortSpec` 时会清空为 `()`），不存在颜色空间校验。
 
 颜色空间只有三种规范值：
 
@@ -192,7 +201,50 @@ PortSpec(
 > `process()` 实际返回的数组颜色空间；请自觉返回与声明一致的结果，否则下游
 > 算子会报“需要 L 图像，当前为 BGR”之类的错误。
 
-### 4.2 `process()` 签名
+### 4.2 端口数据类型
+
+`app/core/data_types.py` 的 `DataType` 是端口类型的唯一枚举来源。`PortSpec`
+构造时会用 `coerce_data_type()` 归一化 `data_type`，因此既可以写枚举，也可以
+写下列中英文别名（大小写不敏感、忽略首尾空白）：
+
+| 类型 | `data_type` 取值 / 常用别名 | 运行时值容器 | 说明 |
+| --- | --- | --- | --- |
+| 图像 | `DataType.IMAGE`、`"image"`、`"img"`、`"图像"`、`"图片"` | `ImageData` | 默认类型；只有图像端口使用 `accepts` |
+| 数值 | `DataType.NUMBER`、`"number"`、`"numeric"`、`"scalar"`、`"数值"`、`"数字"`、`"标量"` | `NumberValue` | 也可直接返回 `int` / `float` |
+| 边缘特征 | `DataType.EDGES`、`"edge"`、`"edges"`、`"线段"`、`"边缘"`、`"边缘特征"` | `EdgesData` | 一组折线 / 线段 |
+| 轮廓特征 | `DataType.CONTOURS`、`"contour"`、`"contours"`、`"轮廓"`、`"轮廓特征"` | `ContoursData` | 一组轮廓点，可带 `hierarchy` |
+| 连通域 | `DataType.COMPONENTS`、`"component"`、`"components"`、`"connected_component"`、`"connected_components"`、`"连通域"`、`"连通分量"` | `ComponentsData` | 也可直接返回二维 int32 标签图 |
+
+别名之外的取值会在声明阶段直接报错：
+
+```text
+不支持的端口数据类型：'xxx'；可选值：图像（image）、数值（number）、……
+```
+
+各类型对应的运行时值：
+
+* **图像 → `ImageData`**：返回 `np.ndarray` 会被自动包装，形状 `(H, W)`
+  推断为 `L`、3 通道为 `BGR`、4 通道为 `BGRA`；`(H, W, 1)` 会去掉单通道维。
+* **数值 → `NumberValue(value, label="数值", unit="")`**：适合单个标量结果，
+  `label` 用于摘要、`unit` 追加单位；也可直接返回 `int` / `float`（`bool` 不
+  是合法数值，会报错）。`NumberValue.summary()` 生成“标签：值 单位”的一行文本。
+* **边缘特征 → `EdgesData(segments, image_size=None, label="边缘线段")`**：
+  `segments` 接受单个 `(N, 2)` 点数组、点数组元组 / 列表，或 `(K, N, 2)`
+  数组；坐标统一取整为 int32。`image_size` 为 `(宽, 高)`，用于预览画布，
+  省略时按点集包围盒推断。提供 `count`、`summary()`、`render_preview()`。
+* **轮廓特征 → `ContoursData(contours, image_size=None, hierarchy=None, label="轮廓")`**：
+  `contours` 的写法与边缘线段一致；`hierarchy` 与 OpenCV `findContours` 的
+  层级数组一致（int32），可选。提供 `count`、`summary()`、`render_preview()`。
+* **连通域 → `ComponentsData(labels, areas=(), centroids=(), image_size=None)`**：
+  `labels` 必须是 `(H, W)` 二维标签图，**0 为背景**；`areas` / `centroids`
+  省略时按标签自动统计。也可以直接返回 int32 二维标签图，框架会用
+  `ComponentsData.from_labels()` 包装。提供 `count`、`total_area`、
+  `largest_area`、`summary()`、`render_preview()`（按调色板渲染彩色标签图）。
+
+这些容器都实现了 `summary()`，可被 `summarize_value()` 转为一行摘要；
+`render_preview()` 可把非图像数据渲染成预览图，纯数值没有预览图。
+
+### 4.3 `process()` 签名
 
 ```python
 def process(self, **kwargs):
@@ -201,7 +253,8 @@ def process(self, **kwargs):
 
 引擎会把**所有声明的输入端口**和**所有参数**用关键字参数传进来：
 
-* 输入按端口 `key` 命名，值类型为 `ImageData` 或 `None`；
+* 输入按端口 `key` 命名，值类型为对应 `data_type` 的容器（`ImageData` /
+  `NumberValue` / `EdgesData` / `ContoursData` / `ComponentsData`）或 `None`；
 * 参数按 `ParamSpec.key` 命名，值已经过 `normalize_params()` 校验/转换；
 * 建议末尾加 `**_` 或显式列出参数，避免以后新增参数时签名不匹配；
 * 建议不要依赖 `self` 上的可变状态：同一个算子实例会被重复调用。
@@ -216,24 +269,43 @@ def validate(self, inputs, params) -> None:
 `validate()` 在输入齐全、颜色空间匹配、参数规范化之后调用，抛
 `OperatorError` 会阻止执行并把消息显示在节点上。
 
-### 4.3 返回值
+### 4.4 返回值
 
-`process()` 可以返回：
+`process()` 的返回值会经 `output_to_dict()` 按**输出端口的 `data_type`** 逐个
+规范化（`coerce_output_value()`），再写入节点结果（`NodeResult.outputs`）。
+可以返回：
 
-1. 单个 `np.ndarray`（或 `ImageData`）：对应**第一个**输出端口；
-2. `{output_key: ndarray | ImageData | None}`：多输出字典；`None` 表示该端口
-   本次没有数据，会被跳过；未知 key 报错；
-3. `list / tuple`：长度必须等于输出端口数量，按声明顺序映射。
+1. 单个值：对应**第一个**输出端口；图像输出可以是 `np.ndarray`（自动包装为
+   `ImageData`）或 `ImageData`；
+2. `{output_key: value}`：多输出字典；`None` 表示该端口本次没有数据，会被跳过；
+   未知 key 报“算子返回了未声明的输出端口：xxx”；
+3. `list / tuple`：仅当声明了多个输出端口时可用，长度必须等于输出端口数量，
+   按声明顺序映射。
+
+每个端口可接受的返回值：
+
+| 端口类型 | 可返回 | 规范化说明 |
+| --- | --- | --- |
+| 图像 | `ImageData` / `np.ndarray` | ndarray 按形状推断颜色空间；`(H,W,1)` 会去掉单通道维 |
+| 数值 | `NumberValue` / `int` / `float` | 裸数值会包装为 `NumberValue`；`bool` 报错 |
+| 边缘特征 | `EdgesData` / `(N,2)` 点集 / 点集列表 | 裸点集按默认标签包装为 `EdgesData` |
+| 轮廓特征 | `ContoursData` / `(N,2)` 点集 / 点集列表 | 需要 `hierarchy` 时请直接构造 `ContoursData` |
+| 连通域 | `ComponentsData` / 二维 int32 标签图 | 标签图 0 为背景，面积 / 质心自动统计 |
 
 注意：
 
 * 至少要有**一个**输出，否则报“算子没有产生任何输出”；
-* 预览显示 `outputs` 字典里的**第一个**输出，多输出时请把主结果放在第一个；
-* 输出 `ImageData` 会按数组形状自动推断颜色空间；若需要保留 alpha，返回 4 通道；
+* 字典建议**显式写出所有输出 key**，不要依赖返回顺序；
+* 返回值无法转换为端口类型时，引擎报 `输出“xxx”的数据无效：<原因>`，例如给
+  数值端口返回字符串、点集形状不是 `(N,2)`、连通域不是二维标签图；
 * 返回 `None` 会被视为错误；要“有条件输出”请用字典并省略 key（下游连接该端口
-  时会报“上游节点未提供输出端口的数据”）。
+  时会报“上游节点未提供输出端口的数据”）；
+* 预览不固定取 `outputs` 的第一个值：引擎优先使用第一个**图像**输出，没有图像
+  输出时用 `render_preview()` 把边缘 / 轮廓 / 连通域渲染成预览图；纯数值节点
+  没有预览图，只显示摘要；
+* 图像输出若没有命名，引擎会自动命名为 `节点标题:端口key`。
 
-### 4.4 dtype 与数值约定
+### 4.5 dtype 与数值约定
 
 内置算子支持 `uint8`、`uint16`、`float32`；框架本身接受
 `uint8/int8/uint16/int16/int32/float16/float32/float64/bool`。建议：
@@ -464,21 +536,64 @@ inputs=(
 
 ### 8.2 多输出
 
-```python
-outputs=(
-    PortSpec("image", "合成图", accepts=("BGR",)),
-    PortSpec("mask", "蒙版", accepts=("L",)),
-)
+多输出节点的每个输出端口都有自己的 `data_type`（图像是默认值，可省略）。下面
+示例同时输出 **图像 + 边缘特征 + 数值**（与内置「边缘特征」算子同类）：
 
-def process(self, image=None, **_):
-    ...
-    return {"image": bgr, "mask": mask}   # 顺序决定预览主图
+```python
+from app.core.data_types import DataType, EdgesData, NumberValue
+from app.operators.spec import Operator, OperatorSpec, PortSpec
+
+
+class EdgeFeature(Operator):
+    spec = OperatorSpec(
+        id="example.edge_feature",
+        name="边缘特征（示意）",
+        category=("特征与分析",),
+        outputs=(
+            PortSpec("edges", "边缘图", accepts=("L",)),
+            PortSpec("lines", "边缘线段", data_type=DataType.EDGES),
+            PortSpec("count", "线段数", data_type=DataType.NUMBER),
+        ),
+    )
+
+    def process(self, image=None, **_):
+        ...
+        return {
+            "edges": edge_map,                                   # ndarray → ImageData
+            "lines": EdgesData(segments, image_size=(width, height)),
+            "count": NumberValue(len(segments), label="线段数", unit="条"),
+        }
 ```
 
+* 输出端口在节点底部**按声明顺序水平排列**，每个端口有独立圆点和标签；
+  圆点颜色按数据类型区分（`DataType.color`）；
+* 每种类型只能连接到**同类型**的输入端口，端口类型不匹配时画布拒绝创建连线；
+* 预览主图取第一个**图像**输出；没有图像输出时，边缘 / 轮廓 / 连通域会由
+  `render_preview()` 渲染成预览图，数值不渲染；
+* 节点摘要按 `端口标签（类型）：摘要` 生成（`NodeResult.summary_lines()` /
+  `summary_text()`），多个输出之间用「；」拼接；
 * 推荐用字典并显式写出所有输出 key；
-* 也可以返回 `(bgr, mask)`，但顺序必须与 `outputs` 完全一致；
+* 也可以返回 `(edge_map, lines, count)`，但顺序必须与 `outputs` 完全一致；
 * `dict` 中值为 `None` 的端口会被省略；
 * 声明了输出但没返回，连接该端口的节点会收到“上游节点未提供输出端口的数据”。
+
+下图是「连通域分析」（图像 + 连通域 + 数值 ×2）与「图像统计」（数值 ×4）
+的多输出端口效果：端口位于节点底部，按声明顺序排列，圆点颜色区分数据类型。
+
+![类型化多输出端口](images/typed-ports.png)
+
+### 8.3 连线类型校验
+
+* 新建连线时，画布用 `port_types_compatible(output_port, input_port)` 判断：
+  两端 `data_type` 必须**完全一致**；
+* 图像端口还会检查颜色空间：双方都声明了 `accepts` 时必须有交集，任一方为空
+  视为不限；实际像素的颜色空间在执行时再由 `validate_inputs()` 校验一次；
+* 不满足时拒绝连线，并显示 `connection_error()` 生成的提示，例如
+  `数据类型不匹配：输出“边缘线段”（边缘特征）不能连接到输入“输入”（图像（BGR））。`；
+* 执行阶段还有兜底校验：`输入“xxx”需要数值数据，当前为图像。`，或
+  `输入“xxx”需要 L/BGR 图像，当前为 BGRA。`；
+* 旧的 `.mi` 工程仍可正常打开，已有连线原样保留；只有**新建 / 重新连线**时才
+  做类型校验。
 
 ---
 
@@ -681,9 +796,13 @@ print(output["mask"].shape, output["mask"].dtype)
 | `参数 xxx 的默认值非法` | 默认值超范围 / enum 不在 choices / ROI 宽高 ≤ 0 |
 | `Illegal instruction`/导入错误 | 算子文件 import 了当前环境不存在的包 |
 | `缺少输入：xxx` | 必填端口没连线 |
+| `数据类型不匹配：输出“xxx”（边缘特征）不能连接到输入“yyy”（数值）。` | 两端 `data_type` 不一致；改用同类型端口，或修正算子的端口声明 |
+| `不支持的端口数据类型：'xxx'` | `PortSpec.data_type` 写错；使用 4.2 表格中的枚举或别名 |
 | `输入“xxx”需要 L 图像，当前为 BGR` | 端口声明与实际颜色空间不匹配 |
+| `输入“xxx”需要数值数据，当前为图像。` | 上游输出类型与输入端口声明不符（常见于旧工程重新连线或手改 spec）；核对两端 `data_type` |
 | `缺少输入图像：...` | 算子内部 `as_array(None)` 的提示；检查必填端口 |
 | `算子没有产生任何输出` | `process` 返回 `None` / 空字典 |
+| `输出“xxx”的数据无效：...` | 返回值无法规范化为端口类型；按 4.4 检查容器参数（点集形状、标签图维度、数值类型等） |
 | `算子返回了未声明的输出端口：xxx` | 字典 key 不在 `outputs` 中 |
 | 参数联动“永远可见” | 表达式用了 `params.xxx` 属性访问，异常被吞；改用裸名或 `params['xxx']` |
 | `找不到算子“xxx”` | 刷新后算子被删除/改名；重新添加节点 |
@@ -708,7 +827,8 @@ print(output["mask"].shape, output["mask"].dtype)
 
 ## 12. 参考：内置算子清单
 
-阅读内置源码是学习写法的最快途径（`app/operators/builtin/`）：
+阅读内置源码是学习写法的最快途径（`app/operators/builtin/`，目录算子见
+`app/operators/builtin/catalog/`）：
 
 | id | 名称 | 一级分类 | 亮点 |
 | --- | --- | --- | --- |
@@ -730,8 +850,14 @@ print(output["mask"].shape, output["mask"].dtype)
 | `geom.flip` | 翻转 | 几何变换 | 枚举轴 |
 | `channel.split` | 通道拆分 | 通道与色彩 | **三输出** |
 | `channel.merge` | 通道合并 | 通道与色彩 | **三输入** |
+| `analyze.image_stats` | 图像统计 | 特征与分析 | **四数值输出**（均值 / 标准差 / 最小 / 最大） |
+| `feature.edges` | 边缘特征 | 特征与分析 | **图像 + 边缘特征 + 数值** 三输出 |
+| `feature.contours` | 轮廓特征 | 特征与分析 | **图像 + 轮廓特征 + 数值** 三输出 |
+| `feature.components` | 连通域分析 | 特征与分析 | **图像 + 连通域 + 数值 ×2** |
+| `feature.draw_contours` | 轮廓绘制 | 特征与分析 | 轮廓特征输入 + 图像输出 |
 | `interactive.roi_crop` | ROI 裁剪 | 交互处理 | roi 参数 + 边界裁剪 |
 | `interactive.draw_line` | 画线标注 | 交互处理 | line + color 参数 |
 
-内置算子共 22 个；模板见 `operators/_template.py`，完整示例见
-`examples/custom_operators/highlight.py`。
+内置算子共 27 个（另有 `app/operators/builtin/catalog/` 下 167 个 OpenCV 5.0 目录算子，
+完整清单见 [opencv_catalog.md](opencv_catalog.md)）；模板见 `operators/_template.py`，
+完整示例见 `examples/custom_operators/highlight.py`。

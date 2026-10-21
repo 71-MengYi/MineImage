@@ -30,7 +30,7 @@ from PySide6.QtWidgets import QGraphicsItem, QStyleOptionGraphicsItem, QWidget
 from app.core.model import NodeModel
 from app.core.types import make_thumbnail
 from app.graph.port_item import PortItem
-from app.operators.spec import OperatorSpec
+from app.operators.spec import OperatorSpec, PortSpec
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型检查
     from app.graph.view import GraphView
@@ -64,6 +64,9 @@ class NodeItem(QGraphicsItem):
 
     # 端口沿边缘分布时距左右边缘的最小留白。
     PORT_MARGIN = 24.0
+    # 端口数量较多时节点自动加宽，避免圆点 / 标签挤在一起。
+    PORT_SPACING = 62.0
+    MAX_WIDTH = 460.0
     # 顶部：节点上边缘 -> 输入端口圆点 -> 输入标签 -> 标题区。
     TOP_LABEL_GAP = 8.0
     LABEL_H = 16.0
@@ -161,25 +164,31 @@ class NodeItem(QGraphicsItem):
             refresh(self)
 
     # ------------------------------------------------------------------ 端口
-    def _port_specs(self) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    def _port_specs(self) -> tuple[list[PortSpec], list[PortSpec]]:
         if self.node.is_source:
-            return [], [("image", "图像")]
+            return [], [PortSpec("image", "图像", description="原始图像输出")]
         if self.spec is None:
             # 未注册的算子仍然允许连线，便于打开旧工程或临时删除算子文件。
-            return [("image", "图像")], [("image", "图像")]
-        inputs = [(port.key, port.label) for port in self.spec.inputs]
-        outputs = [(port.key, port.label) for port in self.spec.outputs]
-        return inputs, outputs
+            return [PortSpec("image", "图像")], [PortSpec("image", "图像")]
+        return list(self.spec.inputs), list(self.spec.outputs)
 
     def _build_ports(self) -> None:
         inputs, outputs = self._port_specs()
-        for index, (key, label) in enumerate(inputs):
-            self._input_ports[key] = PortItem(self, key, label, True, index)
-        for index, (key, label) in enumerate(outputs):
-            self._output_ports[key] = PortItem(self, key, label, False, index)
+        for index, port_spec in enumerate(inputs):
+            self._input_ports[port_spec.key] = PortItem(
+                self, port_spec.key, port_spec.label, True, index, port_spec=port_spec
+            )
+        for index, port_spec in enumerate(outputs):
+            self._output_ports[port_spec.key] = PortItem(
+                self, port_spec.key, port_spec.label, False, index, port_spec=port_spec
+            )
 
     def port_item(self, key: str, is_input: bool) -> PortItem | None:
         return (self._input_ports if is_input else self._output_ports).get(key)
+
+    def port_spec(self, key: str, is_input: bool) -> PortSpec | None:
+        port = self.port_item(key, is_input)
+        return port.port_spec if port is not None else None
 
     @staticmethod
     def port_x(index: int, count: int, width: float | None = None) -> float:
@@ -225,6 +234,9 @@ class NodeItem(QGraphicsItem):
         self.prepareGeometryChange()
         input_count = len(self._input_ports)
         output_count = len(self._output_ports)
+        port_count = max(input_count, output_count, 1)
+        needed = 2.0 * self.PORT_MARGIN + self.PORT_SPACING * (port_count - 1)
+        self._width = min(self.MAX_WIDTH, max(self.WIDTH, needed))
 
         header_top = self.TOP_LABEL_GAP
         if input_count:
@@ -342,11 +354,14 @@ class NodeItem(QGraphicsItem):
         self._thumb_pixmap = None
         if not self._thumbnails_enabled or self._result is None:
             return
-        primary = getattr(self._result, "primary", None)
-        if primary is None:
+        # 图像输出直接显示；轮廓 / 连通域等结构化输出会渲染成预览图。
+        preview = getattr(self._result, "preview_image", None)
+        if preview is None:
+            preview = getattr(self._result, "primary", None)
+        if preview is None:
             return
         try:
-            rgb = make_thumbnail(primary, self._thumbnail_box)
+            rgb = make_thumbnail(preview, self._thumbnail_box)
             self._thumb_pixmap = _rgb_to_pixmap(rgb)
         except Exception:  # noqa: BLE001 - 缩略图失败不能影响画布
             self._thumb_pixmap = None
@@ -359,6 +374,8 @@ class NodeItem(QGraphicsItem):
             lines.append(f"{self.spec.name} · {self.spec.id}")
             if self.spec.description:
                 lines.append(self.spec.description.strip().splitlines()[0])
+            for port in self.spec.outputs:
+                lines.append(f"输出 {port.label}：{port.type_text()}")
         else:
             lines.append(f"未注册的算子：{self.node.op_id}")
         if self._error:

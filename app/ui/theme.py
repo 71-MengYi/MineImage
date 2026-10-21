@@ -178,31 +178,21 @@ QToolButton:hover {{
 QToolButton:pressed {{
     background-color: #e2e8f0;
 }}
-/* 一级分类胶囊：横向并排、可换行；选中态用强调色。 */
-QToolButton#categoryChip {{
-    background-color: #f1f5f9;
-    color: #475569;
-    border: 1px solid {BORDER_SOFT};
-    border-radius: 11px;
-    padding: 4px 9px;
-    min-height: 18px;
-    font-size: 9pt;
-    text-align: left;
+/* 算子库手风琴树：一级分类行由 item 背景色区分，叶子保持简洁。 */
+QTreeWidget#operatorTree {{
+    background: transparent;
+    border: none;
 }}
-QToolButton#categoryChip:hover {{
-    background-color: #e8eef8;
-    color: #1e3a8a;
-    border-color: #cbd5e1;
+QTreeWidget#operatorTree::item {{
+    padding: 1px 6px;
+    border-radius: 6px;
 }}
-QToolButton#categoryChip:checked {{
+QTreeWidget#operatorTree::item:hover {{
+    background-color: #eef4ff;
+}}
+QTreeWidget#operatorTree::item:selected {{
     background-color: {ACCENT_SOFT};
     color: #1e3a8a;
-    border-color: #93c5fd;
-    font-weight: 600;
-}}
-QToolButton#categoryChip:checked:hover {{
-    background-color: #cfe2fd;
-    border-color: #60a5fa;
 }}
 QToolButton#treeAction {{
     background: transparent;
@@ -220,10 +210,6 @@ QToolButton#treeAction:hover {{
 QToolButton#treeAction:disabled {{
     color: {TEXT_FAINT};
     background: transparent;
-}}
-QScrollArea#categoryBar {{
-    background: transparent;
-    border: none;
 }}
 QStatusBar {{
     background-color: #fbfcfe;
@@ -323,9 +309,6 @@ QTreeWidget::item:hover, QTreeView::item:hover {{
 QTreeWidget::item:selected, QTreeView::item:selected {{
     background-color: {ACCENT_SOFT};
     color: #1e3a8a;
-}}
-QTreeWidget::branch {{
-    background: transparent;
 }}
 QTableWidget, QTableView {{
     background-color: {SURFACE};

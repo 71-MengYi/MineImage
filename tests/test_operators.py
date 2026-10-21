@@ -17,6 +17,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.core.constants import CATEGORY_ORDER  # noqa: E402
+from app.core.data_types import (  # noqa: E402
+    ComponentsData,
+    ContoursData,
+    EdgesData,
+    NumberValue,
+    is_data_value,
+)
 from app.core.types import ImageData  # noqa: E402
 from app.operators.loader import OperatorRegistry  # noqa: E402
 from app.operators.spec import (  # noqa: E402
@@ -88,6 +95,11 @@ EXPECTED_CATEGORIES = {
     "geom.flip": "几何变换",
     "channel.split": "通道与色彩",
     "channel.merge": "通道与色彩",
+    "analyze.image_stats": "特征与分析",
+    "feature.edges": "特征与分析",
+    "feature.contours": "特征与分析",
+    "feature.components": "特征与分析",
+    "feature.draw_contours": "特征与分析",
     "interactive.roi_crop": "交互处理",
     "interactive.draw_line": "交互处理",
 }
@@ -128,7 +140,7 @@ class OperatorLibraryTests(unittest.TestCase):
         resolved = {}
         for port in entry.spec.inputs:
             raw = (inputs or {}).get(port.key)
-            resolved[port.key] = raw if isinstance(raw, ImageData) or raw is None else ImageData(raw)
+            resolved[port.key] = raw if raw is None or is_data_value(raw) else ImageData(raw)
         validate_inputs(entry.spec, resolved)
         entry.operator.validate(resolved, normalized)
         kwargs = dict(resolved)
@@ -173,7 +185,7 @@ class OperatorLibraryTests(unittest.TestCase):
             "grayf": grayf(),
         }
         for op_id in EXPECTED_CATEGORIES:
-            if op_id == "channel.merge":
+            if op_id in ("channel.merge", "feature.draw_contours"):
                 continue
             spec = self.registry.spec(op_id)
             for name, array in arrays.items():
@@ -187,6 +199,9 @@ class OperatorLibraryTests(unittest.TestCase):
                 if not np.array_equal(array, before):
                     self.fail(f"{op_id}/{name} 修改了输入图像")
                 for output in outputs.values():
+                    if not isinstance(output, ImageData):
+                        # 数值 / 边缘线段 / 轮廓 / 连通域等结构化输出由各自用例校验。
+                        continue
                     self.assertIn(output.array.ndim, (2, 3))
                     self.assertGreater(output.array.size, 0)
                     self.assertIn(output.color_space, ("L", "BGR", "BGRA"))
@@ -501,6 +516,156 @@ class OperatorLibraryTests(unittest.TestCase):
             self.single("interactive.draw_line", array, {"line": None})
         with self.assertRaises(OperatorError):
             self.single("interactive.draw_line", array, {"line": [5, 5, 5, 5]})
+
+    # ------------------------------------------------------------------ 特征与分析
+    def test_image_stats_outputs_number_values(self) -> None:
+        image = np.arange(0, 120, dtype=np.uint8).reshape(10, 12)
+        outputs = self.run_operator("analyze.image_stats", {"image": image})
+        self.assertEqual(set(outputs), {"mean", "std", "min", "max"})
+        for value in outputs.values():
+            self.assertIsInstance(value, NumberValue)
+        flat = image.reshape(-1).astype(np.float64)
+        self.assertAlmostEqual(outputs["mean"].value, float(flat.mean()))
+        self.assertAlmostEqual(outputs["std"].value, float(flat.std()))
+        self.assertAlmostEqual(outputs["min"].value, float(flat.min()))
+        self.assertAlmostEqual(outputs["max"].value, float(flat.max()))
+        # 彩色图先灰度化，统计的是灰度化后的原始像素值。
+        colored = bgr8()
+        gray = cv2.cvtColor(colored, cv2.COLOR_BGR2GRAY)
+        colored_outputs = self.run_operator("analyze.image_stats", {"image": colored})
+        self.assertAlmostEqual(
+            colored_outputs["mean"].value, float(gray.astype(np.float64).mean())
+        )
+
+    def test_feature_edges_returns_edges_and_hough_lines(self) -> None:
+        image = np.zeros((40, 40), dtype=np.uint8)
+        image[8:32, 8:32] = 255
+        outputs = self.run_operator(
+            "feature.edges",
+            {"image": image},
+            {"low": 50, "high": 150, "threshold": 20, "min_length": 5, "max_gap": 2},
+        )
+        self.assertEqual(set(outputs), {"edges", "lines", "count"})
+        edges = outputs["edges"]
+        self.assertIsInstance(edges, ImageData)
+        self.assertEqual(edges.array.dtype, np.uint8)
+        self.assertTrue(set(np.unique(edges.array)).issubset({0, 255}))
+        self.assertGreater(int(edges.array.sum()), 0)
+        lines = outputs["lines"]
+        self.assertIsInstance(lines, EdgesData)
+        count = outputs["count"]
+        self.assertIsInstance(count, NumberValue)
+        self.assertEqual(count.value, float(len(lines.segments)))
+        self.assertEqual(count.value, float(lines.count))
+        with self.assertRaises(OperatorError):
+            self.run_operator(
+                "feature.edges",
+                {"image": image},
+                {"low": 200, "high": 100},
+            )
+
+    def test_feature_contours_returns_mask_and_contours(self) -> None:
+        image = np.zeros((40, 40), dtype=np.uint8)
+        image[10:30, 10:30] = 255
+        outputs = self.run_operator(
+            "feature.contours",
+            {"image": image},
+            {"threshold": 128, "mode": "binary", "min_area": 10},
+        )
+        self.assertEqual(set(outputs), {"mask", "contours", "count"})
+        mask = outputs["mask"]
+        self.assertIsInstance(mask, ImageData)
+        self.assertEqual(mask.array.dtype, np.uint8)
+        self.assertTrue(set(np.unique(mask.array)).issubset({0, 255}))
+        self.assertGreater(int(mask.array.sum()), 0)
+        contours = outputs["contours"]
+        self.assertIsInstance(contours, ContoursData)
+        self.assertEqual(contours.image_size, (40, 40))
+        count = outputs["count"]
+        self.assertIsInstance(count, NumberValue)
+        self.assertEqual(count.value, float(contours.count))
+        self.assertEqual(len(contours.contours), contours.count)
+        # 最小面积过滤：方块面积 400，大于 1000 的阈值时一个都不保留。
+        filtered = self.run_operator(
+            "feature.contours",
+            {"image": image},
+            {"min_area": 1000},
+        )
+        self.assertEqual(filtered["count"].value, 0.0)
+        self.assertEqual(filtered["contours"].count, 0)
+        self.assertEqual(int(filtered["mask"].array.sum()), 0)
+
+    def test_feature_components_counts_and_filters(self) -> None:
+        image = np.zeros((40, 40), dtype=np.uint8)
+        image[5:15, 5:15] = 255  # 100 像素
+        image[25:30, 25:30] = 255  # 25 像素
+        outputs = self.run_operator(
+            "feature.components",
+            {"image": image},
+            {"threshold": 128, "mode": "binary", "min_area": 10, "connectivity": 8},
+        )
+        self.assertEqual(set(outputs), {"labels", "components", "count", "largest_area"})
+        labels = outputs["labels"]
+        self.assertIsInstance(labels, ImageData)
+        self.assertEqual(labels.color_space, "BGR")
+        self.assertEqual(labels.array.dtype, np.uint8)
+        self.assertEqual(labels.array.shape, (40, 40, 3))
+        components = outputs["components"]
+        self.assertIsInstance(components, ComponentsData)
+        self.assertEqual(components.count, 2)
+        self.assertEqual(components.areas, (100, 25))
+        self.assertIsInstance(outputs["count"], NumberValue)
+        self.assertEqual(outputs["count"].value, 2.0)
+        self.assertIsInstance(outputs["largest_area"], NumberValue)
+        self.assertEqual(outputs["largest_area"].value, 100.0)
+        # min_area 过滤掉 25 像素的小方块。
+        filtered = self.run_operator(
+            "feature.components",
+            {"image": image},
+            {"min_area": 50},
+        )
+        self.assertEqual(filtered["count"].value, 1.0)
+        self.assertEqual(filtered["components"].areas, (100,))
+        self.assertEqual(filtered["largest_area"].value, 100.0)
+        # 没有连通域时也必须能正常返回。
+        empty = self.run_operator(
+            "feature.components",
+            {"image": np.zeros((16, 16), dtype=np.uint8)},
+            {"min_area": 10},
+        )
+        self.assertEqual(empty["count"].value, 0.0)
+        self.assertEqual(empty["largest_area"].value, 0.0)
+        self.assertEqual(empty["components"].count, 0)
+        self.assertEqual(empty["labels"].array.shape, (16, 16, 3))
+
+    def test_feature_draw_contours_consumes_contours_data(self) -> None:
+        image = np.zeros((40, 40), dtype=np.uint8)
+        image[10:30, 10:30] = 255
+        contour_outputs = self.run_operator(
+            "feature.contours",
+            {"image": image},
+            {"min_area": 10},
+        )
+        base = bgr8(height=40, width=40)
+        before = base.copy()
+        outputs = self.run_operator(
+            "feature.draw_contours",
+            {"image": base, "contours": contour_outputs["contours"]},
+            {"color": "#00ff00", "thickness": 2},
+        )
+        self.assertEqual(set(outputs), {"image"})
+        drawn = outputs["image"]
+        self.assertIsInstance(drawn, ImageData)
+        self.assertEqual(drawn.color_space, "BGR")
+        self.assertEqual(drawn.array.shape, base.shape)
+        self.assertFalse(np.array_equal(drawn.array, base))
+        np.testing.assert_array_equal(base, before)
+        # 轮廓输入必须是轮廓特征，直接接数值应在端口校验阶段报错。
+        with self.assertRaises(OperatorError):
+            self.run_operator(
+                "feature.draw_contours",
+                {"image": base, "contours": NumberValue(value=1, label="数值")},
+            )
 
     # ------------------------------------------------------------------ 参数
     def test_unknown_parameter_is_rejected(self) -> None:

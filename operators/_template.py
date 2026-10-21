@@ -2,6 +2,10 @@
 
 模块级 ``OPERATOR`` 必须指向算子类（或实例）。参数规范会自动生成界面控件，
 框架会负责类型/范围/奇数等校验；process() 在后台线程执行，禁止弹窗和阻塞。
+
+端口默认是图像（``data_type=DataType.IMAGE``）；数值 / 边缘特征 / 轮廓特征 /
+连通域端口需要显式声明 ``data_type``。多输出节点在画布底部按声明顺序排列端口，
+返回值建议用 ``{端口key: 值}`` 字典，引擎会按端口类型规范化。
 """
 
 from __future__ import annotations
@@ -9,6 +13,30 @@ from __future__ import annotations
 import cv2
 
 from app.operators.spec import Operator, OperatorError, OperatorSpec, ParamSpec, PortSpec
+
+# ---------------------------------------------------------------------------
+# 多输出 / 类型化输出写法示意（需要时把对应 PortSpec 写进 OperatorSpec.outputs）
+# ---------------------------------------------------------------------------
+# from app.core.data_types import DataType, EdgesData, NumberValue
+#
+#     outputs=(
+#         PortSpec("image", "边缘图", accepts=("L",)),
+#         PortSpec("edges", "边缘线段", data_type=DataType.EDGES),
+#         PortSpec("count", "线段数", data_type=DataType.NUMBER),
+#     )
+#
+#     def process(self, image=None, **_):
+#         ...
+#         return {
+#             "image": edge_map,                                   # ndarray → ImageData
+#             "edges": EdgesData(segments, image_size=(width, height)),
+#             "count": NumberValue(len(segments), label="线段数"),  # 也可直接返回 int
+#         }
+#
+# 返回值会按输出端口类型规范化：裸 int/float → NumberValue；(N,2) 点集 →
+# EdgesData / ContoursData；二维 int32 标签图 → ComponentsData（0 为背景）。
+# 非图像端口不参与颜色空间校验，写在其上的 accepts 会被忽略。
+# ---------------------------------------------------------------------------
 
 
 class MyOperator(Operator):

@@ -30,6 +30,7 @@ from PySide6.QtGui import QImage, QPainter, QUndoStack
 from PySide6.QtWidgets import QApplication, QStyleOptionGraphicsItem
 
 from app.config import AppSettings
+from app.core.data_types import DataType
 from app.core.model import NodeModel, WorkspaceModel, new_id
 from app.core.types import ImageData
 from app.engine.engine import NodeResult
@@ -76,6 +77,21 @@ SPLIT_SPEC = OperatorSpec(
     ),
 )
 
+TYPED_SPEC = OperatorSpec(
+    id="test.typed_outputs",
+    name="类型化输出",
+    category=("特征与分析",),
+    description="测试用类型化多输出算子。",
+    inputs=(PortSpec("image", "图像"),),
+    outputs=(
+        PortSpec("image", "图像"),
+        PortSpec("count", "数量", data_type=DataType.NUMBER),
+        PortSpec("edges", "边缘", data_type=DataType.EDGES),
+        PortSpec("contours", "轮廓", data_type=DataType.CONTOURS),
+        PortSpec("components", "连通域", data_type=DataType.COMPONENTS),
+    ),
+)
+
 
 class _FakeRegistry:
     """仅实现 GraphView 需要的算子查询接口。"""
@@ -112,7 +128,7 @@ class PortGeometryTestCase(unittest.TestCase):
         self.workspace = WorkspaceModel("端口几何测试")
         self.graph = self.workspace.graph
         self.undo = QUndoStack()
-        self.registry = _FakeRegistry(BLUR_SPEC, MERGE_SPEC, SPLIT_SPEC)
+        self.registry = _FakeRegistry(BLUR_SPEC, MERGE_SPEC, SPLIT_SPEC, TYPED_SPEC)
         self.view = GraphView(self.workspace, self.registry, self.undo, self.settings)
         self.view.resize(1000, 700)
 
@@ -200,6 +216,85 @@ class PortGeometryTestCase(unittest.TestCase):
         for index, port in enumerate(item.input_ports.values()):
             expected = item.pos().x() + NodeItem.port_x(index, 3)
             self.assertAlmostEqual(port.center_scene_pos().x(), expected, delta=0.5)
+
+    def test_typed_output_ports_are_colored_and_spread(self) -> None:
+        item = self.add_node("test.typed_outputs")
+        outputs = list(item.output_ports.values())
+        self.assertEqual(len(outputs), 5)
+        expected_types = [
+            DataType.IMAGE,
+            DataType.NUMBER,
+            DataType.EDGES,
+            DataType.CONTOURS,
+            DataType.COMPONENTS,
+        ]
+        self.assertEqual([port.data_type for port in outputs], expected_types)
+        # 多输出时节点自动加宽，端口仍全部位于下边缘且互不重叠。
+        self.assertGreater(item.size().width(), NodeItem.WIDTH)
+        bottom = self._bottom_y(item)
+        for port in outputs:
+            self.assertAlmostEqual(port.center_scene_pos().y(), bottom, delta=0.5)
+        for first, second in zip(outputs, outputs[1:]):
+            self.assertGreaterEqual(
+                second.center_scene_pos().x() - first.center_scene_pos().x(),
+                PortItem.HIT_RADIUS * 2.0,
+            )
+        for first_rect, second_rect in zip(item._output_label_rects, item._output_label_rects[1:]):
+            self.assertLessEqual(first_rect.right(), second_rect.left())
+        # 每种类型使用自己的颜色，悬停提示包含数据类型。
+        colors = [port.type_color().name() for port in outputs]
+        self.assertEqual(len(set(colors)), len(colors))
+        self.assertIn("数值", outputs[1].toolTip())
+        self.assertIn("连通域", outputs[4].toolTip())
+
+    def test_connection_type_compatibility(self) -> None:
+        typed = self.add_node("test.typed_outputs")
+        blur = self.add_node("test.blur", pos=(0.0, 420.0))
+        # 图像 → 图像：类型兼容。
+        self.assertTrue(
+            self.view.ports_compatible(
+                typed.node.id, "image", blur.node.id, "image"
+            )
+        )
+        # 数值 → 图像：不兼容。
+        self.assertFalse(
+            self.view.ports_compatible(
+                typed.node.id, "count", blur.node.id, "image"
+            )
+        )
+        # 源节点的动态图像输出端口也能参与兼容性判断。
+        source = self.workspace.add_source_image(
+            ImageData(np.zeros((8, 8, 3), dtype=np.uint8), "源图"), pos=(0.0, -200.0)
+        )
+        self.assertTrue(
+            self.view.ports_compatible(source.id, "image", blur.node.id, "image")
+        )
+
+    def test_connect_ports_rejects_type_mismatch(self) -> None:
+        typed = self.add_node("test.typed_outputs")
+        blur = self.add_node("test.blur", pos=(0.0, 420.0))
+        messages: list[str] = []
+        self.view.status_message.connect(messages.append)
+        self.view.connect_ports(typed.node.id, "count", blur.node.id, "image")
+        self.assertEqual(dict(self.graph.connections), {})
+        self.assertTrue(
+            any("数据类型不匹配" in message for message in messages),
+            messages,
+        )
+
+    def test_structured_result_uses_rendered_thumbnail(self) -> None:
+        from app.core.data_types import EdgesData
+
+        item = self.add_node("test.typed_outputs")
+        result = NodeResult(
+            item.node.id,
+            {"edges": EdgesData(segments=([0, 0], [20, 20]), image_size=(24, 24))},
+            2.5,
+            item.node.revision,
+        )
+        item.set_result(result)
+        self.assertIsNotNone(item.thumbnail_pixmap)
+        self.assertFalse(item.thumbnail_pixmap.isNull())
 
     # ------------------------------------------------------------ 连线几何
     def test_connection_endpoints_touch_ports(self) -> None:

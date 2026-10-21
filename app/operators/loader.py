@@ -2,10 +2,12 @@
 
 约定
 ----
-扫描目录下的每个 ``*.py`` 文件都是一个算子模块，模块级必须定义 ``OPERATOR``:
+扫描目录下的每个 ``*.py`` 文件都是一个算子模块，模块级定义 ``OPERATOR`` 或
+``OPERATORS``:
 
-* ``OPERATOR = MyOperator``（类，由框架实例化），或
-* ``OPERATOR = MyOperator()``（实例）。
+* ``OPERATOR = MyOperator``（类，由框架实例化），或 ``OPERATOR = MyOperator()``；
+* ``OPERATORS = (A, B, C)``：一个模块打包多个算子，适合按 OpenCV 模块组织目录；
+* 两者可以同时存在，按 ``OPERATOR`` → ``OPERATORS`` 的顺序注册，id 不能重复。
 
 算子 id 全局唯一；``OperatorSpec.category`` 为空时，使用文件相对扫描根目录的
 路径作为分类（支持任意层级）。用户算子目录中重复的 id 会覆盖内置算子，便于
@@ -176,7 +178,7 @@ class OperatorRegistry(QObject):
         )
         for file_path in files:
             try:
-                entry = self._load_file(file_path, root, builtin)
+                entries = self._load_file(file_path, root, builtin)
             except Exception as exc:  # noqa: BLE001 - 单个算子失败不能影响整体扫描
                 self.issues.append(
                     OperatorLoadIssue(
@@ -187,49 +189,67 @@ class OperatorRegistry(QObject):
                     )
                 )
                 continue
-            if entry is None:
-                self.issues.append(
-                    OperatorLoadIssue(file_path, "模块未定义 OPERATOR，已跳过", level="warning")
-                )
-                continue
-            if entry.id in self._entries:
-                previous = self._entries[entry.id]
+            if not entries:
                 self.issues.append(
                     OperatorLoadIssue(
-                        file_path,
-                        f"算子 id “{entry.id}” 重复，已覆盖 {previous.path}",
-                        level="warning",
+                        file_path, "模块未定义 OPERATOR 或 OPERATORS，已跳过", level="warning"
                     )
                 )
-            self._entries[entry.id] = entry
+                continue
+            for entry in entries:
+                if entry.id in self._entries:
+                    previous = self._entries[entry.id]
+                    self.issues.append(
+                        OperatorLoadIssue(
+                            file_path,
+                            f"算子 id “{entry.id}” 重复，已覆盖 {previous.path}",
+                            level="warning",
+                        )
+                    )
+                self._entries[entry.id] = entry
 
-    def _load_file(self, file_path: Path, root: Path, builtin: bool) -> OperatorEntry | None:
+    def _load_file(self, file_path: Path, root: Path, builtin: bool) -> list[OperatorEntry]:
         module = self._import_module(file_path)
-        if not hasattr(module, "OPERATOR"):
-            return None
-        raw = getattr(module, "OPERATOR")
-        operator: Operator
-        if isinstance(raw, type):
-            if not issubclass(raw, Operator):
-                raise TypeError(f"OPERATOR 类必须继承 Operator，实际为 {raw!r}")
-            operator = raw()
-        elif isinstance(raw, Operator):
-            operator = raw
-        else:
-            raise TypeError("OPERATOR 必须是 Operator 的子类或实例")
+        raw_items: list[object] = []
+        if hasattr(module, "OPERATOR"):
+            raw_items.append(getattr(module, "OPERATOR"))
+        if hasattr(module, "OPERATORS"):
+            bundled = getattr(module, "OPERATORS")
+            if not isinstance(bundled, (list, tuple)):
+                raise TypeError("OPERATORS 必须是算子类/实例的列表或元组")
+            raw_items.extend(bundled)
+        if not raw_items:
+            return []
 
-        spec = getattr(type(operator), "spec", None)
-        if not isinstance(spec, OperatorSpec):
-            raise TypeError("算子类缺少 OperatorSpec 类型的 spec 属性")
-        if not spec.category:
-            relative = file_path.relative_to(root)
-            category = relative.parent.parts
-            spec = replace(spec, category=category or ("其他",))
-        if not spec.category:
-            spec = replace(spec, category=("其他",))
-        if operator.__class__.process is Operator.process:
-            raise TypeError("算子必须实现 process()")
-        return OperatorEntry(operator=operator, spec=spec, path=file_path, builtin=builtin)
+        entries: list[OperatorEntry] = []
+        seen: set[str] = set()
+        for raw in raw_items:
+            operator: Operator
+            if isinstance(raw, type):
+                if not issubclass(raw, Operator):
+                    raise TypeError(f"OPERATOR 类必须继承 Operator，实际为 {raw!r}")
+                operator = raw()
+            elif isinstance(raw, Operator):
+                operator = raw
+            else:
+                raise TypeError("OPERATOR / OPERATORS 的元素必须是 Operator 的子类或实例")
+
+            spec = getattr(type(operator), "spec", None)
+            if not isinstance(spec, OperatorSpec):
+                raise TypeError("算子类缺少 OperatorSpec 类型的 spec 属性")
+            if not spec.category:
+                relative = file_path.relative_to(root)
+                category = relative.parent.parts
+                spec = replace(spec, category=category or ("其他",))
+            if not spec.category:
+                spec = replace(spec, category=("其他",))
+            if operator.__class__.process is Operator.process:
+                raise TypeError("算子必须实现 process()")
+            if spec.id in seen:
+                raise TypeError(f"模块内算子 id 重复：{spec.id}")
+            seen.add(spec.id)
+            entries.append(OperatorEntry(operator=operator, spec=spec, path=file_path, builtin=builtin))
+        return entries
 
     @staticmethod
     def _import_module(file_path: Path) -> ModuleType:

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import QFrame, QGraphicsItem, QGraphicsView, QInputDialog
 
 from app.config import AppSettings
 from app.core.constants import MIME_IMAGE_PATHS, MIME_OPERATOR, SINGLE_CLICK_DELAY_MS
+from app.core.data_types import DataType
 from app.core.model import ConnectionModel, GraphError, GraphModel, NodeModel, WorkspaceModel, new_id
 from app.graph.commands import (
     AddConnectionCommand,
@@ -38,7 +39,7 @@ from app.graph.node_item import NodeItem
 from app.graph.port_item import PortItem
 from app.graph.scene import GraphScene
 from app.operators.loader import OperatorRegistry
-from app.operators.spec import OperatorSpec, param_defaults
+from app.operators.spec import OperatorSpec, PortSpec, connection_error, param_defaults, port_types_compatible
 
 _IMAGE_SUFFIXES = {
     ".png",
@@ -217,7 +218,11 @@ class GraphView(QGraphicsView):
         target = self._drop_target_at(scene_pos, spec)
         if target is not None:
             if target.kind == "edge" and target.connection is not None:
-                if spec.inputs and spec.outputs:
+                if (
+                    spec.inputs
+                    and spec.outputs
+                    and self._insertion_ports(spec, target.connection) is not None
+                ):
                     node_id = self._insert_node_on_edge(target.connection, op_id, spec, scene_pos)
                     if node_id is not None:
                         return node_id
@@ -655,6 +660,94 @@ class GraphView(QGraphicsView):
             return None
         return node_item.port_item(key, is_input)
 
+    def port_spec(self, node_id: str, key: str, is_input: bool) -> PortSpec | None:
+        """查询端口声明；源节点动态生成图像输出端口，未注册算子返回 ``None``。"""
+
+        node = self.graph.nodes.get(node_id)
+        if node is None:
+            return None
+        if node.is_source:
+            if not is_input and key == "image":
+                return PortSpec("image", "图像", description="原始图像输出")
+            return None
+        spec = self._registry.spec(node.op_id)
+        if spec is None:
+            return None
+        ports = spec.inputs if is_input else spec.outputs
+        for port in ports:
+            if port.key == key:
+                return port
+        return None
+
+    def port_data_type(self, node_id: str, key: str, is_input: bool) -> DataType | None:
+        port = self.port_spec(node_id, key, is_input)
+        return port.data_type if port is not None else None
+
+    def ports_compatible(
+        self,
+        src_node_id: str,
+        src_port: str,
+        dst_node_id: str,
+        dst_port: str,
+    ) -> bool:
+        """输出端口能否连接到输入端口；未知算子 / 源节点保持宽松兼容。"""
+
+        output_spec = self.port_spec(src_node_id, src_port, False)
+        input_spec = self.port_spec(dst_node_id, dst_port, True)
+        if output_spec is None or input_spec is None:
+            return True
+        return port_types_compatible(output_spec, input_spec)
+
+    def _compatible_output_key(self, spec: OperatorSpec, target: PortItem) -> str | None:
+        target_spec = self.port_spec(target.node_item.node_id, target.key, True)
+        for port in spec.outputs:
+            if port.data_type is not target.data_type:
+                continue
+            if target_spec is not None and not port_types_compatible(port, target_spec):
+                continue
+            return port.key
+        return None
+
+    def _compatible_input_key(self, spec: OperatorSpec, target: PortItem) -> str | None:
+        target_spec = self.port_spec(target.node_item.node_id, target.key, False)
+        for port in spec.inputs:
+            if port.data_type is not target.data_type:
+                continue
+            if target_spec is not None and not port_types_compatible(target_spec, port):
+                continue
+            return port.key
+        return None
+
+    def _insertion_ports(
+        self, spec: OperatorSpec, connection: ConnectionModel
+    ) -> tuple[str, str] | None:
+        """选择在连线上插入节点时用于上下游连接的输入 / 输出端口 key。
+
+        原连线两端的数据类型必须都能在待插入算子上找到同类型端口；未知类型时
+        退化为第一个端口，兼容旧工程与未注册算子。
+        """
+
+        source_type = self.port_data_type(connection.src_node, connection.src_port, False)
+        target_type = self.port_data_type(connection.dst_node, connection.dst_port, True)
+        source_spec = self.port_spec(connection.src_node, connection.src_port, False)
+        target_spec = self.port_spec(connection.dst_node, connection.dst_port, True)
+
+        def input_ok(port: PortSpec) -> bool:
+            if source_type is not None and port.data_type is not source_type:
+                return False
+            return source_spec is None or port_types_compatible(source_spec, port)
+
+        def output_ok(port: PortSpec) -> bool:
+            if target_type is not None and port.data_type is not target_type:
+                return False
+            return target_spec is None or port_types_compatible(port, target_spec)
+
+        input_key = next((port.key for port in spec.inputs if input_ok(port)), None)
+        output_key = next((port.key for port in spec.outputs if output_ok(port)), None)
+        if input_key is None or output_key is None:
+            return None
+        return input_key, output_key
+
     def connect_ports(self, src_node_id: str, src_port: str, dst_node_id: str, dst_port: str) -> None:
         src_node = self.graph.nodes.get(src_node_id)
         dst_node = self.graph.nodes.get(dst_node_id)
@@ -668,6 +761,15 @@ class GraphView(QGraphicsView):
             return
         if not self._port_exists(dst_node, dst_port, is_input=True):
             self.status_message.emit(f"输入端口不存在：{dst_port}")
+            return
+        output_spec = self.port_spec(src_node_id, src_port, False)
+        input_spec = self.port_spec(dst_node_id, dst_port, True)
+        if (
+            output_spec is not None
+            and input_spec is not None
+            and not port_types_compatible(output_spec, input_spec)
+        ):
+            self.status_message.emit(connection_error(output_spec, input_spec))
             return
         existing = self.graph.input_connection(dst_node_id, dst_port)
         if existing is not None and existing.src_node == src_node_id and existing.src_port == src_port:
@@ -730,6 +832,8 @@ class GraphView(QGraphicsView):
             best_distance = SNAP_RADIUS
             if spec.outputs:
                 for port in self.port_items(is_input=True):
+                    if self._compatible_output_key(spec, port) is None:
+                        continue
                     distance = self._port_distance(port.center_scene_pos(), scene_pos)
                     if distance <= best_distance:
                         best_port = port
@@ -737,6 +841,8 @@ class GraphView(QGraphicsView):
                         best_distance = distance
             if spec.inputs:
                 for port in self.port_items(is_input=False):
+                    if self._compatible_input_key(spec, port) is None:
+                        continue
                     distance = self._port_distance(port.center_scene_pos(), scene_pos)
                     if distance <= best_distance:
                         best_port = port
@@ -763,14 +869,22 @@ class GraphView(QGraphicsView):
         if target is None:
             return None
         if target.kind == "edge":
-            if spec is None or not spec.inputs or not spec.outputs:
+            if spec is None or target.connection is None:
+                return None
+            if self._insertion_ports(spec, target.connection) is None:
                 return None
             return target
-        if target.kind != "input" or target.port is None:
+        if target.kind not in ("input", "output") or target.port is None:
             return target
         port = target.port
-        if self.graph.input_connection(port.node_item.node_id, port.key) is not None:
-            return None
+        if target.kind == "input":
+            if spec is not None and self._compatible_output_key(spec, port) is None:
+                return None
+            if self.graph.input_connection(port.node_item.node_id, port.key) is not None:
+                return None
+        else:
+            if spec is not None and self._compatible_input_key(spec, port) is None:
+                return None
         return target
 
     def _add_operator_with_port_connection(
@@ -793,7 +907,12 @@ class GraphView(QGraphicsView):
                     f"输入端口“{port.label}”已有连线，未自动建立连接"
                 )
                 return None
-            port_key = spec.outputs[0].key
+            port_key = self._compatible_output_key(spec, port)
+            if port_key is None:
+                self.status_message.emit(
+                    f"算子“{spec.name}”没有与输入端口“{port.label}”相同类型（{port.data_type.label}）的输出"
+                )
+                return None
             node_is_input = False
             rough = QPointF(anchor.x() - NodeItem.WIDTH / 2.0, anchor.y() - AUTO_CONNECT_GAP - 80.0)
             desired = QPointF(anchor.x(), anchor.y() - AUTO_CONNECT_GAP)
@@ -801,7 +920,12 @@ class GraphView(QGraphicsView):
         else:
             if not spec.inputs:
                 return None
-            port_key = spec.inputs[0].key
+            port_key = self._compatible_input_key(spec, port)
+            if port_key is None:
+                self.status_message.emit(
+                    f"算子“{spec.name}”没有与输出端口“{port.label}”相同类型（{port.data_type.label}）的输入"
+                )
+                return None
             node_is_input = True
             rough = QPointF(anchor.x() - NodeItem.WIDTH / 2.0, anchor.y() + AUTO_CONNECT_GAP)
             desired = QPointF(anchor.x(), anchor.y() + AUTO_CONNECT_GAP)
@@ -877,6 +1001,12 @@ class GraphView(QGraphicsView):
         connection = self.graph.connections.get(edge.connection_id)
         if connection is None:
             return None
+        ports = self._insertion_ports(spec, connection)
+        if ports is None:
+            self.status_message.emit(
+                f"算子“{spec.name}”的输入 / 输出数据类型无法接续这条连线，未插入节点"
+            )
+            return None
         node = NodeModel(
             id=new_id("n"),
             op_id=op_id,
@@ -888,8 +1018,8 @@ class GraphView(QGraphicsView):
             self.graph,
             node,
             connection,
-            spec.inputs[0].key,
-            spec.outputs[0].key,
+            ports[0],
+            ports[1],
         )
         # 插入节点与随后的自动布局必须同属一步撤销，否则第一次 Ctrl+Z 只会
         # 回退布局、节点仍留在画布上，容易让用户误以为撤销失效。

@@ -543,59 +543,108 @@ class OperatorLibraryTests(unittest.TestCase):
         return result
 
     def _all_visible_ids(self) -> set[str]:
-        result: set[str] = set()
-        for name in self.library.category_names():
-            tree = self.library.category_tree(name)
-            if tree is not None:
-                result |= self._visible_leaf_ids(tree)
-        return result
+        tree = self.library.current_tree()
+        return self._visible_leaf_ids(tree) if tree is not None else set()
 
-    def test_category_chips_side_by_side(self) -> None:
+    def test_accordion_categories_default_collapsed(self) -> None:
         self.assertEqual(self.library.category_names(), ["基础调整", "滤波与平滑"])
-        self.assertEqual(self.library.current_category(), "基础调整")
+        self.assertIsNone(self.library.current_category())
         self.assertEqual(self.library.operator_count(), 3)
         self.assertEqual(self.library.load_error_count(), 0)
         self.assertIn("3", self.library.count_label.text())
+        self.assertIn("全部折叠", self.library.category_label.text())
 
-        buttons = self.library.category_buttons()
-        self.assertEqual(len(buttons), 2)
-        self.assertTrue(all(button.isCheckable() for button in buttons))
-        self.assertIn("基础调整", buttons[0].text())
-        self.assertIn("2", buttons[0].text())
-        self.assertIn("滤波与平滑", buttons[1].text())
-        self.assertIn("1", buttons[1].text())
-        self.assertTrue(buttons[0].isChecked())
-        self.assertFalse(buttons[1].isChecked())
-
-        # 2 列网格：两个分类按钮位于同一行、相邻两列。
-        grid = self.library._category_grid
-        positions = [grid.getItemPosition(grid.indexOf(button)) for button in buttons]
-        self.assertEqual([position[1] for position in positions], [0, 1])
-        self.assertEqual(positions[0][0], positions[1][0])
-
-        buttons[1].click()
-        QApplication.processEvents()
-        self.assertEqual(self.library.current_category(), "滤波与平滑")
-        self.assertTrue(buttons[1].isChecked())
-        self.assertFalse(buttons[0].isChecked())
-        self.assertIsNotNone(self.library.current_tree())
-
-        self.assertTrue(self.library.select_category("基础调整"))
-        self.assertEqual(self.library.current_category(), "基础调整")
-        self.assertTrue(buttons[0].isChecked())
-        self.assertFalse(self.library.select_category("不存在的分类"))
-        self.assertEqual(self.library.current_category(), "基础调整")
-
-    def test_nested_groups_default_collapsed(self) -> None:
         tree = self.library.current_tree()
         self.assertIsNotNone(tree)
         assert tree is not None
-        self.assertEqual(tree.topLevelItemCount(), 1)
-        top = tree.topLevelItem(0)
-        self.assertEqual(top.text(0), "颜色")
-        self.assertTrue(top.isExpanded())
-        self.assertTrue(top.font(0).bold())
-        self.assertEqual(self._visible_leaf_ids(tree), {"test.contrast"})
+        self.assertEqual(tree.topLevelItemCount(), 2)
+        items = self.library.category_items()
+        self.assertEqual([item.text(0) for item in items], ["基础调整", "滤波与平滑"])
+        self.assertEqual([item.text(1) for item in items], ["2", "1"])
+        for item in items:
+            self.assertFalse(item.isExpanded())
+            self.assertTrue(item.font(0).bold())
+        self.assertEqual(self._visible_leaf_ids(tree), set())
+
+    def test_click_category_expands_in_place_and_multi_open(self) -> None:
+        tree = self.library.current_tree()
+        self.assertIsNotNone(tree)
+        assert tree is not None
+        base, filter_category = self.library.category_items()
+
+        tree.itemClicked.emit(base, 0)
+        QApplication.processEvents()
+        self.assertTrue(base.isExpanded())
+        self.assertFalse(filter_category.isExpanded())
+        self.assertEqual(self.library.current_category(), "基础调整")
+        # 点击一级分类会直接展开到算子叶子，而不只是显示分组标题。
+        self.assertEqual(
+            self._visible_leaf_ids(tree), {"test.brightness", "test.contrast"}
+        )
+        color_group = base.child(0)
+        self.assertEqual(color_group.text(0), "颜色")
+        self.assertTrue(color_group.isExpanded())
+
+        tree.itemClicked.emit(filter_category, 0)
+        QApplication.processEvents()
+        self.assertTrue(base.isExpanded())
+        self.assertTrue(filter_category.isExpanded())
+        self.assertEqual(self.library.current_category(), "滤波与平滑")
+        # 多开：两个一级分类可以同时展开。
+        self.assertEqual(
+            self._visible_leaf_ids(tree),
+            {"test.brightness", "test.contrast", "test.blur"},
+        )
+
+        # 收起其中一个，不影响另一个。
+        tree.itemClicked.emit(base, 0)
+        QApplication.processEvents()
+        self.assertFalse(base.isExpanded())
+        self.assertTrue(filter_category.isExpanded())
+        self.assertEqual(self._visible_leaf_ids(tree), {"test.blur"})
+
+    def test_real_mouse_click_category_row_expands(self) -> None:
+        """真实 QTest 点击分类行，覆盖 itemClicked → 原地展开事件链。"""
+
+        tree = self.library.current_tree()
+        self.assertIsNotNone(tree)
+        assert tree is not None
+        item = self.library.category_items()[0]
+        tree.scrollToItem(item)
+        QApplication.processEvents()
+        rect = tree.visualItemRect(item)
+        QTest.mouseClick(
+            tree.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            rect.center(),
+        )
+        QApplication.processEvents()
+        self.assertTrue(item.isExpanded())
+        self.assertEqual(
+            self._visible_leaf_ids(tree), {"test.brightness", "test.contrast"}
+        )
+
+        # 与第一次点击隔开，避免被 Qt 识别成双击。
+        QTest.qWait(300)
+        QTest.mouseClick(
+            tree.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            tree.visualItemRect(item).center(),
+        )
+        QApplication.processEvents()
+        self.assertFalse(item.isExpanded())
+        self.assertEqual(self._visible_leaf_ids(tree), set())
+
+    def test_nested_groups_can_collapse_independently(self) -> None:
+        tree = self.library.current_tree()
+        self.assertIsNotNone(tree)
+        assert tree is not None
+        self.assertTrue(self.library.select_category("基础调整"))
+        base = self.library.category_items()[0]
+        color_group = base.child(0)
+        self.assertTrue(color_group.isExpanded())
 
         brightness = self._find_leaf(tree, "test.brightness")
         contrast = self._find_leaf(tree, "test.contrast")
@@ -605,36 +654,48 @@ class OperatorLibraryTests(unittest.TestCase):
         # 三级分类：叶子 -> 亮度(二级) -> 颜色(一级)
         self.assertEqual(brightness.parent().text(0), "亮度")
         self.assertEqual(brightness.parent().parent().text(0), "颜色")
-        self.assertFalse(brightness.parent().isExpanded())
+        self.assertTrue(brightness.parent().isExpanded())
         self.assertEqual(contrast.parent().text(0), "颜色")
-        self.assertIsNone(contrast.parent().parent())
         self.assertIn("调整图像亮度", brightness.toolTip(0))
         self.assertTrue(brightness.flags() & Qt.ItemFlag.ItemIsDragEnabled)
 
-        self.assertTrue(self.library.select_category("滤波与平滑"))
-        blur_tree = self.library.current_tree()
-        self.assertIsNotNone(blur_tree)
-        assert blur_tree is not None
-        self.assertEqual(self._visible_leaf_ids(blur_tree), {"test.blur"})
+        # 单独折叠二级分组：只影响该分组，不影响一级分类。
+        brightness.parent().setExpanded(False)
+        QApplication.processEvents()
+        self.assertEqual(self._visible_leaf_ids(tree), {"test.contrast"})
+        self.assertTrue(base.isExpanded())
+        # 单独折叠一级分组。
+        color_group.setExpanded(False)
+        QApplication.processEvents()
+        self.assertEqual(self._visible_leaf_ids(tree), set())
+        # 点击分组行也可以原地展开。
+        tree.itemClicked.emit(color_group, 0)
+        QApplication.processEvents()
+        self.assertTrue(color_group.isExpanded())
+        self.assertFalse(brightness.parent().isExpanded())
+        self.assertEqual(self._visible_leaf_ids(tree), {"test.contrast"})
 
     def test_expand_all_and_collapse_all(self) -> None:
         tree = self.library.current_tree()
         self.assertIsNotNone(tree)
         assert tree is not None
-        self.assertEqual(self._visible_leaf_ids(tree), {"test.contrast"})
+        self.assertEqual(self._visible_leaf_ids(tree), set())
 
         self.library.expand_all_button.click()
         self.assertEqual(
-            self._visible_leaf_ids(tree), {"test.brightness", "test.contrast"}
+            self._visible_leaf_ids(tree),
+            {"test.brightness", "test.contrast", "test.blur"},
         )
+        self.assertIn("全部展开", self.library.category_label.text())
 
         self.library.collapse_all_button.click()
         self.assertEqual(self._visible_leaf_ids(tree), set())
+        self.assertIn("全部折叠", self.library.category_label.text())
 
         self.library.expand_all_button.click()
         self.assertIn("test.brightness", self._visible_leaf_ids(tree))
 
-    def test_search_across_categories_and_auto_switch(self) -> None:
+    def test_search_across_categories_and_auto_expand(self) -> None:
         self.library.search_edit.setText("高斯模糊")
         QApplication.processEvents()
         self.assertEqual(self.library.current_category(), "滤波与平滑")
@@ -658,17 +719,22 @@ class OperatorLibraryTests(unittest.TestCase):
         QApplication.processEvents()
         self.assertIn("匹配 0 个", self.library.count_label.text())
         self.assertEqual(self._all_visible_ids(), set())
+        self.assertEqual(
+            self.library._content_stack.currentWidget(),
+            self.library.filter_empty_page,
+        )
 
         self.library.search_edit.clear()
         QApplication.processEvents()
         self.assertNotIn("匹配", self.library.count_label.text())
-        self.assertIn("test.blur", self._all_visible_ids())
-        # 清空搜索后回到默认折叠状态（三级叶子再次隐藏）。
-        self.assertTrue(self.library.select_category("基础调整"))
-        tree = self.library.current_tree()
-        self.assertIsNotNone(tree)
-        assert tree is not None
-        self.assertEqual(self._visible_leaf_ids(tree), {"test.contrast"})
+        self.assertIn("全部折叠", self.library.category_label.text())
+        self.assertEqual(self._all_visible_ids(), set())
+        # 清空搜索后再次点击分类可直接展开算子。
+        tree.itemClicked.emit(self.library.category_items()[0], 0)
+        QApplication.processEvents()
+        self.assertEqual(
+            self._all_visible_ids(), {"test.brightness", "test.contrast"}
+        )
 
     def test_refresh_button_emits(self) -> None:
         spy = QSignalSpy(self.library.refresh_requested)

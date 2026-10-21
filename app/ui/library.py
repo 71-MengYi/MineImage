@@ -1,11 +1,9 @@
-"""左侧算子库：并排一级分类、嵌套折叠树、拖拽与说明浮层。
+"""左侧算子库：行式一级分类手风琴、多级折叠树、拖拽与说明浮层。
 
-* 一级分类用横向并排的胶囊按钮（``#categoryChip``，2 列网格自动换行）展示，
-  当前分类高亮，按钮文字水平且带算子数量；
-* 更深层分类用 ``QTreeWidget`` 分组（支持任意层级），默认只展开一级分组，
-  二级及更深分组默认折叠；当前分类提供“展开全部 / 折叠全部”；
-* 搜索跨所有分类过滤，当前分类无命中时自动切换到第一个有命中的分类，
-  并自动展开命中项；
+* 一级分类是整行可折叠标题（左侧箭头 + 分类名 + 右侧数量），默认全部折叠；
+* 点击某个一级分类就在该行下方原地展开，支持同时展开多个分类，展开后下方
+  分类标题整体下移；二级、三级分类仍是折叠分组，可逐级展开 / 折叠；
+* 搜索跨所有分类过滤，命中项自动展开并在列表中定位；
 * 将算子叶子拖到画布时使用 :data:`app.core.constants.MIME_OPERATOR`，
   payload 为 ``{"id": op_id}`` 的 UTF-8 JSON；
 * 单击算子叶子在库底部弹出说明浮层（名称 / 分类 / 描述 / 参数 / 端口），
@@ -17,8 +15,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
+    QBrush,
     QColor,
     QDrag,
     QFont,
@@ -31,16 +30,16 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QButtonGroup,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
     QScrollArea,
-    QSizePolicy,
     QStackedWidget,
+    QStyle,
+    QStyleOptionViewItem,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -118,30 +117,79 @@ def _port_text(ports, label: str) -> str:
     items = []
     for port in ports:
         name = f"{port.label}（{port.key}）"
-        accepts = f"[{port.accept_text()}]"
+        detail = port.type_text()
         optional = " · 可选" if port.optional else ""
-        items.append(f"{name} {accepts}{optional}")
+        items.append(f"{name} · {detail}{optional}")
     return f"{label}：" + "；".join(items)
 
 
+class _CategoryRowDelegate(QStyledItemDelegate):
+    """一级分类行的整行背景：展开浅蓝、收起浅灰，左侧强调条。"""
+
+    def __init__(self, tree: QTreeWidget) -> None:
+        super().__init__(tree)
+        self._tree = tree
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # noqa: N802
+        item = self._tree.itemFromIndex(index)
+        is_category = item is not None and item.parent() is None
+        if is_category:
+            expanded = item.isExpanded()
+            painter.save()
+            # 分支箭头区域由 QTreeView 绘制，背景只铺 item 文本区，避免盖住箭头。
+            painter.fillRect(
+                option.rect,
+                QColor("#eaf2ff") if expanded else QColor("#f8fafc"),
+            )
+            painter.restore()
+            # 一级分类使用整行底色表达选中 / 展开，不需要 Fusion 的虚线焦点框。
+            option.state = option.state & ~QStyle.StateFlag.State_HasFocus
+        super().paint(painter, option, index)
+        if is_category and item.isExpanded() and index.column() == 0:
+            painter.save()
+            painter.fillRect(
+                QRectF(
+                    0.0,
+                    float(option.rect.top() + 4),
+                    3.0,
+                    float(max(0, option.rect.height() - 8)),
+                ),
+                QColor("#2563eb"),
+            )
+            painter.restore()
+
+
 class _OperatorTree(QTreeWidget):
-    """只允许拖拽算子叶子节点的树。"""
+    """算子库主树：一级分类为整行折叠标题，叶子可拖拽。
+
+    * 第一列：分类 / 分组 / 算子名；第二列：分类或分组的算子数量；
+    * 非叶子条目单击整行即可原地展开 / 折叠（箭头仍由 Qt 原生处理）；
+    * 只有算子叶子允许拖拽，payload 为 ``MIME_OPERATOR``。
+    """
 
     def __init__(self, library: "OperatorLibrary", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._library = library
+        self.setObjectName("operatorTree")
         self.setHeaderHidden(True)
+        self.setColumnCount(2)
         self.setRootIsDecorated(True)
-        self.setIndentation(14)
-        self.setAnimated(False)
-        self.setUniformRowHeights(True)
-        self.setExpandsOnDoubleClick(True)
+        self.setIndentation(18)
+        self.setAnimated(True)
+        self.setUniformRowHeights(False)
+        self.setExpandsOnDoubleClick(False)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        header = self.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.setColumnWidth(1, 52)
+        self.setItemDelegate(_CategoryRowDelegate(self))
         self.itemClicked.connect(self._on_item_clicked)
         self.itemActivated.connect(self._on_item_activated)
 
@@ -158,36 +206,15 @@ class _OperatorTree(QTreeWidget):
         op_id = item.data(0, Qt.ItemDataRole.UserRole)
         if op_id:
             self._library.show_operator_info(str(op_id))
+            self._library.note_leaf_clicked(item)
+            return
+        # 一级分类 / 二级分组：单击整行原地展开或折叠（多开，不关闭其它分类）。
+        item.setExpanded(not item.isExpanded())
 
     def _on_item_activated(self, item: QTreeWidgetItem, _column: int) -> None:
         op_id = item.data(0, Qt.ItemDataRole.UserRole)
         if op_id:
             self._library.show_operator_info(str(op_id))
-
-
-class _CategoryPage(QWidget):
-    """单个一级分类页：树 + 空状态。"""
-
-    def __init__(
-        self,
-        library: "OperatorLibrary",
-        category: str,
-        entry_count: int,
-    ) -> None:
-        super().__init__(library)
-        self.category = category
-        self.entry_count = entry_count
-        self.tree = _OperatorTree(library, self)
-        self.empty = QLabel("该分类下暂无算子", self)
-        self.empty.setObjectName("hintLabel")
-        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.empty.setWordWrap(True)
-        self.stack = QStackedWidget(self)
-        self.stack.addWidget(self.tree)
-        self.stack.addWidget(self.empty)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 6, 4, 4)
-        layout.addWidget(self.stack)
 
 
 class OperatorLibrary(QWidget):
@@ -199,13 +226,16 @@ class OperatorLibrary(QWidget):
         super().__init__(parent)
         self.setMinimumWidth(220)
         self._registry: OperatorRegistry | None = None
-        self._pages: dict[str, _CategoryPage] = {}
+        self._category_items: dict[str, QTreeWidgetItem] = {}
+        self._entry_items: dict[str, QTreeWidgetItem] = {}
         self._current_category: str | None = None
-        self._category_buttons: list[QToolButton] = []
-        self._category_button_map: dict[str, QToolButton] = {}
+        self._match_count = 0
         self._filter_text = ""
         self._info_filter_installed = False
         self._build_ui()
+        self.tree_bar.setVisible(False)
+        self._content_stack.setCurrentWidget(self.empty_page)
+        self._update_tree_label()
         self._update_footer()
 
     # ------------------------------------------------------------------ 构建
@@ -219,7 +249,7 @@ class OperatorLibrary(QWidget):
         self.search_edit = QLineEdit(self)
         self.search_edit.setPlaceholderText("搜索算子（名称 / 描述 / 关键字）")
         self.search_edit.setClearButtonEnabled(True)
-        self.search_edit.setToolTip("跨所有分类搜索算子；有命中时自动切换到匹配分类。")
+        self.search_edit.setToolTip("跨所有分类搜索算子；命中项会自动展开并在列表中定位。")
         self.search_edit.textChanged.connect(self._on_search_changed)
         self.refresh_button = QToolButton(self)
         self.refresh_button.setText("刷新")
@@ -229,52 +259,23 @@ class OperatorLibrary(QWidget):
         header.addWidget(self.refresh_button)
         layout.addLayout(header)
 
-        # 一级分类：2 列胶囊按钮，横向并排、自动换行（可滚动）。
-        self._category_scroll = QScrollArea(self)
-        self._category_scroll.setObjectName("categoryBar")
-        self._category_scroll.setWidgetResizable(True)
-        self._category_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._category_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self._category_scroll.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
-        self._category_scroll.setMaximumHeight(140)
-        self._category_scroll.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
-        bar_content = QWidget(self._category_scroll)
-        bar_content.setObjectName("categoryBarContent")
-        self._category_bar_content = bar_content
-        self._category_grid = QGridLayout(bar_content)
-        self._category_grid.setContentsMargins(0, 0, 0, 0)
-        self._category_grid.setHorizontalSpacing(6)
-        self._category_grid.setVerticalSpacing(6)
-        self._category_grid.setColumnStretch(0, 1)
-        self._category_grid.setColumnStretch(1, 1)
-        self._category_scroll.setWidget(bar_content)
-        self._category_group = QButtonGroup(self)
-        self._category_group.setExclusive(True)
-        layout.addWidget(self._category_scroll)
-
-        # 当前分类的工具条：分类名 + 展开 / 折叠全部。
+        # 一级分类 + 多级分组：单棵树内整行折叠，支持同时展开多个分类。
         self.tree_bar = QWidget(self)
         tree_bar_layout = QHBoxLayout(self.tree_bar)
         tree_bar_layout.setContentsMargins(2, 0, 2, 0)
         tree_bar_layout.setSpacing(4)
-        self.category_label = QLabel("", self.tree_bar)
+        self.category_label = QLabel("尚未加载算子", self.tree_bar)
         self.category_label.setObjectName("hintLabel")
         self.expand_all_button = QToolButton(self.tree_bar)
         self.expand_all_button.setObjectName("treeAction")
         self.expand_all_button.setText("展开全部")
-        self.expand_all_button.setToolTip("展开当前分类的全部层级")
+        self.expand_all_button.setToolTip("展开所有分类和分组")
         self.expand_all_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.expand_all_button.clicked.connect(self._on_expand_all)
         self.collapse_all_button = QToolButton(self.tree_bar)
         self.collapse_all_button.setObjectName("treeAction")
         self.collapse_all_button.setText("折叠全部")
-        self.collapse_all_button.setToolTip("折叠当前分类的全部分组")
+        self.collapse_all_button.setToolTip("折叠所有分类和分组")
         self.collapse_all_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.collapse_all_button.clicked.connect(self._on_collapse_all)
         tree_bar_layout.addWidget(self.category_label, 1)
@@ -283,7 +284,9 @@ class OperatorLibrary(QWidget):
         layout.addWidget(self.tree_bar)
 
         self._content_stack = QStackedWidget(self)
-        self.category_stack = QStackedWidget(self)
+        self.tree = _OperatorTree(self)
+        self.tree.itemExpanded.connect(self._on_tree_item_expanded)
+        self.tree.itemCollapsed.connect(self._on_tree_item_collapsed)
 
         self.empty_page = QWidget(self)
         empty_layout = QVBoxLayout(self.empty_page)
@@ -303,8 +306,23 @@ class OperatorLibrary(QWidget):
         empty_layout.addWidget(empty_hint)
         empty_layout.addStretch(2)
 
-        self._content_stack.addWidget(self.category_stack)
+        self.filter_empty_page = QWidget(self)
+        filter_empty_layout = QVBoxLayout(self.filter_empty_page)
+        filter_empty_layout.setContentsMargins(16, 24, 16, 16)
+        filter_empty_layout.addStretch(1)
+        filter_empty_hint = QLabel(
+            "未找到匹配的算子\n试试其它关键字。",
+            self.filter_empty_page,
+        )
+        filter_empty_hint.setObjectName("hintLabel")
+        filter_empty_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        filter_empty_hint.setWordWrap(True)
+        filter_empty_layout.addWidget(filter_empty_hint)
+        filter_empty_layout.addStretch(2)
+
+        self._content_stack.addWidget(self.tree)
         self._content_stack.addWidget(self.empty_page)
+        self._content_stack.addWidget(self.filter_empty_page)
         layout.addWidget(self._content_stack, 1)
 
         footer = QHBoxLayout()
@@ -403,207 +421,295 @@ class OperatorLibrary(QWidget):
 
     # ------------------------------------------------------------------ 数据
     def set_registry(self, registry: OperatorRegistry | None) -> None:
-        """用新的注册表重建全部分类（保留搜索与当前分类）。"""
-        previous_category = self._current_category
+        """重建一级分类树（保留已展开分类与搜索状态）。"""
+        previous_expanded = set(self._expanded_category_names())
+        previous_current = self._current_category
         self._registry = registry
         self._hide_info_panel()
         self.setUpdatesEnabled(False)
         try:
-            self._clear_categories()
+            self.tree.clear()
+            self._category_items.clear()
+            self._entry_items.clear()
+            self._current_category = None
             entries = registry.entries if registry is not None else {}
             if not entries or registry is None:
-                self._category_scroll.setVisible(False)
                 self.tree_bar.setVisible(False)
                 self._content_stack.setCurrentWidget(self.empty_page)
                 self._update_footer()
                 return
-            for index, (name, category_entries) in enumerate(registry.tabs().items()):
-                if not category_entries:
-                    continue
-                page = _CategoryPage(self, name, len(category_entries))
-                self._build_tree(page.tree, category_entries)
-                self._pages[name] = page
-                self.category_stack.addWidget(page)
-                self._add_category_button(index, name, len(category_entries))
-            self._update_category_bar_height()
-            self._category_scroll.setVisible(True)
+            self._build_tree(self.tree, registry.tabs())
             self.tree_bar.setVisible(True)
-            target = (
-                previous_category
-                if previous_category in self._pages
-                else next(iter(self._pages), None)
-            )
-            if target is None:
-                self._content_stack.setCurrentWidget(self.empty_page)
-            else:
-                self.select_category(target)
+            self._content_stack.setCurrentWidget(self.tree)
+            if not self._filter_text:
+                expanded = previous_expanded & set(self._category_items)
+                for name in self._category_items:
+                    if name in expanded:
+                        self._category_items[name].setExpanded(True)
+                if previous_current in expanded:
+                    self._current_category = previous_current
+                elif expanded:
+                    self._current_category = next(
+                        name for name in self._category_items if name in expanded
+                    )
+            self._refresh_category_styles()
+            self._update_tree_label()
             self._apply_filter()
         finally:
             self.setUpdatesEnabled(True)
 
-    def _clear_categories(self) -> None:
-        """清空分类页与一级分类按钮。"""
-        while self.category_stack.count():
-            page = self.category_stack.widget(0)
-            self.category_stack.removeWidget(page)
-            if page is not None:
-                page.deleteLater()
-        self._pages.clear()
-        for button in self._category_buttons:
-            self._category_group.removeButton(button)
-        self._category_buttons.clear()
-        self._category_button_map.clear()
-        while self._category_grid.count():
-            layout_item = self._category_grid.takeAt(0)
-            widget = layout_item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
-        self._current_category = None
-
-    def _add_category_button(self, index: int, name: str, count: int) -> None:
-        """在 2 列网格中添加一个一级分类胶囊按钮。"""
-        button = QToolButton(self._category_bar_content)
-        button.setObjectName("categoryChip")
-        button.setCheckable(True)
-        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        button.setText(f"{name} {count}")
-        button.setToolTip(f"{name} · {count} 个算子")
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
-        button.setMinimumWidth(1)
-        button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        button.clicked.connect(
-            lambda _checked=False, category=name: self.select_category(category)
-        )
-        self._category_group.addButton(button)
-        row, column = divmod(index, 2)
-        self._category_grid.addWidget(button, row, column)
-        self._category_buttons.append(button)
-        self._category_button_map[name] = button
-
-    def _update_category_bar_height(self) -> None:
-        """按行数收紧分类栏高度；分类很多时封顶 140px 并允许滚动。"""
-        if not self._category_buttons:
-            return
-        row_height = max(
-            button.sizeHint().height() for button in self._category_buttons
-        )
-        rows = (len(self._category_buttons) + 1) // 2
-        spacing = self._category_grid.verticalSpacing()
-        height = rows * row_height + max(0, rows - 1) * spacing + 2
-        self._category_scroll.setFixedHeight(min(140, height))
-
     # ------------------------------------------------------------------ 分类
     def category_names(self) -> list[str]:
         """按展示顺序返回全部一级分类名。"""
-        return list(self._pages.keys())
+        return list(self._category_items.keys())
 
-    def category_buttons(self) -> list[QToolButton]:
-        """返回全部一级分类按钮（与 :meth:`category_names` 同序）。"""
-        return list(self._category_buttons)
+    def category_items(self) -> list[QTreeWidgetItem]:
+        """返回全部一级分类条目（与 :meth:`category_names` 同序）。"""
+        return list(self._category_items.values())
+
+    def category_buttons(self) -> list[QTreeWidgetItem]:
+        """兼容旧接口：返回一级分类条目（当前实现没有独立按钮）。"""
+        return self.category_items()
 
     def current_category(self) -> str | None:
         return self._current_category
 
     def category_tree(self, name: str) -> QTreeWidget | None:
-        page = self._pages.get(name)
-        return page.tree if page is not None else None
-
-    def select_category(self, name: str) -> bool:
-        """切换一级分类；分类不存在时返回 False。"""
-        page = self._pages.get(name)
-        if page is None:
-            return False
-        if self._current_category != name:
-            self._hide_info_panel()
-        self._current_category = name
-        button = self._category_button_map.get(name)
-        if button is not None and not button.isChecked():
-            button.setChecked(True)
-        self.category_stack.setCurrentWidget(page)
-        self._content_stack.setCurrentWidget(self.category_stack)
-        self.category_label.setText(f"{name} · {page.entry_count} 个算子")
-        self.expand_all_button.setEnabled(True)
-        self.collapse_all_button.setEnabled(True)
-        return True
-
-    def _on_expand_all(self) -> None:
-        tree = self.current_tree()
-        if tree is not None:
-            tree.expandAll()
-
-    def _on_collapse_all(self) -> None:
-        tree = self.current_tree()
-        if tree is not None:
-            tree.collapseAll()
-
-    def _build_tree(self, tree: QTreeWidget, entries: list[OperatorEntry]) -> None:
-        root: dict[str, Any] = {"groups": {}, "entries": []}
-        for entry in entries:
-            node = root
-            for part in entry.subgroups:
-                node = node["groups"].setdefault(part, {"groups": {}, "entries": []})
-            node["entries"].append(entry)
-
-        def add_nodes(
-            parent: QTreeWidgetItem | QTreeWidget,
-            node: dict[str, Any],
-            path: tuple[str, ...],
-        ) -> None:
-            for group_name, child in node["groups"].items():
-                item = QTreeWidgetItem([group_name])
-                group_path = path + (group_name,)
-                item.setToolTip(0, "分类：" + " / ".join(group_path))
-                item.setData(0, Qt.ItemDataRole.UserRole, None)
-                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                group_font = item.font(0)
-                group_font.setBold(True)
-                item.setFont(0, group_font)
-                if isinstance(parent, QTreeWidget):
-                    parent.addTopLevelItem(item)
-                else:
-                    parent.addChild(item)
-                add_nodes(item, child, group_path)
-
-            for entry in node["entries"]:
-                item = QTreeWidgetItem([entry.name])
-                category_text = " / ".join(entry.spec.category) or "未分类"
-                haystack = " ".join(
-                    [
-                        entry.name,
-                        entry.spec.id,
-                        entry.spec.description or "",
-                        category_text,
-                        " ".join(str(keyword) for keyword in entry.spec.keywords),
-                    ]
-                ).lower()
-                item.setData(0, Qt.ItemDataRole.UserRole, entry.id)
-                item.setData(0, Qt.ItemDataRole.UserRole + 1, haystack)
-                item.setToolTip(
-                    0,
-                    f"{entry.name}\n分类：{category_text}\n{entry.spec.description or '暂无描述'}",
-                )
-                item.setFlags(
-                    Qt.ItemFlag.ItemIsEnabled
-                    | Qt.ItemFlag.ItemIsSelectable
-                    | Qt.ItemFlag.ItemIsDragEnabled
-                )
-                if isinstance(parent, QTreeWidget):
-                    parent.addTopLevelItem(item)
-                else:
-                    parent.addChild(item)
-
-        add_nodes(tree, root, ())
-        self._reset_tree_expansion(tree)
+        if name not in self._category_items:
+            return None
+        return self.tree
 
     @staticmethod
-    def _reset_tree_expansion(tree: QTreeWidget) -> None:
-        """恢复默认折叠状态：只展开一级分组，更深层级折叠。"""
+    def _top_category(item: QTreeWidgetItem) -> QTreeWidgetItem:
+        current = item
+        while current.parent() is not None:
+            current = current.parent()
+        return current
+
+    def _expanded_category_names(self) -> list[str]:
+        return [
+            name
+            for name, item in self._category_items.items()
+            if item.isExpanded()
+        ]
+
+    def select_category(self, name: str) -> bool:
+        """展开指定一级分类并滚动到它；分类不存在时返回 False。"""
+        item = self._category_items.get(name)
+        if item is None:
+            return False
+        self._hide_info_panel()
+        item.setExpanded(True)
+        self.tree.setCurrentItem(item)
+        self.tree.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtTop)
+        self._current_category = name
+        self._refresh_category_styles()
+        self._update_tree_label()
+        return True
+
+    def toggle_category(self, name: str) -> bool:
+        """原地展开 / 折叠一个一级分类；其它已展开分类保持不变（多开）。"""
+        item = self._category_items.get(name)
+        if item is None:
+            return False
+        item.setExpanded(not item.isExpanded())
+        if item.isExpanded():
+            self.tree.setCurrentItem(item)
+            self.tree.scrollToItem(item, QAbstractItemView.ScrollHint.EnsureVisible)
+        return True
+
+    def note_leaf_clicked(self, item: QTreeWidgetItem) -> None:
+        """点击算子叶子时把其所属一级分类记为当前分类。"""
+
+        top = self._top_category(item)
+        self._current_category = top.text(0)
+        self._update_tree_label()
+
+    def _on_tree_item_expanded(self, item: QTreeWidgetItem) -> None:
+        if item.parent() is None:
+            self._current_category = item.text(0)
+            # 展开一级分类时把其下所有分组也展开，让算子列表直接可见；
+            # 用户仍可单独折叠任意二级 / 三级分组。
+            self.tree.blockSignals(True)
+            try:
+                self._expand_descendants(item)
+            finally:
+                self.tree.blockSignals(False)
+        self._refresh_category_styles()
+        self._update_tree_label()
+
+    @classmethod
+    def _expand_descendants(cls, item: QTreeWidgetItem) -> None:
+        for index in range(item.childCount()):
+            child = item.child(index)
+            if child.childCount():
+                child.setExpanded(True)
+                cls._expand_descendants(child)
+
+    def _on_tree_item_collapsed(self, item: QTreeWidgetItem) -> None:
+        if item.parent() is None and self._current_category == item.text(0):
+            expanded = self._expanded_category_names()
+            self._current_category = expanded[-1] if expanded else None
+        self._refresh_category_styles()
+        self._update_tree_label()
+
+    def _refresh_category_styles(self) -> None:
+        """一级分类行：展开时浅蓝底 + 强调文字，收起时浅灰底。"""
+
+        for name, item in self._category_items.items():
+            active = item.isExpanded()
+            background = QColor("#eaf2ff") if active else QColor("#f8fafc")
+            title_color = QColor("#1e3a8a") if active else QColor("#334155")
+            count_color = QColor("#2563eb") if active else QColor("#64748b")
+            for column in (0, 1):
+                item.setBackground(column, QBrush(background))
+            item.setForeground(0, QBrush(title_color))
+            item.setForeground(1, QBrush(count_color))
+
+    def _update_tree_label(self) -> None:
+        if not self._category_items:
+            self.category_label.setText("尚未加载算子")
+            self.expand_all_button.setEnabled(False)
+            self.collapse_all_button.setEnabled(False)
+            return
+        self.expand_all_button.setEnabled(True)
+        self.collapse_all_button.setEnabled(True)
+        expanded = self._expanded_category_names()
+        total = sum(int(item.text(1) or 0) for item in self._category_items.values())
+        self.category_label.setToolTip(
+            f"{len(self._category_items)} 个一级分类，共 {total} 个算子；点击分类原地展开，可同时展开多个。"
+        )
+        if self._filter_text:
+            self.category_label.setText(f"匹配 {self._match_count} 个")
+        elif not expanded:
+            self.category_label.setText("全部折叠")
+        elif len(expanded) == len(self._category_items):
+            self.category_label.setText("全部展开")
+        elif len(expanded) == 1:
+            # 数量已在分类行右侧显示，窄栏下只放分类名，避免被截断。
+            self.category_label.setText(expanded[0])
+        else:
+            self.category_label.setText(f"已展开 {len(expanded)} 个")
+
+    def _on_expand_all(self) -> None:
+        if not self._category_items:
+            return
+        self.tree.blockSignals(True)
+        self.tree.expandAll()
+        self.tree.blockSignals(False)
+        self._current_category = None
+        self._refresh_category_styles()
+        self._update_tree_label()
+
+    def _on_collapse_all(self) -> None:
+        if not self._category_items:
+            return
+        self.tree.blockSignals(True)
+        self.tree.collapseAll()
+        self.tree.blockSignals(False)
+        self.tree.clearSelection()
+        self._current_category = None
+        self._refresh_category_styles()
+        self._update_tree_label()
+
+    def _build_tree(
+        self,
+        tree: QTreeWidget,
+        tabs: dict[str, list[OperatorEntry]],
+    ) -> None:
+        tree.clear()
+        for name, entries in tabs.items():
+            if not entries:
+                continue
+            root: dict[str, Any] = {"groups": {}, "entries": []}
+            for entry in entries:
+                node = root
+                for part in entry.subgroups:
+                    node = node["groups"].setdefault(part, {"groups": {}, "entries": []})
+                node["entries"].append(entry)
+
+            category = QTreeWidgetItem([name, ""])
+            category.setData(0, Qt.ItemDataRole.UserRole, None)
+            category.setData(0, Qt.ItemDataRole.UserRole + 2, "category")
+            category.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            category_font = category.font(0)
+            category_font.setBold(True)
+            category_font.setPointSizeF(max(10.0, category_font.pointSizeF()))
+            category.setFont(0, category_font)
+            category.setTextAlignment(
+                1, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            )
+            category.setSizeHint(0, QSize(0, 36))
+            category.setToolTip(0, f"{name} · 单击展开 / 折叠")
+            tree.addTopLevelItem(category)
+            total = self._populate_tree(category, root, ())
+            category.setText(1, str(total))
+            category.setToolTip(1, f"{total} 个算子")
+            self._category_items[name] = category
         tree.collapseAll()
-        for index in range(tree.topLevelItemCount()):
-            item = tree.topLevelItem(index)
-            if item.childCount():
-                item.setExpanded(True)
+
+    def _populate_tree(
+        self,
+        parent: QTreeWidgetItem,
+        node: dict[str, Any],
+        path: tuple[str, ...],
+    ) -> int:
+        total = 0
+        for group_name, child in node["groups"].items():
+            group = QTreeWidgetItem([group_name, ""])
+            group_path = path + (group_name,)
+            group.setData(0, Qt.ItemDataRole.UserRole, None)
+            group.setData(0, Qt.ItemDataRole.UserRole + 2, "group")
+            group.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            group_font = group.font(0)
+            group_font.setBold(True)
+            group.setFont(0, group_font)
+            group.setForeground(0, QBrush(QColor("#475569")))
+            group.setTextAlignment(
+                1, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            )
+            group.setForeground(1, QBrush(QColor("#94a3b8")))
+            group.setSizeHint(0, QSize(0, 28))
+            group.setToolTip(0, "分类：" + " / ".join(group_path))
+            parent.addChild(group)
+            count = self._populate_tree(group, child, group_path)
+            group.setText(1, str(count))
+            group.setToolTip(1, f"{count} 个算子")
+            total += count
+
+        for entry in node["entries"]:
+            item = QTreeWidgetItem([entry.name, ""])
+            category_text = " / ".join(entry.spec.category) or "未分类"
+            haystack = " ".join(
+                [
+                    entry.name,
+                    entry.spec.id,
+                    entry.spec.description or "",
+                    category_text,
+                    " ".join(str(keyword) for keyword in entry.spec.keywords),
+                ]
+            ).lower()
+            item.setData(0, Qt.ItemDataRole.UserRole, entry.id)
+            item.setData(0, Qt.ItemDataRole.UserRole + 1, haystack)
+            item.setToolTip(
+                0,
+                f"{entry.name}\n分类：{category_text}\n{entry.spec.description or '暂无描述'}",
+            )
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsDragEnabled
+            )
+            item.setSizeHint(0, QSize(0, 26))
+            item.setTextAlignment(
+                1, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            )
+            item.setForeground(1, QBrush(QColor("#cbd5e1")))
+            item.setText(1, "›")
+            parent.addChild(item)
+            self._entry_items[entry.id] = item
+            total += 1
+        return total
 
     # ------------------------------------------------------------------ 过滤
     def _on_search_changed(self, _text: str) -> None:
@@ -613,29 +719,49 @@ class OperatorLibrary(QWidget):
     def _apply_filter(self) -> None:
         was_filtering = bool(self._filter_text)
         self._filter_text = self.search_edit.text().strip().lower()
-        counts: list[int] = []
-        for page in self._pages.values():
-            matched = self._filter_tree(page.tree, self._filter_text)
-            page.stack.setCurrentWidget(page.tree if matched else page.empty)
-            page.empty.setText(
-                "未找到匹配的算子\n试试其它关键字。"
-                if self._filter_text
-                else "该分类下暂无算子。"
-            )
-            counts.append(matched)
-            if was_filtering and not self._filter_text:
-                # 清空搜索后恢复默认折叠状态，避免整棵树保持全展开。
-                self._reset_tree_expansion(page.tree)
-        if self._filter_text and counts:
-            names = list(self._pages)
-            current = self._current_category
-            current_index = names.index(current) if current in self._pages else -1
-            if current_index < 0 or counts[current_index] == 0:
-                for name, matched in zip(names, counts):
-                    if matched:
-                        self.select_category(name)
-                        break
-        self._update_footer(sum(counts) if self._filter_text else None)
+        if not self._category_items:
+            self._content_stack.setCurrentWidget(self.empty_page)
+            self._update_footer()
+            return
+        if not self._filter_text:
+            if was_filtering:
+                self._filter_tree(self.tree, "")
+                self.tree.blockSignals(True)
+                self.tree.collapseAll()
+                self.tree.blockSignals(False)
+                self.tree.clearSelection()
+                self._current_category = None
+            self._content_stack.setCurrentWidget(self.tree)
+            self._refresh_category_styles()
+            self._update_tree_label()
+            self._update_footer()
+            return
+
+        matched = self._filter_tree(self.tree, self._filter_text)
+        self._match_count = matched
+        if matched == 0:
+            self._content_stack.setCurrentWidget(self.filter_empty_page)
+            self._current_category = None
+            self.tree.clearSelection()
+            self._update_tree_label()
+            self._update_footer(matched)
+            return
+
+        self._content_stack.setCurrentWidget(self.tree)
+        self.tree.blockSignals(True)
+        self.tree.expandAll()
+        self.tree.blockSignals(False)
+        first = next(
+            (item for item in self._category_items.values() if not item.isHidden()),
+            None,
+        )
+        if first is not None:
+            self._current_category = first.text(0)
+            self.tree.setCurrentItem(first)
+            self.tree.scrollToItem(first, QAbstractItemView.ScrollHint.PositionAtTop)
+        self._refresh_category_styles()
+        self._update_tree_label()
+        self._update_footer(matched)
 
     def _filter_tree(self, tree: QTreeWidget, text: str) -> int:
         matched = 0
@@ -661,8 +787,6 @@ class OperatorLibrary(QWidget):
 
         for index in range(tree.topLevelItemCount()):
             walk(tree.topLevelItem(index))
-        if text:
-            tree.expandAll()
         return matched
 
     def _on_refresh_clicked(self) -> None:
@@ -862,7 +986,6 @@ class OperatorLibrary(QWidget):
         return len(self._registry.errors)
 
     def current_tree(self) -> _OperatorTree | None:
-        if self._current_category is None:
+        if not self._category_items:
             return None
-        page = self._pages.get(self._current_category)
-        return page.tree if page is not None else None
+        return self.tree

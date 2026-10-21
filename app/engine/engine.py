@@ -26,6 +26,7 @@ from typing import Any, Iterable
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 from app.config import AppSettings
+from app.core.data_types import data_type_of, render_preview, summarize_outputs
 from app.core.model import WorkspaceModel
 from app.core.types import ImageData
 from app.operators.loader import OperatorRegistry
@@ -41,16 +42,59 @@ from app.operators.spec import (
 @dataclass
 class NodeResult:
     node_id: str
-    outputs: dict[str, ImageData]
+    outputs: dict[str, Any]
     elapsed_ms: float
     revision: int
     preview: bool = True
+    port_labels: dict[str, str] = field(default_factory=dict)
 
     @property
     def primary(self) -> ImageData | None:
-        if not self.outputs:
-            return None
-        return next(iter(self.outputs.values()))
+        """第一个图像输出；纯数值 / 结构化数据的节点返回 ``None``。"""
+
+        for value in self.outputs.values():
+            if isinstance(value, ImageData):
+                return value
+        return None
+
+    @property
+    def preview_image(self) -> ImageData | None:
+        """用于预览 / 缩略图的图像：优先图像输出，其次渲染结构化数据。"""
+
+        primary = self.primary
+        if primary is not None:
+            return primary
+        for value in self.outputs.values():
+            image = render_preview(value)
+            if image is not None:
+                return image
+        return None
+
+    def output_type_text(self, key: str) -> str:
+        value = self.outputs.get(key)
+        data_type = data_type_of(value)
+        return data_type.label if data_type is not None else ""
+
+    def summary_lines(self) -> list[str]:
+        return summarize_outputs(self.outputs, self.port_labels)
+
+    def summary_text(self) -> str:
+        lines = self.summary_lines()
+        if not lines:
+            return "算子没有输出"
+        return "；".join(lines)
+
+    def output_type_summary(self) -> str:
+        """按输出数据类型汇总，例如 ``图像、连通域、数值×2``。"""
+
+        counts: dict[str, int] = {}
+        for value in self.outputs.values():
+            data_type = data_type_of(value)
+            label = data_type.label if data_type is not None else "未知数据"
+            counts[label] = counts.get(label, 0) + 1
+        return "、".join(
+            f"{label}×{count}" if count > 1 else label for label, count in counts.items()
+        )
 
 
 @dataclass
@@ -464,7 +508,13 @@ class _EvalState:
             return None
         wrapped = ImageData(image.array, snap.title or image.name, image.color_space)
         elapsed = (time.perf_counter() - started) * 1000.0
-        return NodeResult(snap.id, {"image": wrapped}, elapsed, snap.revision)
+        return NodeResult(
+            snap.id,
+            {"image": wrapped},
+            elapsed,
+            snap.revision,
+            port_labels={"image": "图像"},
+        )
 
     def _compute_operator(self, snap: _NodeSnap) -> NodeResult | None:
         if self.token.cancelled:
@@ -475,7 +525,7 @@ class _EvalState:
             self.record_failure(snap.id, f"找不到算子“{snap.op_id}”，请刷新算子库")
             return None
         spec = entry.spec
-        inputs: dict[str, ImageData | None] = {}
+        inputs: dict[str, Any | None] = {}
         for port in spec.inputs:
             source = self.snapshot.inputs.get((snap.id, port.key))
             if source is None:
@@ -508,9 +558,9 @@ class _EvalState:
             outputs = output_to_dict(spec, output)
             if not outputs:
                 raise OperatorError("算子没有产生任何输出")
-            for key, image in outputs.items():
-                if image.name in ("", "image"):
-                    image.name = f"{snap.title}:{key}"
+            for key, value in outputs.items():
+                if isinstance(value, ImageData) and value.name in ("", "image"):
+                    value.name = f"{snap.title}:{key}"
         except ParamValidationError as exc:
             self.record_failure(snap.id, f"参数错误：{exc.message}", traceback.format_exc())
             return None
@@ -525,7 +575,8 @@ class _EvalState:
             )
             return None
         elapsed = (time.perf_counter() - started) * 1000.0
-        return NodeResult(snap.id, outputs, elapsed, snap.revision)
+        labels = {port.key: port.label for port in spec.outputs if port.key in outputs}
+        return NodeResult(snap.id, outputs, elapsed, snap.revision, port_labels=labels)
 
     def record_failure(self, node_id: str, message: str, details: str = "") -> None:
         if node_id in self.error_nodes:

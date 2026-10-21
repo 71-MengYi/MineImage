@@ -7,7 +7,7 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 
 ```
 文件/菜单 ──> MainWindow ──> WorkspaceWidget（每个标签页一个）
-                                  ├── OperatorLibrary  左侧算子库（搜索/并排一级分类/多级折叠树/拖拽/说明浮层）
+                                  ├── OperatorLibrary  左侧算子库（搜索/整行折叠一级分类/多级折叠树/拖拽/说明浮层）
                                   ├── GraphView        中间节点画布  ←→ GraphModel
                                   ├── ParamPanel       中间叠层（双击节点进入）
                                   ├── PreviewWidget    右侧预览（缩放/平移/对比/交互拾取）
@@ -19,17 +19,61 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 * **模型**：`app/core/model.py`。`WorkspaceModel` 持有 `GraphModel` 与源图像
   `images: dict[str, ImageData]`。节点参数变化通过 `NodeModel.touch()` 增加
   `revision`。引擎用 revision 丢弃过期结果。
+* **端口数据类型**：`app/core/data_types.py` 是端口类型的唯一来源。`DataType`
+  定义 `image / number / edges / contours / components` 五种类型；
+  `NumberValue / EdgesData / ContoursData / ComponentsData` 是结构化值的运行时
+  容器；`coerce_data_type()` 归一化中英文别名，`render_preview()` /
+  `summarize_value()` 供预览与状态栏使用。`PortSpec.data_type` 声明端口类型
+  （默认图像），`port_types_compatible() / connection_error()` 决定连线是否允许，
+  `validate_inputs()` 在执行前校验输入，`output_to_dict() / coerce_output_value()`
+  按端口类型规范化算子返回值。
+* **类型化数据流**：数据流从“图像容器”升级为“类型化端口值”。连线传递的不再只
+  是 `ImageData`，也可能是 `NumberValue`、`EdgesData`、`ContoursData` 或
+  `ComponentsData`；`NodeResult.outputs` 是泛化的 `dict[str, Any]`，
+  `preview_image` 优先取图像输出、否则渲染结构化数据，`summary_text()` 汇总
+  各端口摘要。
 * **算子**：`app/operators/spec.py` 定义 `OperatorSpec / ParamSpec / PortSpec /
   Operator`；`loader.py` 扫描目录。每个算子文件定义模块级 `OPERATOR`。
   参数联动 `visible_when/enabled_when` 使用受限 `eval`：支持裸参数名与
   `params['key']`，**不支持** `params.key` 属性访问；表达式异常时按 True 处理。
 * **引擎**：`app/engine/engine.py`。每次请求抓取图快照，在单线程后台池中执行；
   发出 `node_started/node_finished/node_failed/chain_finished/busy_changed`。
+  `NodeResult.outputs` 可保存任意类型的端口值；`preview_image` 与
+  `summary_text()` 负责预览与摘要，不再假定输出一定是图像。
 * **画布**：`app/graph/*`，QGraphicsView 自绘。所有图修改走 `QUndoStack`。
   端口改为上输入 / 下输出，连线使用纵向三次贝塞尔曲线（`app/graph/curve.py`）；
   拖拽落点靠近端口时自动连线、落在连线上时自动插入节点，移动与连线命令合并为
-  同一个撤销宏。
+  同一个撤销宏。`PortItem` 按 `DataType` 着色并过滤可连接端口：只有同类型端口
+  才能建立连线，图像端口还要求颜色空间有交集。
 * **界面**：`app/ui/*`，主窗口与工作区负责组装，其余控件保持可独立测试。
+
+## 端口数据类型系统
+
+`app/core/data_types.py` 定义节点之间传递的数据种类；`app/operators/spec.py`
+把它们落到端口声明、连线校验与返回值规范化上。
+
+| `DataType` | 值 | 运行时容器 | 说明 |
+| --- | --- | --- | --- |
+| `IMAGE` | `image` | `ImageData` | 默认端口类型；`ndarray` 自动包装并按形状推断颜色空间 |
+| `NUMBER` | `number` | `NumberValue` | 携带 `label` / `unit`；也可直接返回 `int` / `float` |
+| `EDGES` | `edges` | `EdgesData` | `segments` 为 `(N,2)` 点数组或点数组元组，可带 `image_size` |
+| `CONTOURS` | `contours` | `ContoursData` | 与 `EdgesData` 同构，另可携带 `hierarchy` |
+| `COMPONENTS` | `components` | `ComponentsData` | 二维 int32 标签图（0 为背景）+ 面积 / 质心；也可直接返回标签图 |
+
+关键约束：
+
+* 端口类型由 `PortSpec.data_type` 声明，可写枚举或中英文别名（`coerce_data_type`
+  归一化）；默认 `DataType.IMAGE`。
+* `accepts` 只对图像端口有效；非图像端口构造时会被清空，不参与颜色空间校验。
+* 连线类型由 `port_types_compatible(output_port, input_port)` 判定：两端
+  `data_type` 必须一致；图像端口在双方都声明 `accepts` 时要求颜色空间有交集。
+  失败时用 `connection_error()` 生成中文提示。
+* 执行前 `validate_inputs()` 再次检查输入类型与颜色空间；执行后
+  `output_to_dict()` 按输出端口类型调用 `coerce_output_value()` 规范化返回值，
+  不合法时报 `输出“xxx”的数据无效：...`。
+* 旧 `.mi` 工程仍可打开，历史连线不做回溯校验；新建 / 重新连线时才校验类型。
+* 结构化数据通过 `render_preview()` 渲染预览图，`summarize_value()` /
+  `summarize_outputs()` 生成状态栏与节点摘要；数值没有预览图。
 
 ## 颜色 / dtype 约定
 
@@ -79,7 +123,13 @@ refresh_all() -> None
 delete_selected() -> None
 ```
 
-`NodeResult` 需要 `.primary`、`.outputs`、`.elapsed_ms`、`.revision`。
+`NodeResult` 需要 `.primary`、`.preview_image`、`.outputs`、`.summary_text()`、
+`.elapsed_ms`、`.revision`；`.outputs` 的 value 可以是任意类型的端口值。
+
+连线校验：GraphView 在创建连线时调用
+`app.operators.spec.port_types_compatible(output_port, input_port)`，只允许
+`data_type` 相同的端口相连；图像端口还会比较双方 `accepts` 是否有交集。失败时
+通过 `status_message` 显示 `connection_error()` 生成的中文提示。
 
 ### OperatorLibrary（`app/ui/library.py`）
 

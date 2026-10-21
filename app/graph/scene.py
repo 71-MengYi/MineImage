@@ -103,6 +103,13 @@ class GraphScene(QGraphicsScene):
         for port in self._view.port_items(is_input=True):
             if port.node_item.node_id == source.node_item.node_id:
                 continue
+            if not self._view.ports_compatible(
+                source.node_item.node_id,
+                source.key,
+                port.node_item.node_id,
+                port.key,
+            ):
+                continue
             distance = QLineF(port.center_scene_pos(), scene_pos).length()
             if distance <= best_distance:
                 best = port

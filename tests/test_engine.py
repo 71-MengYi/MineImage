@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
 
 from app.config import AppSettings  # noqa: E402
 from app.core.constants import CATEGORY_ORDER  # noqa: E402
+from app.core.data_types import ContoursData, NumberValue  # noqa: E402
 from app.core.model import WorkspaceModel  # noqa: E402
 from app.core.types import ImageData  # noqa: E402
 from app.engine.engine import ExecutionEngine, NodeResult  # noqa: E402
@@ -149,6 +150,46 @@ class ExecutionEngineTests(EngineTestCase):
         self.assertTrue(self.busy_events[0])
         self.assertFalse(self.busy_events[-1])
         self.assertTrue(all(ok for _node, ok in self.chain_events))
+
+    def test_typed_contour_output_flows_into_consumer(self) -> None:
+        """轮廓特征的非图像输出应能经端口传给下游轮廓绘制算子。"""
+
+        source = self.add_source(_image(48, 64, channels=1), "源图")
+        contours = self.add_op(
+            "feature.contours",
+            "轮廓",
+            {"threshold": 100, "mode": "binary", "min_area": 0},
+        )
+        draw = self.add_op(
+            "feature.draw_contours",
+            "轮廓绘制",
+            {"color": "#ff0000", "thickness": 2},
+        )
+        self.connect(source, contours, "image", "image")
+        self.connect(source, draw, "image", "image")
+        self.connect(contours, draw, "contours", "contours")
+
+        self.engine.preview_node(draw.id)
+        self.assertTrue(self.wait_chain(draw.id))
+
+        contour_result = self.engine.result(contours.id)
+        self.assertIsNotNone(contour_result)
+        self.assertIsInstance(contour_result.outputs["contours"], ContoursData)
+        self.assertIsInstance(contour_result.outputs["count"], NumberValue)
+        self.assertIsNotNone(contour_result.primary)
+        self.assertEqual(contour_result.primary.color_space, "L")
+        self.assertIsNotNone(contour_result.preview_image)
+        self.assertIn("轮廓特征", contour_result.summary_text())
+        self.assertEqual(contour_result.port_labels["contours"], "轮廓")
+        self.assertEqual(contour_result.output_type_summary(), "图像、轮廓特征、数值")
+
+        drawn = self.engine.result(draw.id)
+        self.assertIsNotNone(drawn)
+        self.assertIsNotNone(drawn.primary)
+        self.assertEqual(drawn.primary.color_space, "BGR")
+        self.assertEqual(drawn.primary.width, 64)
+        self.assertEqual(drawn.primary.height, 48)
+        self.assertTrue(any(ok for _node, ok in self.chain_events))
 
     def test_upstream_recursion_computes_whole_chain(self) -> None:
         source, gray, blur = self.build_chain()

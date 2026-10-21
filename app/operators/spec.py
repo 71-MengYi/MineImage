@@ -30,6 +30,15 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, Iterable, Mapping, Sequence
 
+from app.core.data_types import (
+    DataType,
+    coerce_components,
+    coerce_contours,
+    coerce_data_type,
+    coerce_edges,
+    coerce_number,
+    data_type_of,
+)
 from app.core.types import ImageData
 
 PARAM_TYPES = (
@@ -65,11 +74,28 @@ class ParamValidationError(OperatorError):
 
 @dataclass(frozen=True)
 class PortSpec:
+    """端口声明。
+
+    ``data_type`` 是端口的唯一类型约束；``accepts`` 只在图像端口上有意义，
+    用于进一步限定颜色空间（``L`` / ``BGR`` / ``BGRA``）。
+    """
+
     key: str
     label: str
     accepts: tuple[str, ...] = ("L", "BGR", "BGRA")
     optional: bool = False
     description: str = ""
+    data_type: DataType | str = DataType.IMAGE
+
+    def __post_init__(self) -> None:
+        data_type = coerce_data_type(self.data_type)
+        object.__setattr__(self, "data_type", data_type)
+        if data_type is not DataType.IMAGE:
+            # 非图像端口不接受颜色空间声明，避免作者误以为会做额外校验。
+            object.__setattr__(self, "accepts", ())
+        else:
+            accepts = tuple(str(item).strip() for item in (self.accepts or ()) if str(item).strip())
+            object.__setattr__(self, "accepts", accepts)
 
     def accepts_image(self, image: ImageData) -> bool:
         if not self.accepts:
@@ -77,7 +103,23 @@ class PortSpec:
         return image.color_space in self.accepts
 
     def accept_text(self) -> str:
+        if self.data_type is not DataType.IMAGE:
+            return self.data_type.label
         return "/".join(self.accepts) if self.accepts else "任意"
+
+    def type_text(self) -> str:
+        if self.data_type is DataType.IMAGE:
+            return f"图像（{self.accept_text()}）"
+        return self.data_type.label
+
+    def accepts_value(self, value: Any) -> bool:
+        """检查一个已规范化数据值是否满足本端口的类型 / 颜色空间约束。"""
+
+        if data_type_of(value) is not self.data_type:
+            return False
+        if isinstance(value, ImageData) and self.data_type is DataType.IMAGE:
+            return self.accepts_image(value)
+        return True
 
 
 @dataclass(frozen=True)
@@ -267,8 +309,9 @@ class Operator:
     * 输入图像：``ImageData`` 或 ``None``（可选且未连接时）；
     * 参数：按 :class:`ParamSpec` 校验、转换后的值。
 
-    返回值可以是单个 ``np.ndarray``（对应唯一输出端口），或
-    ``{output_port_key: ndarray}`` 的多输出字典。请勿原地修改输入数组。
+    返回值可以是单个值（对应唯一输出端口），或 ``{output_port_key: value}``
+    的多输出字典；每个值会按对应输出端口的 :class:`DataType` 规范化。请勿原地
+    修改输入数组。
     """
 
     spec: ClassVar[OperatorSpec]
@@ -448,45 +491,102 @@ def params_by_group(spec: OperatorSpec) -> dict[str, list[ParamSpec]]:
     return groups
 
 
-def validate_inputs(spec: OperatorSpec, inputs: Mapping[str, ImageData | None]) -> None:
-    """检查端口是否齐全、颜色空间是否匹配。"""
+def port_types_compatible(output_port: PortSpec, input_port: PortSpec) -> bool:
+    """输出端口能否直接连接到输入端口。
+
+    * 数据类型必须完全一致；
+    * 图像端口在双方都声明了颜色空间时，至少要有交集（实际像素仍会在执行时校验）。
+    """
+
+    if output_port.data_type is not input_port.data_type:
+        return False
+    if output_port.data_type is DataType.IMAGE:
+        if output_port.accepts and input_port.accepts:
+            return bool(set(output_port.accepts) & set(input_port.accepts))
+    return True
+
+
+def connection_error(output_port: PortSpec, input_port: PortSpec) -> str:
+    """生成面向用户的类型不匹配提示。"""
+
+    return (
+        f"数据类型不匹配：输出“{output_port.label}”（{output_port.type_text()}）"
+        f"不能连接到输入“{input_port.label}”（{input_port.type_text()}）。"
+    )
+
+
+def validate_inputs(spec: OperatorSpec, inputs: Mapping[str, Any | None]) -> None:
+    """检查端口是否齐全、数据类型与图像颜色空间是否匹配。"""
+
     missing = []
     for port in spec.inputs:
-        image = inputs.get(port.key)
-        if image is None:
+        value = inputs.get(port.key)
+        if value is None:
             if not port.optional:
                 missing.append(port.label)
             continue
-        if not port.accepts_image(image):
+        if data_type_of(value) is not port.data_type:
+            actual = data_type_of(value)
+            actual_text = actual.label if actual is not None else type(value).__name__
             raise OperatorError(
-                f"输入“{port.label}”需要 {port.accept_text()} 图像，当前为 {image.color_space}。"
+                f"输入“{port.label}”需要{port.data_type.label}数据，当前为{actual_text}。"
+            )
+        if isinstance(value, ImageData) and not port.accepts_image(value):
+            raise OperatorError(
+                f"输入“{port.label}”需要 {port.accept_text()} 图像，当前为 {value.color_space}。"
             )
     if missing:
         raise OperatorError(f"缺少输入：{'、'.join(missing)}")
 
 
-def output_to_dict(spec: OperatorSpec, output: Any) -> dict[str, ImageData]:
-    """把算子返回值规范化为 ``{port: ImageData}``。"""
-    if isinstance(output, ImageData):
-        output = output.array
+def coerce_output_value(port: PortSpec, value: Any) -> Any:
+    """按输出端口类型规范化一个返回值；失败时抛出 :class:`OperatorError`。"""
+
+    key_label = f"输出“{port.label}”"
+    if value is None:
+        raise OperatorError(f"{key_label}没有数据")
+    try:
+        if port.data_type is DataType.IMAGE:
+            if isinstance(value, ImageData):
+                return value
+            return ImageData(value)
+        if port.data_type is DataType.NUMBER:
+            return coerce_number(value, key_label)
+        if port.data_type is DataType.EDGES:
+            return coerce_edges(value, key_label)
+        if port.data_type is DataType.CONTOURS:
+            return coerce_contours(value, key_label)
+        if port.data_type is DataType.COMPONENTS:
+            return coerce_components(value, key_label)
+    except (TypeError, ValueError) as exc:
+        raise OperatorError(f"{key_label}的数据无效：{exc}") from exc
+    raise OperatorError(f"{key_label}的数据类型不受支持：{port.data_type!r}")
+
+
+def output_to_dict(spec: OperatorSpec, output: Any) -> dict[str, Any]:
+    """把算子返回值规范化为 ``{port: value}``，并按端口类型转换。"""
+
+    ports = {port.key: port for port in spec.outputs}
     if isinstance(output, dict):
-        result: dict[str, ImageData] = {}
+        result: dict[str, Any] = {}
         for key, value in output.items():
-            if key not in {port.key for port in spec.outputs}:
+            port = ports.get(key)
+            if port is None:
                 raise OperatorError(f"算子返回了未声明的输出端口：{key}")
             if value is None:
                 continue
-            image = value if isinstance(value, ImageData) else ImageData(value)
-            result[key] = image
+            result[key] = coerce_output_value(port, value)
         return result
     if output is None:
-        raise OperatorError("算子没有返回图像")
-    if isinstance(output, (list, tuple)):
+        raise OperatorError("算子没有返回任何输出")
+    if isinstance(output, (list, tuple)) and len(spec.outputs) > 1:
         if len(output) != len(spec.outputs):
             raise OperatorError(f"算子返回了 {len(output)} 个输出，但声明了 {len(spec.outputs)} 个端口")
         return {
-            port.key: (value if isinstance(value, ImageData) else ImageData(value))
+            port.key: coerce_output_value(port, value)
             for port, value in zip(spec.outputs, output)
+            if value is not None
         }
-    image = output if isinstance(output, ImageData) else ImageData(output)
-    return {spec.outputs[0].key: image}
+    # 单值返回：对应第一个输出端口。
+    port = spec.outputs[0]
+    return {port.key: coerce_output_value(port, output)}

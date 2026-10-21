@@ -357,16 +357,23 @@ class PreviewWidget(QWidget):
         painter.setFont(title_font)
         painter.setPen(self.EMPTY_TEXT)
         rect = QRectF(self.rect()).adjusted(12, 0, -12, -26)
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "暂无预览")
+        title = self._node_title or "暂无预览"
+        painter.drawText(
+            rect,
+            int(Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap),
+            title,
+        )
         body_font = QFont(self.font())
         body_font.setBold(False)
+        body_font.setPointSizeF(9.5)
         painter.setFont(body_font)
         painter.setPen(QColor("#7c8797"))
-        body_rect = QRectF(self.rect()).adjusted(12, 40, -12, 0)
+        body_rect = QRectF(self.rect()).adjusted(28, 40, -28, 0)
+        body = self._info or "在画布中单击节点查看结果\n双击节点可编辑参数"
         painter.drawText(
             body_rect,
-            Qt.AlignmentFlag.AlignCenter,
-            "在画布中单击节点查看结果\n双击节点可编辑参数",
+            int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap),
+            body,
         )
         pen = QPen(QColor(15, 23, 42, 44), 1.0, Qt.PenStyle.DashLine)
         painter.setPen(pen)

@@ -8,12 +8,19 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QGraphicsItem, QStyleOptionGraphicsItem, QWidget
 
+from app.core.data_types import DataType
+from app.operators.spec import PortSpec
+
 if TYPE_CHECKING:  # pragma: no cover - 仅类型检查
     from app.graph.node_item import NodeItem
 
 
 class PortItem(QGraphicsItem):
-    """节点边缘的圆形端口：输入在上边缘、输出在下边缘，输出端口可拖拽出连线。"""
+    """节点边缘的圆形端口：输入在上边缘、输出在下边缘，输出端口可拖拽出连线。
+
+    端口颜色由 :class:`~app.core.data_types.DataType` 决定，同类型的输出 / 输入
+    才能连接；悬停提示会显示数据类型、可选状态与端口说明。
+    """
 
     RADIUS = 5.5
     HIT_RADIUS = 9.0
@@ -25,6 +32,7 @@ class PortItem(QGraphicsItem):
         label: str,
         is_input: bool,
         index: int,
+        port_spec: PortSpec | None = None,
     ) -> None:
         super().__init__(node_item)
         self.node_item = node_item
@@ -32,23 +40,31 @@ class PortItem(QGraphicsItem):
         self.label = label
         self.is_input = is_input
         self.index = index
+        self.port_spec = port_spec
+        self.data_type = port_spec.data_type if port_spec is not None else DataType.IMAGE
         self._connected = False
         self._hover = False
         self._highlight = False
         self.setZValue(3.0)
         self.setAcceptHoverEvents(True)
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
-        role = "输入" if is_input else "输出"
-        accepts = ""
-        if is_input and node_item.spec is not None:
-            try:
-                accepts = node_item.spec.input(key).accept_text()
-            except KeyError:
-                accepts = ""
-        tip = f"{role}端口：{label}"
-        if accepts:
-            tip += f"\n接受图像：{accepts}"
-        self.setToolTip(tip)
+        self.setToolTip(self._tooltip_text())
+
+    def _tooltip_text(self) -> str:
+        role = "输入" if self.is_input else "输出"
+        lines = [f"{role}端口：{self.label}", f"数据类型：{self.data_type.label}"]
+        spec = self.port_spec
+        if spec is not None:
+            if self.data_type is DataType.IMAGE:
+                prefix = "接受图像" if self.is_input else "图像颜色空间"
+                lines.append(f"{prefix}：{spec.accept_text()}")
+            if spec.optional:
+                lines.append("可选：未连接时算子收到 None")
+            if spec.description:
+                lines.append(spec.description)
+        if not self.is_input:
+            lines.append("拖动此端口可创建连线")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ 状态
     def set_connected(self, connected: bool) -> None:
@@ -70,6 +86,9 @@ class PortItem(QGraphicsItem):
     def center_scene_pos(self) -> QPointF:
         return self.scenePos()
 
+    def type_color(self) -> QColor:
+        return QColor(self.data_type.color)
+
     # --------------------------------------------------------------- 几何绘制
     def boundingRect(self) -> QRectF:  # noqa: N802 - Qt 接口
         radius = self.HIT_RADIUS + 3.0
@@ -88,17 +107,26 @@ class PortItem(QGraphicsItem):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawEllipse(QPointF(0.0, 0.0), self.HIT_RADIUS, self.HIT_RADIUS)
 
+        color = self.type_color()
         if self._connected:
-            brush = QColor("#3b82f6")
-            pen_color = QColor("#1d4ed8")
+            brush = QColor(color)
+            pen_color = color.darker(125)
         else:
             brush = QColor("#ffffff")
-            pen_color = QColor("#64748b")
+            pen_color = color
         if self._hover:
-            pen_color = QColor("#2563eb")
+            if not self._connected:
+                brush = QColor(color)
+                brush.setAlpha(52)
+            pen_color = color.darker(115)
         painter.setBrush(brush)
-        painter.setPen(QPen(pen_color, 1.6))
+        painter.setPen(QPen(pen_color, 1.7))
         painter.drawEllipse(QPointF(0.0, 0.0), self.RADIUS, self.RADIUS)
+        if self._connected:
+            # 已连接端口画一个小白点，和未连接端口区分更明显。
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#ffffff"))
+            painter.drawEllipse(QPointF(0.0, 0.0), 1.8, 1.8)
 
     # ------------------------------------------------------------------ 交互
     def hoverEnterEvent(self, event) -> None:  # noqa: N802 - Qt 接口

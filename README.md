@@ -10,12 +10,17 @@ MineImage 是一个基于 **PySide6 + OpenCV** 的节点式图像处理实验工
 
 * **节点画布**：拖拽算子、上下端口连线、靠近端口自动吸附连线、拖到连线上自动插入
   节点、框选、多分支 DAG、纵向自动布局、撤销/重做。
-* **算子库**：一级分类以并排按钮展示，更深层级使用多级折叠分组；支持搜索、拖拽和
-  单击查看算子说明浮层。
+* **算子库**：内置 **194 个算子 / 14 个一级分类**，覆盖 OpenCV 5.0 的 core、imgproc、
+  photo、features2d、objdetect、video、calib3d、dnn 等主要模块；一级分类为整行折叠
+  分组，默认全部收起，可同时展开多个；更深层级使用多级折叠分组；支持搜索、拖拽和
+  单击查看算子说明浮层。清单见 [docs/opencv_catalog.md](docs/opencv_catalog.md)。
 * **实时预览**：单击节点立即显示该节点输出；双击进入参数面板，拖动参数只重算当前
   节点，点击“保存”后才更新下游。后台线程计算、过期任务自动取消。
 * **中间结果追溯**：每个节点缓存自己的最新快照，随时点击查看；工程保存时参数与
   连线一并保存；**文件 → 导出当前节点图像**（Ctrl+E）可导出 PNG/TIFF/NPY。
+* **类型化端口**：节点间可传递图像、数值、边缘特征、轮廓特征、连通域五种数据；
+  多输出节点在底部按声明顺序排列端口，端口按类型着色；新建连线时校验数据类型
+  （图像端口还校验颜色空间），不匹配的连接会被拒绝，执行前还会再校验一次输入。
 * **预览交互**：保持比例、Ctrl+滚轮缩放、左键拖动、单视图 / 左右对比 / 滑动对比；
   支持点选、矩形 ROI、画线工具供算子声明式调用。
 * **状态栏**：行/列坐标（左上角原点）与原始像素值（R/G/B/A，附 dtype）、缩放比例、
@@ -68,15 +73,47 @@ class MyOp(Operator):
 OPERATOR = MyOp
 ```
 
+端口默认是图像；在 `PortSpec` 里给 `data_type` 写 `"number"`、`"edges"`、
+`"contours"` 或 `"components"` 即可声明数值或结构化输出。`process()` 可以直接
+返回 `NumberValue`、`EdgesData`、`ContoursData`、`ComponentsData`，也可以返回
+裸 `int/float`、`(N,2)` 点集或二维 int32 标签图，框架会按端口类型自动规范化。
+多输出用 `{输出端口key: 值}` 字典返回，节点底部会按声明顺序生成多个输出端口。
+
 完整字段、交互参数（points/roi/line）、联动条件与校验规则见
 [docs/operator_guide.md](docs/operator_guide.md)，可复制的模板是
 [operators/_template.py](operators/_template.py)。
+
+内置目录算子位于 `app/operators/builtin/catalog/`，按 OpenCV 模块拆分文件；一个
+模块可以定义多个算子并用 `OPERATORS = (A, B, ...)` 批量导出（仍兼容单个
+`OPERATOR`）。目录算子统一使用 `catalog/_cv.py` 做输入校验、dtype 归一化与输出恢复。
+
+## OpenCV 5.0 算子目录
+
+| 分类 | 数量 | 代表能力 |
+| --- | --- | --- |
+| 基础调整 | 18 | 加减乘除、位运算、归一化、伽马、LUT |
+| 滤波与平滑 | 14 | 双边、方框、可分离卷积、锐化、金字塔、均值漂移 |
+| 阈值与分割 | 19 | Otsu / 三角 / 自适应阈值、分水岭、GrabCut、K 均值、轮廓 |
+| 边缘检测 | 10 | Canny、Sobel、Scharr、Laplacian、霍夫线 / 圆、LSD |
+| 形态学 | 10 | 腐蚀膨胀、开闭、梯度、顶帽、黑帽、击中击不中 |
+| 几何变换 | 13 | 仿射 / 透视、remap、极坐标、扩边、错切、裁剪、平铺 |
+| 通道与色彩 | 13 | 颜色空间、通道混合、伪彩色、白平衡、色温、Alpha |
+| 特征与分析 | 37 | SIFT / ORB / AKAZE / BRISK、匹配、直方图、矩、FFT、PSNR / SSIM |
+| 图像增强 | 17 | 非局部均值、TV-L1、修复、无缝克隆、HDR、去雾、Retinex |
+| 视频与运动 | 10 | 光流、背景建模、CamShift、ECC、目标跟踪 |
+| 立体与标定 | 6 | 棋盘格、畸变校正、立体视差 / 深度、单应、全景 |
+| 深度学习 | 6 | Haar / HOG / 二维码 / 条码检测、DNN Blob 与推理 |
+| 交互处理 | 19 | ROI、线 / 矩形 / 圆 / 文本 / 箭头 / 水印、布局拼接 |
+| 其他 | 2 | OpenCV 通用调用（任意 cv2 函数）、构建信息 |
+
+完整 id、说明与覆盖矩阵见 [docs/opencv_catalog.md](docs/opencv_catalog.md)。该文档由
+`python scripts/gen_opencv_catalog_doc.py` 从注册表生成，新增算子后可重新运行同步。
 
 ## 工程结构
 
 ```
 app/
-  core/        图像容器、DAG 模型、.mi 工程格式、图像 IO
+  core/        图像容器、端口数据类型、DAG 模型、.mi 工程格式、图像 IO
   operators/   算子规范、自动扫描、内置算子
   engine/      异步执行引擎（快照 / 取消 / 下游重算）
   graph/       QGraphicsView 节点画布、连线、命令、自动布局

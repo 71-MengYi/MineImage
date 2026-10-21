@@ -486,14 +486,19 @@ class WorkspaceWidget(QWidget):
         self._emit_status()
 
     def _show_result(self, result: NodeResult, node: NodeModel) -> None:
-        image = result.primary
         self._last_elapsed_ms = result.elapsed_ms
+        image = result.preview_image
+        summary = result.summary_text()
         if image is None:
             self._current_image = None
-            self.preview.set_image(None, node.display_title(), "算子没有输出图像")
+            self.preview.set_image(None, node.display_title(), summary or "算子没有输出图像")
             return
         self._current_image = image
         meta = f"{result.elapsed_ms:.1f} ms · {image.width}×{image.height} · {image.color_space} · {image.dtype_name}"
+        if len(result.outputs) > 1:
+            meta += f" · 输出 {len(result.outputs)}：{result.output_type_summary()}"
+        if result.primary is None:
+            meta += " · 结构化数据预览"
         self.preview.set_image(image, node.display_title(), meta)
 
     def _on_node_failed(self, node_id: str, message: str) -> None:
@@ -612,7 +617,10 @@ class WorkspaceWidget(QWidget):
         node_id = self._current_node_id
         result = self.engine.result(node_id) if node_id else None
         if result is None or result.primary is None:
-            self.status_message.emit("当前节点没有可导出的结果")
+            if result is not None and result.outputs:
+                self.status_message.emit("当前节点没有图像输出，无法导出为图像文件")
+            else:
+                self.status_message.emit("当前节点没有可导出的结果")
             return False
         try:
             save_image(path, result.primary)
