@@ -41,6 +41,7 @@ from app.graph.commands import (
     MoveNodeCommand,
     RemoveConnectionCommand,
     RemoveNodeCommand,
+    RemoveNodeTreeCommand,
     RenameNodeCommand,
 )
 from app.graph.connection_item import ConnectionItem
@@ -522,10 +523,15 @@ class GraphView(QGraphicsView):
         if selected and selected in self._nodes:
             self.set_selected_node(selected)
 
-    def delete_selected(self) -> None:
+    def _clear_pending_interaction(self) -> None:
+        """清掉拖动中的临时状态，避免删除后仍引用已移除的条目。"""
+
         self._pending_move_target = None
         self._pending_move_reason = None
         self._clear_target_highlight()
+
+    def delete_selected(self) -> None:
+        self._clear_pending_interaction()
         node_items = [item for item in self._scene.selectedItems() if isinstance(item, NodeItem)]
         connection_items = [item for item in self._scene.selectedItems() if isinstance(item, ConnectionItem)]
         if not node_items and not connection_items:
@@ -555,6 +561,23 @@ class GraphView(QGraphicsView):
         self._selection_timer.stop()
         self.selection_changed.emit(self.selected_node_id() or "")
         self.status_message.emit("已删除选中对象")
+
+    def delete_node_with_children(self, node_id: str) -> None:
+        """删除指定节点及其全部下游子节点，整次删除一步撤销。"""
+
+        if node_id not in self.graph.nodes:
+            return
+        self._clear_pending_interaction()
+        command = RemoveNodeTreeCommand(self.graph, node_id)
+        self._undo_stack.push(command)
+        self._update_scene_rect()
+        self._selection_timer.stop()
+        self.selection_changed.emit(self.selected_node_id() or "")
+        children = max(len(command.node_ids) - 1, 0)
+        if children:
+            self.status_message.emit(f"已删除节点及 {children} 个子节点")
+        else:
+            self.status_message.emit("已删除节点")
 
     # --------------------------------------------------------------- 自动布局
     def _layout_changes(self) -> list[tuple[str, tuple[float, float], tuple[float, float]]]:
@@ -1705,6 +1728,10 @@ class GraphView(QGraphicsView):
                 self.set_selected_node(node_item.node_id)
             menu.addAction("复制节点", self.copy_selected)
             menu.addAction("删除节点", self.delete_selected)
+            menu.addAction(
+                "删除节点及子节点",
+                lambda: self.delete_node_with_children(node_item.node_id),
+            )
             menu.addAction("重命名节点", lambda: self.rename_node(node_item.node_id))
             menu.addSeparator()
             menu.addAction("自动布局", self.auto_layout)

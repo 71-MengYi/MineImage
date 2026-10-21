@@ -103,6 +103,43 @@ class RemoveNodeCommand(QUndoCommand):
                 continue
 
 
+class RemoveNodeTreeCommand(QUndoCommand):
+    """删除节点及其全部下游子节点，连同相关连线；整次删除一步撤销。"""
+
+    def __init__(self, graph: GraphModel, node_id: str, text: str = "删除节点及子节点") -> None:
+        super().__init__(text)
+        self._graph = graph
+        self._node_id = node_id
+        self._sub_commands: list[RemoveNodeCommand] = []
+
+    @property
+    def node_id(self) -> str:
+        return self._node_id
+
+    @property
+    def node_ids(self) -> list[str]:
+        """本次删除涉及的节点 id（根节点在前）；首次执行前为空列表。"""
+
+        return [command.node_id for command in self._sub_commands]
+
+    def redo(self) -> None:
+        if self._node_id not in self._graph.nodes:
+            return
+        if not self._sub_commands:
+            # 根节点先入栈、子节点后入栈；撤销时按相反顺序恢复，每条连线
+            # 的快照由更早入栈的一端持有，因此能完整重建子树内的连线。
+            self._sub_commands = [
+                RemoveNodeCommand(self._graph, node_id)
+                for node_id in self._graph.descendants(self._node_id, include_self=True)
+            ]
+        for command in self._sub_commands:
+            command.redo()
+
+    def undo(self) -> None:
+        for command in reversed(self._sub_commands):
+            command.undo()
+
+
 class AddConnectionCommand(QUndoCommand):
     """添加一条连线。"""
 
@@ -335,6 +372,7 @@ __all__ = [
     "MoveNodeCommand",
     "RemoveConnectionCommand",
     "RemoveNodeCommand",
+    "RemoveNodeTreeCommand",
     "RenameNodeCommand",
     "SetNodeParamsCommand",
 ]

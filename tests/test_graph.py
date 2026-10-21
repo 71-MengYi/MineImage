@@ -14,6 +14,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -35,6 +36,7 @@ from app.graph.commands import (
     MoveNodeCommand,
     RemoveConnectionCommand,
     RemoveNodeCommand,
+    RemoveNodeTreeCommand,
     SetNodeParamsCommand,
 )
 from app.graph.layout import compute_layout
@@ -97,6 +99,19 @@ class FakeRegistry:
 
 def make_registry() -> FakeRegistry:
     return FakeRegistry(BLUR_SPEC, MERGE_SPEC, SPLIT_SPEC, OUTPUT_SPEC)
+
+
+class _FakeContextMenuEvent:
+    """右键菜单事件替身：只实现 contextMenuEvent 用到的接口。"""
+
+    def __init__(self, pos: QPoint) -> None:
+        self._pos = pos
+
+    def pos(self) -> QPoint:
+        return self._pos
+
+    def globalPos(self) -> QPoint:
+        return QPoint(0, 0)
 
 
 def setUpModule() -> None:
@@ -556,6 +571,85 @@ class GraphViewTestCase(unittest.TestCase):
         self.assertIn(connection.id, self.graph.connections)
         self.assertEqual(len(self.view._nodes), 2)
         self.assertEqual(len(self.view._connections), 1)
+
+    def test_remove_node_tree_command_removes_descendants_and_undo(self) -> None:
+        upstream = self.add_node(pos=(0.0, -200.0))
+        root = self.add_node(pos=(0.0, 0.0))
+        child = self.add_node(pos=(0.0, 200.0))
+        grandchild = self.add_node(pos=(0.0, 400.0))
+        branch = self.add_node("test.split", pos=(400.0, 400.0))
+        kept = self.add_node(pos=(600.0, 0.0))
+        upstream_link = self.connect(upstream, root)
+        first_link = self.connect(root, child)
+        second_link = self.connect(child, grandchild)
+        branch_link = self.connect(child, branch)
+
+        command = RemoveNodeTreeCommand(self.graph, root.id)
+        self.undo.push(command)
+
+        self.assertEqual(
+            set(command.node_ids),
+            {root.id, child.id, grandchild.id, branch.id},
+        )
+        self.assertEqual(set(self.graph.nodes), {upstream.id, kept.id})
+        self.assertFalse(self.graph.connections)
+        self.assertEqual(set(self.view._nodes), {upstream.id, kept.id})
+        self.assertFalse(self.view._connections)
+
+        self.undo.undo()
+        self.assertEqual(
+            set(self.graph.nodes),
+            {upstream.id, root.id, child.id, grandchild.id, branch.id, kept.id},
+        )
+        self.assertEqual(
+            set(self.graph.connections),
+            {upstream_link.id, first_link.id, second_link.id, branch_link.id},
+        )
+        self.assertEqual(len(self.view._nodes), 6)
+        self.assertEqual(len(self.view._connections), 4)
+
+        self.undo.redo()
+        self.assertEqual(set(self.graph.nodes), {upstream.id, kept.id})
+        self.assertFalse(self.graph.connections)
+
+    def test_delete_node_with_children_via_context_menu(self) -> None:
+        root = self.add_node(pos=(0.0, 0.0))
+        child = self.add_node(pos=(0.0, 200.0))
+        grandchild = self.add_node(pos=(0.0, 400.0))
+        kept = self.add_node(pos=(500.0, 0.0))
+        first_link = self.connect(root, child)
+        self.connect(child, grandchild)
+
+        point = self._show_and_focus_node(root)
+        with patch("app.graph.view.QMenu") as menu_cls:
+            self.view.contextMenuEvent(_FakeContextMenuEvent(point))
+        actions = [
+            call.args[0]
+            for call in menu_cls.return_value.addAction.call_args_list
+            if call.args
+        ]
+        self.assertEqual(
+            actions.index("删除节点及子节点"),
+            actions.index("删除节点") + 1,
+        )
+
+        status: list[str] = []
+        self.view.status_message.connect(status.append)
+        self.view.delete_node_with_children(root.id)
+
+        self.assertEqual(set(self.graph.nodes), {kept.id})
+        self.assertFalse(self.graph.connections)
+        self.assertIn("已删除节点及 2 个子节点", status)
+
+        self.undo.undo()
+        self.assertEqual(
+            set(self.graph.nodes),
+            {root.id, child.id, grandchild.id, kept.id},
+        )
+        self.assertEqual(len(self.graph.connections), 2)
+        self.assertIn(first_link.id, self.graph.connections)
+        self.assertEqual(len(self.view._nodes), 4)
+        self.assertEqual(len(self.view._connections), 2)
 
     # ------------------------------------------------------------------ 拖放
     def test_mime_operator_drop_creates_node(self) -> None:
