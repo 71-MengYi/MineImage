@@ -19,7 +19,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt
-from PySide6.QtGui import QDropEvent, QUndoStack
+from PySide6.QtGui import QDropEvent, QUndoStack, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -1041,6 +1041,149 @@ class GraphViewTestCase(unittest.TestCase):
         self.assertEqual(set(item.output_ports), {"image"})
         self.assertGreater(item.size().height(), 0.0)
         item.update()  # 不应崩溃
+
+    # -------------------------------------------------------------- 画布导航
+    def _prepare_navigation_canvas(self) -> NodeModel:
+        """单个节点 + 适应视图：内容放得下时，左键拖动空白处仍应能平移画布。"""
+
+        node = self.add_node(pos=(0.0, 0.0))
+        self.view.resize(1000, 700)
+        self.view.show()
+        if _APP is not None:
+            _APP.processEvents()
+        self.view.centerOn(self.view._nodes[node.id].sceneBoundingRect().center())
+        if _APP is not None:
+            _APP.processEvents()
+        return node
+
+    def _send_wheel(
+        self,
+        angle: QPoint,
+        modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
+        pixel: QPoint | None = None,
+    ) -> None:
+        position = QPointF(self.view.viewport().rect().center())
+        event = QWheelEvent(
+            position,
+            self.view.viewport().mapToGlobal(position.toPoint()),
+            QPoint(0, 0) if pixel is None else pixel,
+            angle,
+            Qt.MouseButton.NoButton,
+            modifiers,
+            Qt.ScrollPhase.NoScrollPhase,
+            False,
+        )
+        QApplication.sendEvent(self.view.viewport(), event)
+        if _APP is not None:
+            _APP.processEvents()
+
+    def test_canvas_scrollbars_are_hidden(self) -> None:
+        self._prepare_navigation_canvas()
+        self.assertFalse(self.view.horizontalScrollBar().isVisible())
+        self.assertFalse(self.view.verticalScrollBar().isVisible())
+
+    def test_shift_wheel_scrolls_canvas_horizontally(self) -> None:
+        self._prepare_navigation_canvas()
+        hbar = self.view.horizontalScrollBar()
+        vbar = self.view.verticalScrollBar()
+        h_before, v_before = hbar.value(), vbar.value()
+
+        self._send_wheel(QPoint(0, 120), Qt.KeyboardModifier.ShiftModifier)
+        self.assertLess(hbar.value(), h_before, "Shift+滚轮向下应向左滚动")
+        self.assertEqual(vbar.value(), v_before, "Shift+滚轮不应再纵向滚动")
+
+        self._send_wheel(QPoint(0, -120), Qt.KeyboardModifier.ShiftModifier)
+        self.assertEqual(hbar.value(), h_before)
+        self.assertEqual(vbar.value(), v_before)
+
+    def test_shift_wheel_uses_pixel_delta(self) -> None:
+        self._prepare_navigation_canvas()
+        hbar = self.view.horizontalScrollBar()
+        h_before = hbar.value()
+        self._send_wheel(
+            QPoint(0, 0),
+            Qt.KeyboardModifier.ShiftModifier,
+            QPoint(0, 40),
+        )
+        self.assertEqual(hbar.value(), h_before - 40)
+
+    def test_plain_wheel_still_scrolls_canvas_vertically(self) -> None:
+        self._prepare_navigation_canvas()
+        hbar = self.view.horizontalScrollBar()
+        vbar = self.view.verticalScrollBar()
+        h_before, v_before = hbar.value(), vbar.value()
+
+        self._send_wheel(QPoint(0, 120))
+        self.assertLess(vbar.value(), v_before)
+        self.assertEqual(hbar.value(), h_before)
+
+    def test_ctrl_wheel_still_zooms_canvas(self) -> None:
+        self._prepare_navigation_canvas()
+        before = self.view.transform().m11()
+        self._send_wheel(QPoint(0, 120), Qt.KeyboardModifier.ControlModifier)
+        self.assertGreater(self.view.transform().m11(), before)
+
+    def test_left_drag_blank_pans_canvas(self) -> None:
+        node = self._prepare_navigation_canvas()
+        hbar = self.view.horizontalScrollBar()
+        vbar = self.view.verticalScrollBar()
+        h_before, v_before = hbar.value(), vbar.value()
+        node_pos = self.graph.nodes[node.id].pos
+        start = QPoint(40, 40)
+        end = QPoint(160, 120)
+        viewport = self.view.viewport()
+
+        QTest.mousePress(viewport, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, start)
+        self.assertTrue(self.view._panning)
+        QTest.mouseMove(viewport, end)
+        QTest.mouseRelease(viewport, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, end)
+        if _APP is not None:
+            _APP.processEvents()
+
+        self.assertFalse(self.view._panning)
+        self.assertEqual(hbar.value(), h_before - 120)
+        self.assertEqual(vbar.value(), v_before - 80)
+        # 拖动画布不应移动节点。
+        self.assertEqual(self.graph.nodes[node.id].pos, node_pos)
+
+    def test_blank_click_clears_selection_without_panning(self) -> None:
+        node = self._prepare_navigation_canvas()
+        self.view.set_selected_node(node.id)
+        hbar = self.view.horizontalScrollBar()
+        vbar = self.view.verticalScrollBar()
+        h_before, v_before = hbar.value(), vbar.value()
+
+        QTest.mouseClick(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            QPoint(20, 20),
+        )
+        if _APP is not None:
+            _APP.processEvents()
+
+        self.assertIsNone(self.view.selected_node_id())
+        self.assertEqual((hbar.value(), vbar.value()), (h_before, v_before))
+
+    def test_ctrl_drag_blank_keeps_rubber_band_selection(self) -> None:
+        node = self._prepare_navigation_canvas()
+        item = self.view._nodes[node.id]
+        center = self.view.mapFromScene(item.sceneBoundingRect().center())
+        start = QPoint(center.x() - 180, center.y() - 140)
+        end = QPoint(center.x() + 180, center.y() + 140)
+        viewport = self.view.viewport()
+        self.view._scene.clearSelection()
+
+        QTest.mousePress(viewport, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ControlModifier, start)
+        self.assertFalse(self.view._panning)
+        QTest.mouseMove(viewport, end)
+        QTest.mouseRelease(
+            viewport, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ControlModifier, end
+        )
+        if _APP is not None:
+            _APP.processEvents()
+
+        self.assertEqual(self.view.selected_node_id(), node.id)
 
     # ------------------------------------------------------------------ 点击
     def _show_and_focus_node(self, node: NodeModel):

@@ -130,6 +130,9 @@ class GraphView(QGraphicsView):
         self._errors: dict[str, str] = {}
         self._thumbnails_enabled = bool(settings.show_node_thumbnails)
         self._syncing_selection = False
+        self._panning = False
+        self._pan_last = QPointF()
+        self._pan_dragged = False
         self._move_start: dict[str, QPointF] = {}
         self._pending_move_target: _MoveTarget | None = None
         self._pending_move_reason: str | None = None
@@ -154,6 +157,10 @@ class GraphView(QGraphicsView):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
+        # 隐藏滚动条，让画布看起来是一整块可自由拖动的画布；平移仍通过
+        # 左键拖动空白处 / Shift+滚轮完成（滚动条只是不显示，范围仍有效）。
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self._selection_timer = QTimer(self)
         self._selection_timer.setSingleShot(True)
@@ -1366,6 +1373,66 @@ class GraphView(QGraphicsView):
         return commands, f"已将节点“{title}”插入到连线中"
 
     # --------------------------------------------------------------- 鼠标事件
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        # 左键从空白处按下 = 拖动画布；按住 Ctrl 时仍交给视图做框选。
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and not (event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            and self.itemAt(event.position().toPoint()) is None
+        ):
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            self._panning = True
+            self._pan_last = QPointF(event.position())
+            self._pan_dragged = False
+            self._selection_timer.stop()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        if self._panning:
+            if not (event.buttons() & Qt.MouseButton.LeftButton):
+                self._finish_canvas_pan()
+                super().mouseMoveEvent(event)
+                return
+            position = QPointF(event.position())
+            delta = position - self._pan_last
+            self._pan_last = position
+            if delta.x() or delta.y():
+                self._pan_dragged = True
+                self._scroll_canvas(
+                    -int(round(delta.x())),
+                    -int(round(delta.y())),
+                )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        if self._panning and event.button() == Qt.MouseButton.LeftButton:
+            dragged = self._pan_dragged
+            self._finish_canvas_pan()
+            if not dragged:
+                # 空白处单击：保持“点击空白清空选择”的旧行为。
+                self._scene.clearSelection()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _finish_canvas_pan(self) -> None:
+        self._panning = False
+        self._pan_dragged = False
+        self.viewport().unsetCursor()
+
+    def _scroll_canvas(self, dx: int, dy: int) -> None:
+        """按视口像素平移画布；滚动条单位与视口像素一致。"""
+
+        hbar = self.horizontalScrollBar()
+        vbar = self.verticalScrollBar()
+        hbar.setValue(hbar.value() + dx)
+        vbar.setValue(vbar.value() + dy)
+
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt 接口
         if event.button() == Qt.MouseButton.LeftButton:
             item = self._node_item_at(event.position().toPoint())
@@ -1406,14 +1473,41 @@ class GraphView(QGraphicsView):
         super().keyPressEvent(event)
 
     def wheelEvent(self, event) -> None:  # noqa: N802 - Qt 接口
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+        modifiers = event.modifiers()
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
             factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
             scale = self.transform().m11() * factor
             if self._zoom_min <= scale <= self._zoom_max:
                 self.scale(factor, factor)
             event.accept()
             return
+        if modifiers & Qt.KeyboardModifier.ShiftModifier:
+            self._scroll_canvas_horizontally(event)
+            event.accept()
+            return
         super().wheelEvent(event)
+
+    def _scroll_canvas_horizontally(self, event) -> None:
+        """Shift+滚轮：把纵向滚轮量换算成横向滚动。"""
+
+        pixel_delta = event.pixelDelta()
+        angle_delta = event.angleDelta()
+        if pixel_delta.x() or pixel_delta.y():
+            amount = pixel_delta.x() or pixel_delta.y()
+        else:
+            delta = angle_delta.y() or angle_delta.x()
+            if not delta:
+                return
+            lines = QApplication.wheelScrollLines()
+            bar = self.horizontalScrollBar()
+            # 与 Qt 默认滚轮一致：一格 = 120，滚动 wheelScrollLines 行；
+            # 返回 -1 表示整页。高精度滚轮按比例换算。
+            step = bar.pageStep() if lines <= 0 else bar.singleStep() * lines
+            amount = int(round(delta / 120.0 * step))
+        if not amount:
+            return
+        bar = self.horizontalScrollBar()
+        bar.setValue(bar.value() - amount)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt 接口
         super().resizeEvent(event)
@@ -1617,11 +1711,15 @@ class GraphView(QGraphicsView):
 
     def _update_scene_rect(self) -> None:
         items_rect = self._scene.itemsBoundingRect()
+        visible = self.mapToScene(self.viewport().rect()).boundingRect()
         if items_rect.isNull() or not items_rect.isValid() or items_rect.isEmpty():
             base_rect = QRectF(-500.0, -350.0, 1000.0, 700.0)
         else:
-            base_rect = items_rect.adjusted(-180.0, -180.0, 180.0, 180.0)
-        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+            # 内容外留 180px 操作余量；再加一屏空白，保证左键拖动画布时
+            # 即使流程图刚好放得下也始终有平移空间。
+            pad_x = 180.0 + (visible.width() if visible.isValid() else 0.0)
+            pad_y = 180.0 + (visible.height() if visible.isValid() else 0.0)
+            base_rect = items_rect.adjusted(-pad_x, -pad_y, pad_x, pad_y)
         if visible.isValid() and not visible.isEmpty():
             union = base_rect.united(visible)
         else:
