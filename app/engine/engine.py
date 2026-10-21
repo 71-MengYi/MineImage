@@ -2,16 +2,35 @@
 
 设计要点
 --------
-* 所有计算在单一后台线程池中执行，UI 线程只接收结果信号；
 * 每次请求在主线程抓取一份不可变的图快照（含算子注册表引用），后台线程
   完全不接触正在变化的模型；
+* 一次请求内部用 concurrent.futures.ThreadPoolExecutor 并行执行互不依赖的
+  节点：任务按拓扑序提交，兄弟分支（同一节点的多个下游）真正同时运行，
+  有依赖的节点在任务内部等待上游 future 完成；
+* 节点数据更新后会递归更新全部下游：preview_node / commit_node /
+  update_nodes 计算目标节点的同时计算它的所有子孙；refresh_node 仍只重算
+  单个节点（以及它尚未缓存的上游）；
 * 通过 generation + revision 双重检查丢弃过期结果：新请求会让旧 generation
-  的所有排队信号失效，节点 revision 变化后旧结果也不会写入缓存；
-* 节点级结果缓存（快照）：点击节点立刻拿到上次结果，参数变更只重算当前节点，
-  点击“保存”后才重算下游；
+  的所有排队信号失效，节点 revision 变化后旧结果也不会写入缓存；旧的慢算子
+  无法中断时允许新请求并行启动，旧结果最终被 generation 检查丢弃；
+* 节点级结果缓存（快照）：点击节点立刻拿到上次结果，参数变更会重算当前节点
+  与下游，保证画布显示的数据始终与参数一致；
 * 算子异常被捕获并记录，节点标红，不中断其它分支；
-* ``shutdown()`` 会先使 generation 失效再等待后台线程，避免退出后还有结果
-  回写到已销毁的界面。
+* 默认并行度取 AppSettings.execution_workers（默认 4，范围 1..16），构造时
+  也可用 workers= 显式指定；
+* shutdown() 会先使 generation 失效再等待后台线程，避免退出后还有结果回写
+  到已销毁的界面。
+
+线程模型
+--------
+同一个请求内的节点任务由多个后台线程并发执行，因此 Operator.process() 必须
+线程安全：不得依赖算子实例上的可变状态，也不得原地修改输入图像（传入的
+ImageData 可能被多个兄弟分支同时读取）。历史上“算子只在单一后台线程里串行
+执行”的假设已经移除。
+
+引擎自身的结果缓存只在主线程的槽函数里写入 _results / _errors；后台线程只
+通过 Qt 信号（自动排队到主线程）报告进度，并用一把只保护 cache /
+error_nodes / failed 的锁同步线程间的求值状态。
 """
 
 from __future__ import annotations
@@ -21,8 +40,10 @@ import logging
 import threading
 import time
 import traceback
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
@@ -53,7 +74,7 @@ class NodeResult:
 
     @property
     def primary(self) -> ImageData | None:
-        """第一个图像输出；纯数值 / 结构化数据的节点返回 ``None``。"""
+        """第一个图像输出；纯数值 / 结构化数据的节点返回 None。"""
 
         for value in self.outputs.values():
             if isinstance(value, ImageData):
@@ -81,7 +102,7 @@ class NodeResult:
         return "；".join(lines)
 
     def output_type_summary(self) -> str:
-        """按输出数据类型汇总，例如 ``图像、连通域、数值×2``。"""
+        """按输出数据类型汇总，例如 图像、连通域、数值×2。"""
 
         counts: dict[str, int] = {}
         for value in self.outputs.values():
@@ -135,24 +156,34 @@ class _CancelToken:
 
 
 class _EvalJob(QRunnable):
+    """一次求值请求：在 QThreadPool 线程里驱动内部的多线程节点执行器。"""
+
     def __init__(
         self,
         engine: "ExecutionEngine",
-        target_id: str,
+        roots: tuple[str, ...],
         generation: int,
         snapshot: _GraphSnapshot,
         token: _CancelToken,
+        max_workers: int,
     ) -> None:
         super().__init__()
         self.engine = engine
-        self.target_id = target_id
+        self.roots = roots
         self.generation = generation
         self.snapshot = snapshot
         self.token = token
+        self.max_workers = max_workers
         self.setAutoDelete(True)
 
     def run(self) -> None:  # pragma: no cover - 后台线程
-        self.engine._run_job(self.target_id, self.generation, self.snapshot, self.token)
+        self.engine._run_job(
+            self.roots,
+            self.generation,
+            self.snapshot,
+            self.token,
+            self.max_workers,
+        )
 
 
 class ExecutionEngine(QObject):
@@ -168,7 +199,7 @@ class ExecutionEngine(QObject):
     _started = Signal(int, str)
     _computed = Signal(int, object)
     _failed = Signal(int, str, int, str, str)  # generation, node, revision, message, details
-    _finished = Signal(int, str, bool)
+    _finished = Signal(int, object, bool)  # generation, roots, success
 
     def __init__(
         self,
@@ -176,11 +207,19 @@ class ExecutionEngine(QObject):
         registry: OperatorRegistry,
         settings: AppSettings,
         parent: QObject | None = None,
+        *,
+        workers: int | None = None,
     ) -> None:
         super().__init__(parent)
         self.workspace = workspace
         self.registry = registry
         self.settings = settings
+        if workers is None:
+            workers = settings.execution_workers
+        try:
+            self._workers = max(1, int(workers))
+        except (TypeError, ValueError):
+            self._workers = 1
         self._results: dict[str, NodeResult] = {}
         self._errors: dict[str, NodeError] = {}
         self._generation = 0
@@ -188,8 +227,9 @@ class ExecutionEngine(QObject):
         self._busy = False
         self._shutting_down = False
         self._pool = QThreadPool(self)
-        # 单后台线程：保证同一时刻只有一个计算在跑，并且结果顺序可控。
-        self._pool.setMaxThreadCount(1)
+        # 允许两个请求同时在跑：新请求不必等待旧请求里无法中断的慢算子结束，
+        # 旧 generation 的排队结果会由 _on_* 的 generation 检查丢弃。
+        self._pool.setMaxThreadCount(2)
 
         self._started.connect(self._on_started)
         self._computed.connect(self._on_computed)
@@ -213,7 +253,12 @@ class ExecutionEngine(QObject):
 
     # ------------------------------------------------------------------ 请求
     def preview_node(self, node_id: str) -> None:
-        """点击节点：有快照时立即回放，不打断正在运行的计算；否则异步计算上游。"""
+        """选中 / 预览节点：重算该节点并递归更新全部下游。
+
+        已有同一 revision 的快照时同步回放，且绝不取消正在运行的后台任务；
+        同一 revision 的失败也直接回放错误，避免重复跑图。需要真正计算时先让
+        该节点与全部下游缓存失效，再启动一次“下游递归”请求。
+        """
         if self._shutting_down:
             return
         node = self.workspace.graph.nodes.get(node_id)
@@ -226,10 +271,10 @@ class ExecutionEngine(QObject):
             return
         cached_error = self._errors.get(node_id)
         if cached_error is not None and cached_error.revision == node.revision:
-            # 同一 revision 下重复点击失败节点：直接回放错误，避免重复跑图。
             self.node_failed.emit(node_id, cached_error.message)
             return
-        self._start(node_id)
+        self._clear_cached(node_id, downstream=True)
+        self._start((node_id,), compute_downstream=True)
 
     def commit_node(self, node_id: str) -> None:
         """保存：使该节点及全部下游失效，并重算整棵下游子树。"""
@@ -237,23 +282,49 @@ class ExecutionEngine(QObject):
             return
         if node_id not in self.workspace.graph.nodes:
             return
-        self.invalidate(node_id, downstream=True)
-        self._start(node_id, compute_downstream=True)
+        self._clear_cached(node_id, downstream=True)
+        self._start((node_id,), compute_downstream=True)
 
     def refresh_node(self, node_id: str) -> None:
-        """强制重算单个节点（不重算下游）。"""
+        """强制重算单个节点（不重算下游，上游按需补齐）。"""
         if self._shutting_down:
             return
         if node_id not in self.workspace.graph.nodes:
             return
-        self.invalidate(node_id, downstream=False)
-        self._start(node_id)
+        self._clear_cached(node_id, downstream=False)
+        self._start((node_id,), compute_downstream=False)
 
-    def _start(self, target_id: str, *, compute_downstream: bool = False) -> None:
+    def update_nodes(self, node_ids: Iterable[str]) -> None:
+        """一次请求重算多个根节点及其全部下游。
+
+        不存在的节点会被忽略；重复根会去重。整批根节点共用一次快照与同一个
+        并行执行器，chain_finished 对每个根各发一次（成功与否取整次请求）。
+        """
         if self._shutting_down:
             return
-        if target_id not in self.workspace.graph.nodes:
+        roots: list[str] = []
+        seen: set[str] = set()
+        for node_id in node_ids:
+            if node_id in seen or node_id not in self.workspace.graph.nodes:
+                continue
+            seen.add(node_id)
+            roots.append(node_id)
+        if not roots:
             return
+        for root in roots:
+            self._clear_cached(root, downstream=True)
+        self._start(tuple(roots), compute_downstream=True)
+
+    def _start(self, roots: Sequence[str], *, compute_downstream: bool = False) -> None:
+        if self._shutting_down:
+            return
+        roots = tuple(dict.fromkeys(roots))
+        if not roots:
+            return
+        if any(root not in self.workspace.graph.nodes for root in roots):
+            roots = tuple(root for root in roots if root in self.workspace.graph.nodes)
+            if not roots:
+                return
         # 先让 generation 失效，再取消旧任务：即使旧任务正在执行且无法立刻
         # 停止，它后续发出的排队信号也会在主线程被丢弃。
         self._generation += 1
@@ -264,17 +335,27 @@ class ExecutionEngine(QObject):
             snapshot = self._capture_graph()
         except Exception as exc:  # noqa: BLE001 - 快照失败不能把引擎留在“忙”状态
             self._set_busy(False)
-            self.record_immediate_failure(
-                target_id,
-                f"无法创建执行快照：{exc.__class__.__name__}: {exc}",
-                traceback.format_exc(),
-            )
+            for root in roots:
+                self.record_immediate_failure(
+                    root,
+                    f"无法创建执行快照：{exc.__class__.__name__}: {exc}",
+                    traceback.format_exc(),
+                )
             return
         snapshot.compute_downstream = compute_downstream
         self._token = token
         self._set_busy(True)
-        job = _EvalJob(self, target_id, generation, snapshot, token)
+        job = _EvalJob(self, roots, generation, snapshot, token, self._workers)
         self._pool.start(job)
+
+    def _clear_cached(self, node_id: str, *, downstream: bool) -> None:
+        """只清空缓存，不影响正在执行的任务（由下一个请求统一取消）。"""
+        targets = [node_id]
+        if downstream:
+            targets.extend(self.workspace.graph.descendants(node_id))
+        for target in targets:
+            self._results.pop(target, None)
+            self._errors.pop(target, None)
 
     def _abandon_current(self) -> None:
         """放弃当前请求，并让它的 queued 结果全部失效。"""
@@ -318,6 +399,14 @@ class ExecutionEngine(QObject):
         for node_id in node_ids:
             self._results.pop(node_id, None)
             self._errors.pop(node_id, None)
+
+    def set_workers(self, count: int) -> None:
+        """调整后续请求的并行 worker 数；不会中断正在执行的请求。"""
+
+        try:
+            self._workers = max(1, min(16, int(count)))
+        except (TypeError, ValueError):
+            self._workers = 1
 
     def set_registry(self, registry: OperatorRegistry) -> None:
         self.registry = registry
@@ -377,21 +466,20 @@ class ExecutionEngine(QObject):
     # ------------------------------------------------------------- 后台执行
     def _run_job(
         self,
-        target_id: str,
+        roots: Sequence[str],
         generation: int,
         snapshot: _GraphSnapshot,
         token: _CancelToken,
+        max_workers: int,
     ) -> None:
-        state = _EvalState(self, snapshot, generation, token)
+        state = _EvalState(self, snapshot, generation, token, max_workers)
         try:
-            if snapshot.compute_downstream:
-                state.compute_subtree(target_id)
-            else:
-                state.compute_node(target_id)
+            state.compute(roots)
         except Exception as exc:  # noqa: BLE001 - 防止后台线程崩溃
-            state.record_failure(target_id, f"执行失败：{exc}", traceback.format_exc())
+            fallback = roots[0] if roots else ""
+            state.record_failure(fallback, f"执行失败：{exc}", traceback.format_exc())
         finally:
-            self._finished.emit(generation, target_id, not state.failed)
+            self._finished.emit(generation, list(roots), state.success)
 
     def record_immediate_failure(self, node_id: str, message: str, details: str = "") -> None:
         """主线程侧的失败通知（例如快照创建失败）。"""
@@ -437,15 +525,21 @@ class ExecutionEngine(QObject):
         self._errors[node_id] = NodeError(node_id, message, details, revision)
         self.node_failed.emit(node_id, message)
 
-    def _on_chain_finished(self, generation: int, target_id: str, success: bool) -> None:
+    def _on_chain_finished(self, generation: int, roots: Sequence[str], success: bool) -> None:
         if self._shutting_down or generation != self._generation:
             return
         self._set_busy(False)
-        self.chain_finished.emit(target_id, success)
+        for root in roots:
+            self.chain_finished.emit(root, success)
 
 
 class _EvalState:
-    """一次请求内部的执行状态（仅后台线程访问）。"""
+    """一次请求内部的执行状态。
+
+    实例会被同一请求内的多个 worker 线程并发访问，因此 cache / error_nodes /
+    failed 统一由 self._lock 保护。锁只覆盖字典与集合操作，绝不在持锁期间执行
+    算子。
+    """
 
     def __init__(
         self,
@@ -453,54 +547,208 @@ class _EvalState:
         snapshot: _GraphSnapshot,
         generation: int,
         token: _CancelToken,
+        max_workers: int,
     ) -> None:
         self.engine = engine
         self.snapshot = snapshot
         self.generation = generation
         self.token = token
+        self.max_workers = max(1, int(max_workers))
+        self._lock = threading.Lock()
         self.cache: dict[str, NodeResult] = dict(snapshot.seed)
-        self.failed = False
         self.error_nodes: set[str] = set()
+        self.failed = False
+        self._preds, self._succs = self._build_adjacency()
+
+    # ------------------------------------------------------------- 状态访问
+    @property
+    def success(self) -> bool:
+        with self._lock:
+            return not self.failed
+
+    def _cached(self, node_id: str) -> NodeResult | None:
+        with self._lock:
+            return self.cache.get(node_id)
+
+    def _cached_failure(self, node_id: str) -> bool:
+        with self._lock:
+            return node_id in self.error_nodes
+
+    def _store_result(self, result: NodeResult) -> None:
+        with self._lock:
+            self.cache[result.node_id] = result
+            self.error_nodes.discard(result.node_id)
+
+    def _mark_failure(self, node_id: str) -> bool:
+        with self._lock:
+            if node_id in self.error_nodes:
+                return False
+            self.error_nodes.add(node_id)
+            self.failed = True
+            return True
+
+    # --------------------------------------------------------------- 图收集
+    def _build_adjacency(self) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+        """从快照 inputs 构建去重后的前驱/后继邻接表。
+
+        同一对节点之间可能存在多条端口连线（例如通道拆分 / 合并），这里按
+        “唯一节点对”去重，避免拓扑排序把并行端口误判成多条依赖边。
+        """
+        nodes = self.snapshot.nodes
+        preds: dict[str, list[str]] = {node_id: [] for node_id in nodes}
+        succs: dict[str, list[str]] = {node_id: [] for node_id in nodes}
+        seen: set[tuple[str, str]] = set()
+        for (dst_node, _dst_port), (src_node, _src_port) in self.snapshot.inputs.items():
+            if src_node not in nodes or dst_node not in nodes:
+                continue
+            edge = (src_node, dst_node)
+            if edge in seen:
+                continue
+            seen.add(edge)
+            preds[dst_node].append(src_node)
+            succs[src_node].append(dst_node)
+        return preds, succs
+
+    def _closure(self, starts: Iterable[str], adjacency: dict[str, list[str]]) -> set[str]:
+        seen: set[str] = set()
+        queue: deque[str] = deque(
+            node_id for node_id in starts if node_id in self.snapshot.nodes
+        )
+        while queue:
+            node_id = queue.popleft()
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            for neighbour in adjacency.get(node_id, ()):
+                if neighbour not in seen:
+                    queue.append(neighbour)
+        return seen
+
+    def _collect_nodes(self, roots: Sequence[str]) -> set[str]:
+        """计算集合：根的祖先闭包 ∪ 根（∪ 下游闭包及其祖先）。"""
+        selected = self._closure(roots, self._preds)
+        if self.snapshot.compute_downstream:
+            downstream = self._closure(roots, self._succs)
+            selected |= downstream
+            # 下游节点可能还有根之外的上游（例如两条分支汇合的 merge）：这些
+            # 外部输入必须一起求值，否则汇合节点拿不到输入。该扩展只会补上
+            # 计算所必需的祖先，已有快照的节点会直接命中缓存。
+            selected |= self._closure(downstream, self._preds)
+        return {node_id for node_id in selected if node_id in self.snapshot.nodes}
+
+    def _topological_order(self, selected: set[str]) -> list[str]:
+        """Kahn 拓扑排序；同一对节点的多条端口连线只算一条边。"""
+        indegree: dict[str, int] = {}
+        for node_id in selected:
+            indegree[node_id] = sum(
+                1 for src in self._preds.get(node_id, ()) if src in selected
+            )
+        queue: deque[str] = deque(
+            node_id
+            for node_id in self.snapshot.nodes
+            if node_id in selected and indegree[node_id] == 0
+        )
+        order: list[str] = []
+        while queue:
+            node_id = queue.popleft()
+            order.append(node_id)
+            for dst_node in self._succs.get(node_id, ()):
+                if dst_node not in indegree:
+                    continue
+                indegree[dst_node] -= 1
+                if indegree[dst_node] == 0:
+                    queue.append(dst_node)
+        if len(order) != len(selected):
+            # 模型层已经禁止回环；这里只做防御，保证任务仍会被提交而不死锁。
+            ordered = set(order)
+            remaining = [
+                node_id
+                for node_id in self.snapshot.nodes
+                if node_id in selected and node_id not in ordered
+            ]
+            LOG.warning(
+                "执行快照存在环：%d 个节点无法排序，已追加到末尾",
+                len(remaining),
+            )
+            order.extend(remaining)
+        return order
 
     # ------------------------------------------------------------------ 执行
-    def compute_node(self, node_id: str) -> NodeResult | None:
+    def compute(self, roots: Sequence[str]) -> None:
+        """并行求值：按拓扑序提交任务，依赖节点等待上游 future。"""
+        selected = self._collect_nodes(roots)
+        order = self._topological_order(selected)
+        if not order:
+            return
+        futures: dict[str, Future[Any]] = {}
+        max_workers = min(self.max_workers, len(order))
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="mineimage-eval",
+        ) as executor:
+            for node_id in order:
+                # 拓扑序保证依赖节点一定先提交，因此这里能拿到全部上游 future；
+                # 任务内部不再读写共享的 futures 字典，避免额外加锁。
+                deps = {
+                    src_node: futures[src_node]
+                    for src_node in self._preds.get(node_id, ())
+                    if src_node in futures
+                }
+                futures[node_id] = executor.submit(self._run_node, node_id, deps)
+            for future in futures.values():
+                try:
+                    future.result()
+                except Exception:  # noqa: BLE001 - _run_node 已兜底，这里只等待完成
+                    LOG.exception("节点任务异常退出")
+        with self._lock:
+            self.failed = self.failed or bool(self.error_nodes)
+
+    def _run_node(
+        self,
+        node_id: str,
+        deps: dict[str, Future[Any]],
+    ) -> NodeResult | None:
+        """单个节点任务：任何异常都在任务内部消化，不抛给等待方。"""
+        try:
+            return self._evaluate_node(node_id, deps)
+        except Exception as exc:  # noqa: BLE001 - 后台任务不能把异常抛给等待方
+            self.record_failure(node_id, f"执行失败：{exc}", traceback.format_exc())
+            return None
+
+    def _evaluate_node(
+        self,
+        node_id: str,
+        deps: dict[str, Future[Any]],
+    ) -> NodeResult | None:
         if self.token.cancelled:
             return None
-        if node_id in self.cache:
-            return self.cache[node_id]
-        if node_id in self.error_nodes:
+        cached = self._cached(node_id)
+        if cached is not None:
+            # seed 里已有 fresh 结果：不重算、不发 _started。
+            return cached
+        if self._cached_failure(node_id):
             return None
         snap = self.snapshot.nodes.get(node_id)
         if snap is None:
             return None
-
         if snap.op_id == "__source__":
-            result = self._compute_source(snap)
-        else:
-            result = self._compute_operator(snap)
-        if result is not None:
-            self.cache[node_id] = result
-            self.engine._computed.emit(self.generation, result)
-        return result
+            return self._compute_source(snap)
+        return self._compute_operator(snap, deps)
 
-    def compute_subtree(self, target_id: str) -> None:
-        start = self.compute_node(target_id)
-        if start is None:
-            self.failed = True
-        # 下游按 BFS 顺序逐个计算；每个节点所需的其它上游由 compute_node
-        # 递归补齐（DAG 已在模型层保证无环），重复访问会被 cache 命中。
-        queue = list(self.snapshot.children.get(target_id, []))
-        visited: set[str] = set()
-        while queue and not self.token.cancelled:
-            node_id = queue.pop(0)
-            if node_id in visited:
-                continue
-            visited.add(node_id)
-            self.compute_node(node_id)
-            queue.extend(self.snapshot.children.get(node_id, []))
-        if self.token.cancelled:
-            return
-        self.failed = self.failed or bool(self.error_nodes)
+    def _wait_upstream(
+        self,
+        src_node: str,
+        deps: dict[str, Future[Any]],
+    ) -> NodeResult | None:
+        future = deps.get(src_node)
+        if future is not None:
+            try:
+                return future.result()
+            except Exception:  # noqa: BLE001 - 上游任务已兜底，仍防御一次
+                LOG.exception("上游节点 %s 任务异常", src_node)
+                return None
+        # 依赖不在本次计算集合里（理论上已被祖先闭包补齐）：只能复用已有快照。
+        return self._cached(src_node)
 
     def _compute_source(self, snap: _NodeSnap) -> NodeResult | None:
         self.engine._started.emit(self.generation, snap.id)
@@ -511,31 +759,39 @@ class _EvalState:
             return None
         wrapped = ImageData(image.array, snap.title or image.name, image.color_space)
         elapsed = (time.perf_counter() - started) * 1000.0
-        return NodeResult(
+        result = NodeResult(
             snap.id,
             {"image": wrapped},
             elapsed,
             snap.revision,
             port_labels={"image": "图像"},
         )
+        self._store_result(result)
+        self.engine._computed.emit(self.generation, result)
+        return result
 
-    def _compute_operator(self, snap: _NodeSnap) -> NodeResult | None:
-        if self.token.cancelled:
-            return None
-        started = time.perf_counter()
+    def _compute_operator(
+        self,
+        snap: _NodeSnap,
+        deps: dict[str, Future[Any]],
+    ) -> NodeResult | None:
         entry = self.snapshot.registry.entry(snap.op_id)
         if entry is None:
             self.record_failure(snap.id, f"找不到算子“{snap.op_id}”，请刷新算子库")
             return None
         spec = entry.spec
         inputs: dict[str, Any | None] = {}
+        upstream_results: dict[str, NodeResult | None] = {}
         for port in spec.inputs:
             source = self.snapshot.inputs.get((snap.id, port.key))
             if source is None:
                 inputs[port.key] = None
                 continue
             src_node, src_port = source
-            upstream = self.compute_node(src_node)
+            if src_node not in upstream_results:
+                # 同一 src 的多个端口只等待一次 future。
+                upstream_results[src_node] = self._wait_upstream(src_node, deps)
+            upstream = upstream_results[src_node]
             if upstream is None:
                 self.record_failure(
                     snap.id,
@@ -549,6 +805,9 @@ class _EvalState:
                     f"上游节点未提供输出端口“{src_port}”的数据",
                 )
                 return None
+        if self.token.cancelled:
+            return None
+        started = time.perf_counter()
         # 上游就绪后才算真正开始执行本节点，UI 的“运行中”高亮更准确。
         self.engine._started.emit(self.generation, snap.id)
         try:
@@ -579,13 +838,14 @@ class _EvalState:
             return None
         elapsed = (time.perf_counter() - started) * 1000.0
         labels = {port.key: port.label for port in spec.outputs if port.key in outputs}
-        return NodeResult(snap.id, outputs, elapsed, snap.revision, port_labels=labels)
+        result = NodeResult(snap.id, outputs, elapsed, snap.revision, port_labels=labels)
+        self._store_result(result)
+        self.engine._computed.emit(self.generation, result)
+        return result
 
     def record_failure(self, node_id: str, message: str, details: str = "") -> None:
-        if node_id in self.error_nodes:
+        if not self._mark_failure(node_id):
             return
-        self.failed = True
-        self.error_nodes.add(node_id)
         snap = self.snapshot.nodes.get(node_id)
         revision = snap.revision if snap is not None else 0
         LOG.error(

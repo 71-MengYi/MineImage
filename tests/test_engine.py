@@ -97,12 +97,74 @@ class EngineTestCase(unittest.TestCase):
         return predicate() if predicate is not None else True
 
     def wait_chain(self, target_id: str, timeout: float = 10.0) -> bool:
+        return self.wait_chain_in(self.chain_events, target_id, timeout)
+
+    def wait_chain_in(
+        self,
+        chain_events: list[tuple[str, bool]],
+        target_id: str,
+        timeout: float = 10.0,
+    ) -> bool:
         reached = self.pump(
-            lambda: any(node_id == target_id for node_id, _ok in self.chain_events),
+            lambda: any(node_id == target_id for node_id, _ok in chain_events),
             timeout,
         )
-        self.assertTrue(reached, f"等待 {target_id} 的 chain_finished 超时；事件={self.chain_events}")
-        return next(ok for node_id, ok in reversed(self.chain_events) if node_id == target_id)
+        self.assertTrue(reached, f"等待 {target_id} 的 chain_finished 超时；事件={chain_events}")
+        return next(ok for node_id, ok in reversed(chain_events) if node_id == target_id)
+
+    def new_engine(
+        self,
+        *,
+        registry: OperatorRegistry | None = None,
+        workers: int | None = None,
+    ) -> ExecutionEngine:
+        """创建一个共享工作区的独立引擎；清理时关闭，避免线程泄漏。"""
+        engine = ExecutionEngine(
+            self.workspace,
+            registry if registry is not None else self.registry,
+            self.settings,
+            workers=workers,
+        )
+        self.addCleanup(engine.shutdown)
+        return engine
+
+    def attach_events(self, engine: ExecutionEngine) -> dict[str, list]:
+        """收集引擎信号：timeline 按到达顺序记录 started / finished / failed。"""
+        events: dict[str, list] = {
+            "started": [],
+            "finished": [],
+            "failures": [],
+            "chain": [],
+            "busy": [],
+            "timeline": [],
+        }
+
+        def on_started(node_id: str) -> None:
+            events["started"].append(node_id)
+            events["timeline"].append(("started", node_id))
+
+        def on_finished(result: NodeResult) -> None:
+            events["finished"].append(result)
+            events["timeline"].append(("finished", result.node_id))
+
+        def on_failed(node_id: str, message: str) -> None:
+            events["failures"].append((node_id, message))
+            events["timeline"].append(("failed", node_id))
+
+        def on_chain(node_id: str, success: bool) -> None:
+            events["chain"].append((node_id, success))
+
+        def on_busy(value: bool) -> None:
+            events["busy"].append(value)
+
+        engine.node_started.connect(on_started)
+        engine.node_finished.connect(on_finished)
+        engine.node_failed.connect(on_failed)
+        engine.chain_finished.connect(on_chain)
+        engine.busy_changed.connect(on_busy)
+        # 持有回调引用，避免被垃圾回收后失去信号连接。
+        events["_handlers"] = (on_started, on_finished, on_failed, on_chain, on_busy)
+        return events
 
     def add_source(self, array: np.ndarray, name: str = "源图像"):
         image = ImageData(array, name)
@@ -294,25 +356,30 @@ class ExecutionEngineTests(EngineTestCase):
         self.assertTrue(delivered)
         self.assertEqual({result.revision for result in delivered}, {final_revision})
 
-    def test_preview_only_recomputes_node_commit_recomputes_downstream(self) -> None:
+    def test_preview_and_commit_both_recompute_downstream(self) -> None:
         _source, gray, blur = self.build_chain()
         self.engine.preview_node(blur.id)
         self.assertTrue(self.wait_chain(blur.id))
         old_gray = self.engine.result(gray.id)
         old_blur = self.engine.result(blur.id)
 
-        # 预览：只更新灰度节点，下游保留上一次快照。
+        # 预览：参数变化会级联重算下游，且 blur 只交付一次。
         self.workspace.graph.set_node_params(gray.id, {"mode": "average"})
         self.engine.invalidate(gray.id, downstream=False)
+        self.finished.clear()
         self.chain_events.clear()
         self.engine.preview_node(gray.id)
         self.assertTrue(self.wait_chain(gray.id))
         new_gray = self.engine.result(gray.id)
+        new_blur = self.engine.result(blur.id)
         self.assertIsNot(new_gray, old_gray)
         self.assertEqual(new_gray.revision, gray.revision)
-        self.assertIs(self.engine.result(blur.id), old_blur)
+        self.assertIsNot(new_blur, old_blur)
+        self.assertEqual(new_blur.revision, blur.revision)
+        blur_revisions = [result.revision for result in self.finished if result.node_id == blur.id]
+        self.assertEqual(blur_revisions, [blur.revision])
 
-        # 保存：当前节点与下游子树一起重算。
+        # 保存：当前节点与下游子树继续一起重算。
         self.workspace.graph.set_node_params(gray.id, {"mode": "max"})
         self.finished.clear()
         self.chain_events.clear()
@@ -320,10 +387,33 @@ class ExecutionEngineTests(EngineTestCase):
         self.assertTrue(self.wait_chain(gray.id))
         self.assertIsNot(self.engine.result(gray.id), new_gray)
         recomputed = self.engine.result(blur.id)
-        self.assertIsNot(recomputed, old_blur)
+        self.assertIsNot(recomputed, new_blur)
         self.assertEqual(recomputed.revision, blur.revision)
         blur_revisions = [result.revision for result in self.finished if result.node_id == blur.id]
         self.assertEqual(blur_revisions, [blur.revision])
+
+    def test_preview_updates_downstream_recursively(self) -> None:
+        _source, gray, blur = self.build_chain()
+        self.engine.preview_node(blur.id)
+        self.assertTrue(self.wait_chain(blur.id))
+        old_gray = self.engine.result(gray.id)
+        old_blur = self.engine.result(blur.id)
+
+        self.workspace.graph.set_node_params(gray.id, {"mode": "average"})
+        self.engine.invalidate(gray.id, downstream=False)
+        self.finished.clear()
+        self.chain_events.clear()
+        self.engine.preview_node(gray.id)
+        self.assertTrue(self.wait_chain(gray.id))
+
+        # 预览上游节点也必须递归重算 blur，而不是保留旧快照。
+        recomputed_gray = self.engine.result(gray.id)
+        recomputed_blur = self.engine.result(blur.id)
+        self.assertIsNot(recomputed_gray, old_gray)
+        self.assertIsNot(recomputed_blur, old_blur)
+        self.assertEqual(recomputed_gray.revision, gray.revision)
+        self.assertEqual(recomputed_blur.revision, blur.revision)
+        self.assertIn(blur.id, [result.node_id for result in self.finished])
 
     def test_invalidate_downstream_clears_descendant_results(self) -> None:
         _source, gray, blur = self.build_chain()
@@ -456,6 +546,124 @@ class ExecutionEngineTests(EngineTestCase):
         message = self.engine.error(merge.id).message
         self.assertIn("缺少输入", message)
         self.assertIn("红色通道", message)
+
+    # ------------------------------------------------------------ 并行 / 下游
+    def test_parallel_siblings_finish_concurrently(self) -> None:
+        delay = 0.4
+        engine = self.new_engine(
+            registry=OperatorRegistry.build([OPS_FIXTURES]),
+            workers=2,
+        )
+        events = self.attach_events(engine)
+        source = self.add_source(_image())
+        first = self.add_op("test.slow", "慢速分支一", {"delay": delay})
+        second = self.add_op("test.slow", "慢速分支二", {"delay": delay})
+        self.connect(source, first)
+        self.connect(source, second)
+
+        started_at = time.monotonic()
+        engine.preview_node(source.id)
+        self.assertTrue(self.wait_chain_in(events["chain"], source.id, timeout=15.0))
+        elapsed = time.monotonic() - started_at
+
+        slow_ids = {first.id, second.id}
+        started_positions = [
+            index
+            for index, (kind, node_id) in enumerate(events["timeline"])
+            if kind == "started" and node_id in slow_ids
+        ]
+        finished_positions = [
+            index
+            for index, (kind, node_id) in enumerate(events["timeline"])
+            if kind == "finished" and node_id in slow_ids
+        ]
+        self.assertEqual(len(started_positions), 2, events["timeline"])
+        self.assertEqual(len(finished_positions), 2, events["timeline"])
+        # 两个兄弟节点都先“开始”，之后才有任一“完成” => 真正并行。
+        self.assertLess(
+            max(started_positions),
+            min(finished_positions),
+            f"兄弟分支没有并行开始：{events['timeline']}",
+        )
+        # 串行约 2×delay；并行约 delay。1.5×delay 足以区分两者。
+        self.assertLess(
+            elapsed,
+            delay * 1.5,
+            f"两个 {delay}s 分支耗时 {elapsed:.3f}s，未体现并行",
+        )
+        self.assertIsNotNone(engine.result(first.id))
+        self.assertIsNotNone(engine.result(second.id))
+
+    def test_branch_failure_does_not_block_siblings(self) -> None:
+        self.engine.set_registry(OperatorRegistry.build([OPS_FIXTURES]))
+        source = self.add_source(_image())
+        boom = self.add_op("test.boom", "异常分支")
+        gray = self.add_op("basic.grayscale", "正常分支")
+        self.connect(source, boom)
+        self.connect(source, gray)
+
+        self.engine.preview_node(source.id)
+        self.assertFalse(self.wait_chain(source.id))
+        self.assertTrue(
+            self.pump(
+                lambda: any(result.node_id == gray.id for result in self.finished),
+                timeout=5.0,
+            ),
+            f"正常分支没有交付 node_finished：{[r.node_id for r in self.finished]}",
+        )
+        self.assertIsNotNone(self.engine.result(gray.id))
+        self.assertIsNotNone(self.engine.error(boom.id))
+        self.assertIn(boom.id, [node_id for node_id, _message in self.failures])
+
+    def test_diamond_dependency_runs_once(self) -> None:
+        source = self.add_source(_image())
+        split = self.add_op("channel.split", "通道拆分")
+        merge = self.add_op("channel.merge", "通道合并")
+        self.connect(source, split)
+        for port in ("b", "g", "r"):
+            self.connect(split, merge, port, port)
+
+        self.started.clear()
+        self.engine.preview_node(source.id)
+        self.assertTrue(self.wait_chain(source.id))
+        self.assertTrue(
+            self.pump(
+                lambda: len(self.started) >= 3 and len(self.finished) >= 3,
+                timeout=5.0,
+            ),
+            f"菱形依赖节点未全部完成：started={self.started}",
+        )
+        for node in (source, split, merge):
+            self.assertEqual(
+                self.started.count(node.id),
+                1,
+                f"{node.title} 启动了 {self.started.count(node.id)} 次：{self.started}",
+            )
+        self.assertEqual(len(self.started), 3, self.started)
+        self.assertIsNotNone(self.engine.result(merge.id))
+
+    def test_update_nodes_computes_multiple_roots_once(self) -> None:
+        source = self.add_source(_image())
+        first = self.add_op("basic.grayscale", "分支一")
+        second = self.add_op("basic.invert", "分支二")
+        self.connect(source, first)
+        self.connect(source, second)
+        self.engine.preview_node(source.id)
+        self.assertTrue(self.wait_chain(source.id))
+        old_first = self.engine.result(first.id)
+        old_second = self.engine.result(second.id)
+
+        self.chain_events.clear()
+        # 多根、重复根与不存在的节点都应被正确处理。
+        self.engine.update_nodes([first.id, second.id, first.id, "missing-node"])
+        self.assertTrue(self.wait_chain_in(self.chain_events, first.id))
+        self.assertTrue(self.wait_chain_in(self.chain_events, second.id))
+        self.assertIsNot(self.engine.result(first.id), old_first)
+        self.assertIsNot(self.engine.result(second.id), old_second)
+        delivered = [node_id for node_id, _ok in self.chain_events]
+        self.assertEqual(delivered.count(first.id), 1, self.chain_events)
+        self.assertEqual(delivered.count(second.id), 1, self.chain_events)
+        self.assertTrue(all(ok for _node_id, ok in self.chain_events))
 
     # ------------------------------------------------------------------ 取消 / 过期
     def _slow_registry(self) -> OperatorRegistry:

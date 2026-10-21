@@ -286,7 +286,79 @@ class MainWindowIntegrationTests(unittest.TestCase):
         widget.set_compare_mode("single")
         self.assertEqual(widget.compare_mode, "single")
 
-    def test_preview_only_recomputes_current_node_until_save(self) -> None:
+    def test_connect_triggers_immediate_compute_and_downstream(self) -> None:
+        widget = self._open()
+        graph = widget.workspace.graph
+        source = graph.source_nodes()[0]
+        gray_id = widget.graph_view.add_operator_at("basic.grayscale")
+        blur_id = widget.graph_view.add_operator_at("filter.gaussian_blur")
+        self.assertIsNotNone(gray_id)
+        self.assertIsNotNone(blur_id)
+        self.assertIsNone(widget.engine.result(gray_id))
+
+        # 先接 gray → blur（gray 此时缺输入），再接 source → gray：
+        # 两条连线都应立即触发后台计算，第二次更新还要递归算下游 blur。
+        graph.add_connection(gray_id, "image", blur_id, "image")
+        self._wait_idle(widget)
+        self.assertIsNotNone(widget.engine.error(blur_id))
+
+        graph.add_connection(source.id, "image", gray_id, "image")
+        self._wait_idle(widget)
+        self.assertIsNotNone(widget.engine.result(gray_id))
+        self.assertIsNotNone(widget.engine.result(blur_id))
+        # 不需要点击节点也能完成；当前节点仍是打开图像时的源节点。
+        self.assertEqual(widget._current_node_id, source.id)
+
+    def test_disconnect_recomputes_and_reports_missing_input(self) -> None:
+        widget = self._open()
+        graph = widget.workspace.graph
+        source = graph.source_nodes()[0]
+        gray_id = widget.graph_view.add_operator_at("basic.grayscale")
+        blur_id = widget.graph_view.add_operator_at("filter.gaussian_blur")
+        gray_link = graph.add_connection(source.id, "image", gray_id, "image")
+        graph.add_connection(gray_id, "image", blur_id, "image")
+        self._wait_idle(widget)
+        self.assertIsNotNone(widget.engine.result(gray_id))
+        self.assertIsNotNone(widget.engine.result(blur_id))
+
+        # 断开输入后也应立即重算：当前节点报“缺少输入”，下游报上游失败。
+        graph.remove_connection(gray_link.id)
+        self._wait_idle(widget)
+        self.assertIsNone(widget.engine.result(gray_id))
+        self.assertIn("缺少输入", widget.engine.error(gray_id).message)
+        self.assertIn("上游节点执行失败", widget.engine.error(blur_id).message)
+
+    def test_delete_node_with_children_updates_engine(self) -> None:
+        widget = self._open()
+        graph = widget.workspace.graph
+        source = graph.source_nodes()[0]
+        gray_id = widget.graph_view.add_operator_at("basic.grayscale")
+        blur_id = widget.graph_view.add_operator_at("filter.gaussian_blur")
+        graph.add_connection(source.id, "image", gray_id, "image")
+        graph.add_connection(gray_id, "image", blur_id, "image")
+        self._wait_idle(widget)
+        self.assertIsNotNone(widget.engine.result(blur_id))
+
+        # 删除 gray 及其子节点：断线与删节点的多条信号合并成一次引擎更新，
+        # 目标节点已被删除时也应安静跳过，不能抛异常。
+        widget.graph_view.delete_node_with_children(gray_id)
+        QTest.qWait(120)  # 等待连线变化合并定时器
+        self._wait_idle(widget)
+        self.assertNotIn(gray_id, graph.nodes)
+        self.assertNotIn(blur_id, graph.nodes)
+        self.assertIn(source.id, graph.nodes)
+        self.assertFalse(graph.connections)
+        self.assertIsNone(widget.engine.result(blur_id))
+
+        # 撤销恢复节点与连线，再次触发连线变化同样不能报错。
+        widget.undo_stack.undo()
+        QTest.qWait(120)
+        self._wait_idle(widget)
+        self.assertIn(gray_id, graph.nodes)
+        self.assertIn(blur_id, graph.nodes)
+        self.assertEqual(len(graph.connections), 2)
+
+    def test_param_preview_updates_downstream_immediately(self) -> None:
         widget = self._open()
         graph = widget.workspace.graph
         source = graph.source_nodes()[0]
@@ -308,17 +380,18 @@ class MainWindowIntegrationTests(unittest.TestCase):
         QTest.qWait(300)
         self._wait_idle(widget)
         self.assertEqual(gray.params["mode"], "average")
-        # 只重算当前节点：下游 blur 的快照必须保持不变
+        # 参数预览同样递归更新下游，不再需要点“保存”才生效。
         after_preview = widget.engine.result(blur_id)
-        self.assertIs(after_preview, before)
-        np.testing.assert_array_equal(after_preview.primary.array, before_array)
+        self.assertIsNotNone(after_preview)
+        self.assertIsNot(after_preview, before)
+        self.assertFalse(np.array_equal(after_preview.primary.array, before_array))
 
         widget.param_panel.save_button.click()
         QTest.qWait(200)
         self._wait_idle(widget)
         after_save = widget.engine.result(blur_id)
         self.assertIsNotNone(after_save)
-        self.assertFalse(np.array_equal(after_save.primary.array, before_array))
+        self.assertIsNot(after_save, after_preview)
 
     def test_high_bit_depth_and_float_sources(self) -> None:
         gray16 = (np.arange(64 * 96, dtype=np.uint16).reshape(64, 96) * 13).astype(np.uint16)

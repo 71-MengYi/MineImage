@@ -110,6 +110,21 @@ class AppSettings:
         self._qs.setValue("general/node_thumbnails", bool(value))
 
     @property
+    def execution_workers(self) -> int:
+        """后台执行引擎的并行工作线程数（每条独立分支一个 worker）。"""
+
+        default = min(4, max(1, os.cpu_count() or 1))
+        try:
+            value = int(self.value("execution/workers", default))
+        except (TypeError, ValueError):
+            value = default
+        return max(1, min(16, value))
+
+    @execution_workers.setter
+    def execution_workers(self, value: int) -> None:
+        self._qs.setValue("execution/workers", max(1, min(16, int(value))))
+
+    @property
     def auto_fit_on_open(self) -> bool:
         return self._as_bool(self.value("preview/auto_fit_on_open", True))
 

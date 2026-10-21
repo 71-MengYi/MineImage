@@ -34,6 +34,9 @@ DEFAULT_SPLITTER_SIZES = (200, 400, 800)
 LEGACY_SPLITTER_RATIOS = ((1, 1, 3), (1, 1, 4))
 #: 识别旧默认比例时允许的相对误差（窗口缩放与最小宽度会改变实际数值）。
 LEGACY_RATIO_TOLERANCE = 0.22
+#: 连线变化后合并触发的延迟（毫秒）：一次撤销宏 / 粘贴可能产生多条连线，
+#: 合并成一次引擎更新，避免互相取消。
+CONNECTION_UPDATE_DELAY_MS = 30
 
 LOG = logging.getLogger(__name__)
 
@@ -87,6 +90,12 @@ class WorkspaceWidget(QWidget):
         self._current_image = None
         self._last_pixel_sample = None
         self._last_undo_index = 0
+        # 连线变化后待更新的目标节点：合并同一次操作里的多条连线事件。
+        self._pending_connection_roots: set[str] = set()
+        self._connection_update_timer = QTimer(self)
+        self._connection_update_timer.setSingleShot(True)
+        self._connection_update_timer.setInterval(CONNECTION_UPDATE_DELAY_MS)
+        self._connection_update_timer.timeout.connect(self._flush_connection_updates)
         # 默认比例 1:2:4；旧版本默认比例（1:1:3 / 1:1:4）也视为“未自定义”，
         # 首次显示时校正，避免已有配置一直保留旧比例。
         saved_sizes = tuple(self.settings.workspace_splitter_sizes)
@@ -211,6 +220,7 @@ class WorkspaceWidget(QWidget):
     # ------------------------------------------------------------------ 设置
     def _sync_settings(self) -> None:
         self.undo_stack.setUndoLimit(self.settings.undo_limit)
+        self.engine.set_workers(self.settings.execution_workers)
         self.graph_view.set_thumbnails_enabled(self.settings.show_node_thumbnails)
         self.preview.set_preview_quality(
             self.settings.downsample_preview,
@@ -335,7 +345,7 @@ class WorkspaceWidget(QWidget):
         self._mark_dirty()
         node = self.workspace.graph.nodes.get(node_id)
         if node:
-            self.status_message.emit(f"已添加算子：{node.display_title()}，请连接输入后预览")
+            self.status_message.emit(f"已添加算子：{node.display_title()}，连接输入后会自动计算")
         self.graph_view.fit_graph()
         self._emit_status()
 
@@ -354,12 +364,33 @@ class WorkspaceWidget(QWidget):
         self._emit_status()
 
     def _on_connection_changed(self, dst_node_id: str) -> None:
-        self.engine.invalidate(dst_node_id, downstream=True)
+        """连线增删后立即安排目标节点及其下游重算。
+
+        一次操作（粘贴、替换连线、删除子树）可能连续产生多条连线信号，
+        这里先让旧快照失效，再在 :data:`CONNECTION_UPDATE_DELAY_MS` 后合并成
+        一次引擎请求，避免后一次请求取消前一次尚未完成的计算。
+        """
+
         self._mark_dirty()
-        if self._current_node_id:
-            current = self.workspace.graph.nodes.get(self._current_node_id)
-            if current is not None:
-                self.engine.preview_node(current.id)
+        if dst_node_id in self.workspace.graph.nodes:
+            self.engine.invalidate(dst_node_id, downstream=True)
+            self._pending_connection_roots.add(dst_node_id)
+            self._connection_update_timer.start()
+        self._emit_status()
+
+    def _flush_connection_updates(self) -> None:
+        """把合并后的连线变化交给引擎：目标节点与全部下游一起重算。"""
+
+        roots = [
+            node_id
+            for node_id in self._pending_connection_roots
+            if node_id in self.workspace.graph.nodes
+        ]
+        self._pending_connection_roots.clear()
+        if not roots:
+            return
+        self.engine.update_nodes(roots)
+        self.status_message.emit("连线已更新，正在重新计算下游…")
         self._emit_status()
 
     # ------------------------------------------------------------------ 参数
@@ -406,8 +437,9 @@ class WorkspaceWidget(QWidget):
         if node is None:
             return
         if self._param_node_id == node_id and node.params != params:
+            # 参数 revision 变化后 preview_node 会让该节点与全部下游快照失效，
+            # 并递归重算下游，保证画布上的数据始终与参数一致。
             self.workspace.graph.set_node_params(node_id, params)
-            self.engine.invalidate(node_id, downstream=False)
             self.engine.preview_node(node_id)
             self._mark_dirty()
             self._emit_status()
@@ -450,9 +482,15 @@ class WorkspaceWidget(QWidget):
         if self._is_layout_only_change(previous, self._last_undo_index):
             self._emit_status()
             return
-        # 撤销/重做可能改变参数或连线；清空所有快照并重新预览当前节点。
+        # 撤销/重做可能改变参数或连线；清空所有快照后重新计算当前节点。
         self.engine.invalidate_all()
-        if self._current_node_id and self._current_node_id in self.workspace.graph.nodes:
+        if self._pending_connection_roots:
+            # 连线变化已经安排了延迟更新：把当前节点并入同一批请求，
+            # 避免两次请求互相取消。
+            if self._current_node_id and self._current_node_id in self.workspace.graph.nodes:
+                self._pending_connection_roots.add(self._current_node_id)
+            self._connection_update_timer.start()
+        elif self._current_node_id and self._current_node_id in self.workspace.graph.nodes:
             self.engine.preview_node(self._current_node_id)
         self._emit_status()
 
@@ -589,7 +627,7 @@ class WorkspaceWidget(QWidget):
 
     def _on_busy_changed(self, busy: bool) -> None:
         if busy:
-            self.status_message.emit("后台计算中…")
+            self.status_message.emit("后台并行计算中…")
         self._emit_status()
 
     # ------------------------------------------------------------------ 状态
@@ -700,4 +738,6 @@ class WorkspaceWidget(QWidget):
         return True
 
     def shutdown(self) -> None:
+        self._connection_update_timer.stop()
+        self._pending_connection_roots.clear()
         self.engine.shutdown()

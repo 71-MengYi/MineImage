@@ -849,6 +849,7 @@ class SettingsDialogTests(unittest.TestCase):
         try:
             spy = QSignalSpy(dialog.applied)
             dialog.undo_spin.setValue(7)
+            dialog.workers_spin.setValue(3)
             dialog.thumbnails_check.setChecked(False)
             dialog.auto_fit_check.setChecked(False)
             dialog.downsample_check.setChecked(True)
@@ -865,6 +866,7 @@ class SettingsDialogTests(unittest.TestCase):
 
             reloaded = AppSettings(self.ini_path)
             self.assertEqual(reloaded.undo_limit, 7)
+            self.assertEqual(reloaded.execution_workers, 3)
             self.assertFalse(reloaded.show_node_thumbnails)
             self.assertFalse(reloaded.auto_fit_on_open)
             self.assertTrue(reloaded.downsample_preview)
@@ -878,13 +880,16 @@ class SettingsDialogTests(unittest.TestCase):
 
     def test_cancel_does_not_persist(self) -> None:
         settings = AppSettings(self.ini_path)
+        default_workers = settings.execution_workers
         dialog = SettingsDialog(settings)
         try:
             dialog.undo_spin.setValue(9)
+            dialog.workers_spin.setValue(5)
             dialog.downsample_check.setChecked(True)
             dialog.reject()
             reloaded = AppSettings(self.ini_path)
             self.assertEqual(reloaded.undo_limit, 100)
+            self.assertEqual(reloaded.execution_workers, default_workers)
             self.assertFalse(reloaded.downsample_preview)
         finally:
             dialog.deleteLater()
@@ -894,8 +899,10 @@ class SettingsDialogTests(unittest.TestCase):
         dialog = SettingsDialog(settings)
         try:
             dialog.undo_spin.setValue(0)
+            dialog.workers_spin.setValue(0)
             dialog.max_dim_spin.setValue(10)
             self.assertGreaterEqual(dialog.undo_spin.value(), 1)
+            self.assertGreaterEqual(dialog.workers_spin.value(), 1)
             self.assertGreaterEqual(dialog.max_dim_spin.value(), 256)
             dialog.accept()
             reloaded = AppSettings(self.ini_path)

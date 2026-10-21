@@ -104,7 +104,24 @@ class SettingsDialog(QDialog):
         form.addRow("预览", self.auto_fit_check)
         layout.addWidget(group)
 
-        hint = QLabel("修改撤销步数只会影响之后的撤销操作，不会清空当前历史。", page)
+        execution_group = QGroupBox("后台计算", page)
+        execution_form = QFormLayout(execution_group)
+        execution_form.setContentsMargins(12, 16, 12, 10)
+        execution_form.setSpacing(10)
+        self.workers_spin = QSpinBox(execution_group)
+        self.workers_spin.setRange(1, 16)
+        self.workers_spin.setSuffix(" 线程")
+        self.workers_spin.setToolTip(
+            "并行执行互不依赖的节点分支；修改后对新请求生效。"
+        )
+        execution_form.addRow("并行线程数", self.workers_spin)
+        layout.addWidget(execution_group)
+
+        hint = QLabel(
+            "修改撤销步数只会影响之后的撤销操作，不会清空当前历史；"
+            "并行线程数只会影响后续计算，不会打断正在运行的任务。",
+            page,
+        )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -379,6 +396,7 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------------ 数据
     def _load_values(self) -> None:
         self.undo_spin.setValue(max(1, int(self.settings.undo_limit)))
+        self.workers_spin.setValue(max(1, int(self.settings.execution_workers)))
         self.thumbnails_check.setChecked(bool(self.settings.show_node_thumbnails))
         self.auto_fit_check.setChecked(bool(self.settings.auto_fit_on_open))
         self.downsample_check.setChecked(bool(self.settings.downsample_preview))
@@ -545,6 +563,7 @@ class SettingsDialog(QDialog):
 
     def _persist(self) -> None:
         self.settings.undo_limit = max(1, int(self.undo_spin.value()))
+        self.settings.execution_workers = max(1, int(self.workers_spin.value()))
         self.settings.show_node_thumbnails = self.thumbnails_check.isChecked()
         self.settings.auto_fit_on_open = self.auto_fit_check.isChecked()
         self.settings.downsample_preview = self.downsample_check.isChecked()

@@ -45,8 +45,14 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   Operator`；`loader.py` 扫描目录。每个算子文件定义模块级 `OPERATOR`。
   参数联动 `visible_when/enabled_when` 使用受限 `eval`：支持裸参数名与
   `params['key']`，**不支持** `params.key` 属性访问；表达式异常时按 True 处理。
-* **引擎**：`app/engine/engine.py`。每次请求抓取图快照，在单线程后台池中执行；
-  发出 `node_started/node_finished/node_failed/chain_finished/busy_changed`。
+* **引擎**：`app/engine/engine.py`。每次请求在主线程抓取一份不可变的图快照，再在
+  后台线程池中按 DAG 拓扑序提交节点任务：兄弟分支并行执行，有依赖的节点等待上游
+  future 完成；`update_nodes` / `preview_node` / `commit_node` 递归重算目标节点与
+  全部下游，`refresh_node` 只重算单个节点。结果按 `generation + revision` 双重
+  校验丢弃过期写回，节点错误按分支隔离。算子 `process()` 会被多个线程并发调用，
+  必须线程安全（无实例可变状态、不原地修改输入）。默认并行度为
+  `min(4, CPU 核数)`（1–16，`execution/workers` 可调）。发出
+  `node_started/node_finished/node_failed/chain_finished/busy_changed`。
   `NodeResult.outputs` 可保存任意类型的端口值；`preview_image` 与
   `summary_text()` 负责预览与摘要，不再假定输出一定是图像。
 * **画布**：`app/graph/*`，QGraphicsView 自绘。所有图修改走 `QUndoStack`。
@@ -105,16 +111,21 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 
 | 操作 | 行为 |
 | --- | --- |
-| 单击节点 | `engine.preview_node(id)`：有快照立即显示，否则后台补算上游 |
-| 参数拖动 | UI 防抖 120ms；更新模型参数、`invalidate(id, downstream=False)`、`preview_node(id)` |
-| 保存 | `engine.commit_node(id)`：使该节点与下游失效，后台重算下游子树 |
-| 切换节点 | 直接读取该节点快照；不触发下游计算 |
-| 修改连线 / 删除节点 | 由工作区使目标节点及下游失效 |
+| 单击节点 | `engine.preview_node(id)`：有同一 revision 快照立即回放；否则让该节点与全部下游失效，后台重算目标节点并递归重算全部下游 |
+| 参数拖动 | UI 防抖 120ms；更新模型参数后调用 `preview_node(id)`，实时重算当前节点并递归更新全部下游，不必先点“保存” |
+| 保存 | `engine.commit_node(id)`：强制使该节点与下游失效，并重算整棵下游子树（用于确认最终结果） |
+| 切换节点 | 与单击节点一致：有有效快照直接显示，否则 `preview_node(id)` 重算该节点与全部下游 |
+| 修改连线 / 删除节点 | 连线新增 / 删除 / 替换后立即失效目标节点及全部下游；工作区在 30ms 内合并同一次操作的多条事件，再调用 `engine.update_nodes([...])` 重算，不需要先选中节点。删除节点还会清空引擎快照并取消当前任务 |
 | 移动节点 / 自动布局 | 只更新位置，不清空结果快照、不重算 |
-| 复制粘贴节点 | 新节点与副本间连线一步入栈；完成后使相关下游失效 |
+| 复制粘贴节点 | 新节点与副本间连线一步入栈；连线事件按 30ms 合并后重算新节点及相关下游 |
 | 打开工程 | 重新创建引擎并清空缓存 |
+| 并行 worker 配置 | `execution/workers`（设置 → 常规 → 后台计算 → 并行线程数）：默认 `min(4, CPU 核数)`，范围 1–16；只影响后续请求，不打断正在运行的任务 |
 
-后台任务由 generation 编号；新请求会取消旧任务，旧结果不得写入界面。
+后台任务由 generation 编号；新请求会取消旧任务，旧结果不得写入界面。一次请求内部
+按 DAG 拓扑序把互不依赖的分支并行提交到多线程执行器：兄弟分支真正同时运行，有
+依赖的节点等待上游 future；错误按分支隔离，某分支失败不会中断其它分支，上游失败
+的下游节点显示“上游节点执行失败”。正在执行的算子不可中断：取消后当前算子会跑完，
+但其结果由 generation 丢弃。
 
 ## 应用日志
 
@@ -146,7 +157,7 @@ GraphView(workspace: WorkspaceModel, registry: OperatorRegistry,
 selection_changed = Signal(str)       # "" 表示取消选择
 node_activated = Signal(str)          # 双击节点
 node_created = Signal(str)            # 画布内新增算子节点
-connection_changed = Signal(str)      # 目标节点 id；调用方应失效其下游
+connection_changed = Signal(str)      # 目标节点 id；工作区失效其下游并在 30ms 内合并重算
 node_removed = Signal(str)
 images_dropped = Signal(list)         # list[str]，拖入的图像路径
 status_message = Signal(str)
@@ -173,6 +184,32 @@ delete_selected() -> None
 `app.operators.spec.port_types_compatible(output_port, input_port)`，只允许
 `data_type` 相同的端口相连；图像端口还会比较双方 `accepts` 是否有交集。失败时
 通过 `status_message` 显示 `connection_error()` 生成的中文提示。
+
+### ExecutionEngine（`app/engine/engine.py`）
+
+```python
+ExecutionEngine(workspace, registry, settings, parent=None, *, workers=None)
+
+preview_node(node_id) -> None          # 快照命中直接回放；否则递归重算该节点与下游
+commit_node(node_id) -> None           # 失效该节点与下游并强制重算整棵子树
+refresh_node(node_id) -> None          # 只重算单个节点（上游按需补齐）
+update_nodes(node_ids) -> None         # 批量根节点：一次快照、一次请求重算各自子树
+invalidate(node_id, *, downstream=True) -> None
+invalidate_all() -> None
+set_workers(count: int) -> None        # 1..16，只影响后续请求
+set_registry(registry) -> None
+shutdown() -> None
+
+node_started = Signal(str)
+node_finished = Signal(object)         # NodeResult
+node_failed = Signal(str, str)         # node id, message
+chain_finished = Signal(str, bool)     # root id, success
+busy_changed = Signal(bool)
+```
+
+`workers` 缺省取 `AppSettings.execution_workers`（`execution/workers`，默认
+`min(4, CPU 核数)`，范围 1–16）。同一次请求内多个 worker 并发调用
+`Operator.process()`，算子必须线程安全。
 
 ### OperatorLibrary（`app/ui/library.py`）
 
