@@ -106,7 +106,7 @@ REQUIRED_IDS = {
     "analysis.phase_correlate", "analysis.template_match", "analysis.psnr",
     "analysis.ssim", "analysis.match_shapes",
     # 通用能力与特征匹配
-    "feature.match", "misc.cv2_call", "misc.cv2_info",
+    "feature.match", "misc.cv2_call", "misc.cv2_info", "output.display",
 }
 
 CJK = ("\u4e00", "\u9fff")

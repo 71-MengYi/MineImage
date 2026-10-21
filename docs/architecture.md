@@ -32,6 +32,10 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   `ComponentsData`；`NodeResult.outputs` 是泛化的 `dict[str, Any]`，
   `preview_image` 优先取图像输出、否则渲染结构化数据，`summary_text()` 汇总
   各端口摘要。
+* **输出预览节点**：`其他 → 可视化 → 输出预览`（`output.display`）把五类可选输入
+  汇总为 `display` 图像输出（在返回字典中放在首位，供 `preview_image` 使用），
+  同时把每路输入从同名端口原样透传；`spec.outputs` 中仍把 `image` 放第一位，
+  保证在连线上自动插入时选择透传端口而不是显示面板。
 * **算子**：`app/operators/spec.py` 定义 `OperatorSpec / ParamSpec / PortSpec /
   Operator`；`loader.py` 扫描目录。每个算子文件定义模块级 `OPERATOR`。
   参数联动 `visible_when/enabled_when` 使用受限 `eval`：支持裸参数名与
