@@ -1,7 +1,7 @@
 """画布上的节点卡片。
 
 节点外观为浅色圆角卡片：标题、分类 / 算子 id、上边缘的输入端口、下边缘的输出端口、
-右下角耗时、可选的结果缩略图以及出错时的红色边框与 tooltip。
+右下角耗时、结果区（图像缩略图 / 单个数值 / 数组提示）以及出错时的红色边框与 tooltip。
 节点条目的位置始终与 :class:`NodeModel.pos`（左上角场景坐标）保持一致。
 
 端口改为上下方向后，输入端口沿节点上边缘水平分布，输出端口沿下边缘水平分布；
@@ -27,6 +27,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QGraphicsItem, QStyleOptionGraphicsItem, QWidget
 
+from app.core.data_types import DataType, NumberValue, data_type_of, format_number
 from app.core.model import NodeModel
 from app.core.types import make_thumbnail
 from app.graph.port_item import PortItem
@@ -101,9 +102,15 @@ class NodeItem(QGraphicsItem):
         self._thumbnail_box = max(24, int(thumbnail_box))
         self._result: Any = None
         self._thumb_pixmap: QPixmap | None = None
+        self._content_mode = "empty"  # empty | thumb | number | numbers | array
+        self._content_label = ""
+        self._content_value = ""
+        self._content_hint = ""
+        self._footer_number = ""
         self._elapsed: float | None = None
         self._error: str | None = None
         self._thumb_rect = QRectF()
+        self._content_rect = QRectF()
         self._header_rect = QRectF()
         self._footer_rect = QRectF()
         self._content_top = 0.0
@@ -246,6 +253,7 @@ class NodeItem(QGraphicsItem):
 
         thumb_area = 0.0
         self._thumb_rect = QRectF()
+        self._content_rect = QRectF()
         if self._thumb_pixmap is not None and not self._thumb_pixmap.isNull():
             thumb_area = max(
                 40.0,
@@ -257,7 +265,20 @@ class NodeItem(QGraphicsItem):
                 self._width - 2.0 * self.THUMB_MARGIN,
                 thumb_area,
             )
-        content_height = thumb_area if thumb_area > 0.0 else self.MIN_CONTENT_H
+        text_area = 0.0
+        if not thumb_area:
+            if self._content_mode == "number":
+                text_area = 48.0
+            elif self._content_mode in ("array", "numbers"):
+                text_area = 40.0
+            if text_area:
+                self._content_rect = QRectF(
+                    self.THUMB_MARGIN,
+                    self._content_top,
+                    self._width - 2.0 * self.THUMB_MARGIN,
+                    text_area,
+                )
+        content_height = thumb_area or text_area or self.MIN_CONTENT_H
 
         bottom_stack = self.BOTTOM_LABEL_GAP + self.FOOTER_H + self.CONTENT_GAP
         if output_count:
@@ -317,7 +338,7 @@ class NodeItem(QGraphicsItem):
         self._result = result
         self._elapsed = float(getattr(result, "elapsed_ms", 0.0) or 0.0)
         self._error = None
-        self._update_thumbnail()
+        self._update_content()
         self._rebuild_geometry()
         self._refresh_connections()
         self._refresh_tooltip()
@@ -333,7 +354,7 @@ class NodeItem(QGraphicsItem):
                 self._thumbnail_box = box
                 changed = True
         if changed:
-            self._update_thumbnail()
+            self._update_content()
             self._rebuild_geometry()
             self._refresh_connections()
             self.update()
@@ -350,21 +371,59 @@ class NodeItem(QGraphicsItem):
         self._refresh_tooltip()
         self.update()
 
-    def _update_thumbnail(self) -> None:
+    def _update_content(self) -> None:
+        """按结果类型决定节点中部显示缩略图、数值还是数组提示。"""
+
         self._thumb_pixmap = None
-        if not self._thumbnails_enabled or self._result is None:
+        self._content_mode = "empty"
+        self._content_label = ""
+        self._content_value = ""
+        self._content_hint = ""
+        self._footer_number = ""
+        if self._result is None:
             return
-        # 图像输出直接显示；轮廓 / 连通域等结构化输出会渲染成预览图。
+
+        outputs = getattr(self._result, "outputs", {}) or {}
+        numbers = [value for value in outputs.values() if isinstance(value, NumberValue)]
         preview = getattr(self._result, "preview_image", None)
-        if preview is None:
-            preview = getattr(self._result, "primary", None)
-        if preview is None:
+        if preview is not None and self._thumbnails_enabled:
+            try:
+                rgb = make_thumbnail(preview, self._thumbnail_box)
+                self._thumb_pixmap = _rgb_to_pixmap(rgb)
+                self._content_mode = "thumb"
+                if len(numbers) == 1:
+                    value = numbers[0]
+                    unit = str(value.unit or "").strip()
+                    label = str(value.label or "数值").strip()
+                    self._footer_number = (
+                        f"{label} {format_number(value.value)}"
+                        + (f" {unit}" if unit else "")
+                    )
+                return
+            except Exception:  # noqa: BLE001 - 缩略图失败不能影响画布
+                self._thumb_pixmap = None
+        if len(numbers) == 1:
+            value = numbers[0]
+            self._content_mode = "number"
+            self._content_label = str(value.label or "数值").strip()
+            unit = str(value.unit or "").strip()
+            self._content_value = format_number(value.value) + (f" {unit}" if unit else "")
             return
-        try:
-            rgb = make_thumbnail(preview, self._thumbnail_box)
-            self._thumb_pixmap = _rgb_to_pixmap(rgb)
-        except Exception:  # noqa: BLE001 - 缩略图失败不能影响画布
-            self._thumb_pixmap = None
+
+        array_types = (DataType.EDGES, DataType.CONTOURS, DataType.COMPONENTS)
+        array_values = [
+            value for value in outputs.values() if data_type_of(value) in array_types
+        ]
+        if array_values:
+            self._content_mode = "array"
+            self._content_label = "数组数据"
+            self._content_hint = "双击节点查看详情"
+            return
+
+        if numbers:
+            self._content_mode = "numbers"
+            self._content_label = f"数值 ×{len(numbers)}"
+            self._content_hint = "双击节点查看详情"
 
     def _refresh_tooltip(self) -> None:
         lines: list[str] = [self.node.display_title()]
@@ -511,6 +570,53 @@ class NodeItem(QGraphicsItem):
             y = self._thumb_rect.y() + (self._thumb_rect.height() - pixmap.height()) / 2.0
             painter.drawPixmap(QPointF(round(x), round(y)), pixmap)
 
+        # 数值 / 数组提示：没有缩略图时占用节点中部
+        if self._content_rect.height() > 0.0:
+            painter.setPen(QPen(QColor("#e2e7ec"), 1.0))
+            painter.setBrush(QColor("#f8fafc"))
+            painter.drawRoundedRect(self._content_rect, 6.0, 6.0)
+            content_rect = self._content_rect.adjusted(10.0, 4.0, -10.0, -4.0)
+            if self._content_mode == "number":
+                label_font = QFont("Microsoft YaHei UI")
+                label_font.setPointSizeF(7.0)
+                painter.setFont(label_font)
+                painter.setPen(QColor("#64748b"))
+                painter.drawText(
+                    QRectF(content_rect.x(), content_rect.y(), content_rect.width(), 14.0),
+                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                    _elide(label_font, self._content_label, content_rect.width()),
+                )
+                value_font = QFont("Microsoft YaHei UI")
+                value_font.setPointSizeF(12.5)
+                value_font.setBold(True)
+                painter.setFont(value_font)
+                painter.setPen(QColor("#1f2937"))
+                painter.drawText(
+                    QRectF(content_rect.x(), content_rect.y() + 14.0, content_rect.width(), 26.0),
+                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                    _elide(value_font, self._content_value, content_rect.width()),
+                )
+            else:
+                label_font = QFont("Microsoft YaHei UI")
+                label_font.setPointSizeF(8.5)
+                label_font.setBold(True)
+                painter.setFont(label_font)
+                painter.setPen(QColor("#475569"))
+                painter.drawText(
+                    QRectF(content_rect.x(), content_rect.y(), content_rect.width(), 17.0),
+                    int(Qt.AlignmentFlag.AlignCenter),
+                    _elide(label_font, self._content_label, content_rect.width()),
+                )
+                hint_font = QFont("Microsoft YaHei UI")
+                hint_font.setPointSizeF(7.0)
+                painter.setFont(hint_font)
+                painter.setPen(QColor("#94a3b8"))
+                painter.drawText(
+                    QRectF(content_rect.x(), content_rect.y() + 17.0, content_rect.width(), 15.0),
+                    int(Qt.AlignmentFlag.AlignCenter),
+                    _elide(hint_font, self._content_hint, content_rect.width()),
+                )
+
         # 底部信息（位于输出标签上方，避免与标签重叠）
         footer_font = QFont("Microsoft YaHei UI")
         footer_font.setPointSizeF(7.0)
@@ -518,10 +624,11 @@ class NodeItem(QGraphicsItem):
         painter.setPen(QColor("#94a3b8"))
         footer_y = self._footer_rect.top()
         output_count = len(self._output_ports)
+        footer_left = self._footer_number or f"输出 {output_count}"
         painter.drawText(
             QRectF(12.0, footer_y, self._width / 2.0, self.FOOTER_H),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            f"输出 {output_count}",
+            _elide(footer_font, footer_left, self._width / 2.0 - 20.0),
         )
         if error:
             footer_text = "错误"

@@ -343,6 +343,7 @@ class WorkspaceWidget(QWidget):
         if self._param_node_id == node_id:
             self._param_node_id = None
             self._param_session_old = {}
+            self.param_panel.set_result(None)
             self.center_stack.setCurrentWidget(self.graph_view)
         self._mark_dirty()
         self._emit_status()
@@ -375,8 +376,10 @@ class WorkspaceWidget(QWidget):
         self._refresh_original(node)
         cached = self.engine.result(node_id)
         if cached is not None and cached.revision == node.revision:
+            self.param_panel.set_result(cached)
             self._show_result(cached, node)
         else:
+            self.param_panel.set_result(None)
             self.preview.set_image(None, node.display_title(), "正在计算…")
             self.engine.preview_node(node_id)
         self._emit_status()
@@ -541,6 +544,8 @@ class WorkspaceWidget(QWidget):
         self.graph_view.notify_result(node.id, result)
         if node.id == self._current_node_id:
             self._show_result(result, node)
+        if node.id == self._param_node_id:
+            self.param_panel.set_result(result)
         self._emit_status()
 
     def _show_result(self, result: NodeResult, node: NodeModel) -> None:
@@ -555,8 +560,6 @@ class WorkspaceWidget(QWidget):
         meta = f"{result.elapsed_ms:.1f} ms · {image.width}×{image.height} · {image.color_space} · {image.dtype_name}"
         if len(result.outputs) > 1:
             meta += f" · 输出 {len(result.outputs)}：{result.output_type_summary()}"
-        if result.primary is None:
-            meta += " · 结构化数据预览"
         self.preview.set_image(image, node.display_title(), meta)
 
     def _on_node_failed(self, node_id: str, message: str) -> None:
@@ -567,6 +570,8 @@ class WorkspaceWidget(QWidget):
             self._current_image = None
             self.preview.set_image(None, title, f"计算失败：{message}")
             self._last_elapsed_ms = None
+        if node_id == self._param_node_id:
+            self.param_panel.set_result(None)
         self.status_message.emit(message)
         self._emit_status()
 

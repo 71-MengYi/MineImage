@@ -26,7 +26,7 @@ from typing import Any, Iterable
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 from app.config import AppSettings
-from app.core.data_types import data_type_of, render_preview, summarize_outputs
+from app.core.data_types import data_type_of, summarize_outputs
 from app.core.model import WorkspaceModel
 from app.core.types import ImageData
 from app.operators.loader import OperatorRegistry
@@ -59,16 +59,9 @@ class NodeResult:
 
     @property
     def preview_image(self) -> ImageData | None:
-        """用于预览 / 缩略图的图像：优先图像输出，其次渲染结构化数据。"""
+        """用于主预览 / 缩略图的图像：只取图像输出，结构化数据不再渲染。"""
 
-        primary = self.primary
-        if primary is not None:
-            return primary
-        for value in self.outputs.values():
-            image = render_preview(value)
-            if image is not None:
-                return image
-        return None
+        return self.primary
 
     def output_type_text(self, key: str) -> str:
         value = self.outputs.get(key)

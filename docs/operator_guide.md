@@ -242,7 +242,8 @@ PortSpec(
   `largest_area`、`summary()`、`render_preview()`（按调色板渲染彩色标签图）。
 
 这些容器都实现了 `summary()`，可被 `summarize_value()` 转为一行摘要；
-`render_preview()` 可把非图像数据渲染成预览图，纯数值没有预览图。
+`render_preview()` 可把非图像数据渲染成图像，仅供算子**显式**生成可视化输出，
+引擎不再自动用它生成主预览或节点缩略图。
 
 ### 4.3 `process()` 签名
 
@@ -300,9 +301,9 @@ def validate(self, inputs, params) -> None:
   数值端口返回字符串、点集形状不是 `(N,2)`、连通域不是二维标签图；
 * 返回 `None` 会被视为错误；要“有条件输出”请用字典并省略 key（下游连接该端口
   时会报“上游节点未提供输出端口的数据”）；
-* 预览不固定取 `outputs` 的第一个值：引擎优先使用第一个**图像**输出，没有图像
-  输出时用 `render_preview()` 把边缘 / 轮廓 / 连通域渲染成预览图；纯数值节点
-  没有预览图，只显示摘要；
+* 预览主图只取第一个**图像**输出；没有图像输出时显示摘要文本，不再把边缘 /
+  轮廓 / 连通域自动渲染成预览图。单个数值会直接显示在节点卡片内，数值 / 数组
+  详情可在参数面板的「输出数据」区查看；
 * 图像输出若没有命名，引擎会自动命名为 `节点标题:端口key`。
 
 ### 4.5 dtype 与数值约定
@@ -568,8 +569,8 @@ class EdgeFeature(Operator):
 * 输出端口在节点底部**按声明顺序水平排列**，每个端口有独立圆点和标签；
   圆点颜色按数据类型区分（`DataType.color`）；
 * 每种类型只能连接到**同类型**的输入端口，端口类型不匹配时画布拒绝创建连线；
-* 预览主图取第一个**图像**输出；没有图像输出时，边缘 / 轮廓 / 连通域会由
-  `render_preview()` 渲染成预览图，数值不渲染；
+* 预览主图只取第一个**图像**输出；没有图像输出时不再自动渲染结构化数据，
+  节点显示数值或「数组数据」提示，详情在参数面板查看；
 * 节点摘要按 `端口标签（类型）：摘要` 生成（`NodeResult.summary_lines()` /
   `summary_text()`），多个输出之间用「；」拼接；
 * 推荐用字典并显式写出所有输出 key；
@@ -585,7 +586,8 @@ class EdgeFeature(Operator):
 ### 8.3 连线类型校验
 
 * 新建连线时，画布用 `port_types_compatible(output_port, input_port)` 判断：
-  两端 `data_type` 必须**完全一致**；
+  任意一端声明为万能端口（`any_type=True`）时直接兼容；否则两端 `data_type`
+  必须**完全一致**；
 * 图像端口还会检查颜色空间：双方都声明了 `accepts` 时必须有交集，任一方为空
   视为不限；实际像素的颜色空间在执行时再由 `validate_inputs()` 校验一次；
 * 不满足时拒绝连线，并显示 `connection_error()` 生成的提示，例如
@@ -594,6 +596,37 @@ class EdgeFeature(Operator):
   `输入“xxx”需要 L/BGR 图像，当前为 BGRA。`；
 * 旧的 `.mi` 工程仍可正常打开，已有连线原样保留；只有**新建 / 重新连线**时才
   做类型校验。
+
+### 8.4 万能端口与节点显示策略
+
+如果希望一个端口同时接收 / 输出任意已知类型，使用 `any_type=True`：
+
+```python
+from app.operators.spec import Operator, OperatorSpec, PortSpec
+
+class Output(Operator):
+    spec = OperatorSpec(
+        id="example.output",
+        name="输出",
+        category=("其他", "可视化"),
+        inputs=(PortSpec("data", "任意数据", any_type=True),),
+        outputs=(PortSpec("data", "任意数据", any_type=True),),
+    )
+
+    def process(self, data=None, **_):
+        return data
+```
+
+* 万能输入在 `validate_inputs()` 中只校验“值是已知数据类型”，不限定具体哪一种；
+* 万能输出在 `coerce_output_value()` 中原样返回输入对象，不复制、不转换；
+* `PortSpec.data_type` 对万能端口只是 UI 占位（默认图像），画布端口使用中性色；
+* 节点卡片会自动处理显示：单个数值直接显示数值，图像显示缩略图，数组显示
+  「数组数据 / 双击查看」提示；
+* 主预览与节点缩略图只取图像输出，结构化数据不再自动调用 `render_preview()`；
+  参数面板在结果包含非图像输出时自动显示「输出数据」区，以文本形式给出数组的
+  数量、画布尺寸、形状、前几个点等详情；
+* `render_preview()` 保留给算子**显式**生成可视化输出（例如连通域分析的彩色标签图），
+  不再参与节点预览 / 缩略图的自动回退。
 
 ---
 

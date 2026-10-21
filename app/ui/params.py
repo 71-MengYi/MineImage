@@ -7,7 +7,9 @@
 * 使用 :func:`app.operators.spec.normalize_params` 做声明式校验，非法时显示
   行内错误并禁用「保存」；
 * 交互参数（点集 / 矩形 / 直线）只发出 ``pick_requested``，真正的拾取由预览
-  控件完成；不参与下游重算。
+  控件完成；不参与下游重算；
+* 只要当前结果包含数值 / 结构化数组输出，参数区下方就显示只读的「输出数据」；
+  数组以文本详情输出，不再渲染成预览图，也不进入画布缩略图与主预览。
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
@@ -40,6 +42,16 @@ from PySide6.QtWidgets import (
 )
 
 from app.core.constants import IMAGE_FILTER, PARAM_DEBOUNCE_MS
+from app.core.data_types import (
+    ComponentsData,
+    ContoursData,
+    DataType,
+    EdgesData,
+    NumberValue,
+    data_type_of,
+    format_number,
+    summarize_value,
+)
 from app.core.model import NodeModel
 from app.operators.spec import (
     Operator,
@@ -120,6 +132,15 @@ def _line_text(value: Any) -> str:
     return f"({_fmt_number(x1)}, {_fmt_number(y1)}) → ({_fmt_number(x2)}, {_fmt_number(y2)})"
 
 
+def _clear_layout(layout: QVBoxLayout) -> None:
+    while layout.count():
+        item = layout.takeAt(0)
+        widget = item.widget()
+        if widget is not None:
+            widget.setParent(None)
+            widget.deleteLater()
+
+
 def _color_icon(color: str) -> QIcon:
     pixmap = QPixmap(20, 20)
     pixmap.fill(Qt.GlobalColor.transparent)
@@ -158,6 +179,10 @@ class ParamPanel(QWidget):
         self._valid = False
         self._loading = False
         self._last_status_message = ""
+        self._last_result: Any = None
+        self._output_group: QGroupBox | None = None
+        self._output_layout: QVBoxLayout | None = None
+        self._empty_params_label: QLabel | None = None
 
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
@@ -277,6 +302,10 @@ class ParamPanel(QWidget):
             self._baseline = {}
             self._normalized = {}
             self._valid = False
+            self._last_result = None
+            self._output_group = None
+            self._output_layout = None
+            self._empty_params_label = None
             self._show_placeholder()
             return
 
@@ -284,6 +313,10 @@ class ParamPanel(QWidget):
         self._operator = operator
         self._spec = operator.spec
         self._node_id = node.id
+        self._last_result = None
+        self._output_group = None
+        self._output_layout = None
+        self._empty_params_label = None
         defaults = param_defaults(self._spec)
         merged = dict(defaults)
         merged.update(node.params or {})
@@ -304,6 +337,12 @@ class ParamPanel(QWidget):
         self._show_editor()
         self._validate()
         self._preview_timer.stop()
+
+    def set_result(self, result: Any | None) -> None:
+        """更新参数面板中的「输出数据」区；不影响参数控件。"""
+
+        self._last_result = result
+        self._refresh_output_section()
 
     def current_params(self) -> dict[str, Any]:
         """返回当前参数（合法时为规范化结果，非法时为尽力收集的原始值）。"""
@@ -349,6 +388,9 @@ class ParamPanel(QWidget):
 
     # ------------------------------------------------------------------ 编辑器构建
     def _clear_editors(self) -> None:
+        self._output_group = None
+        self._output_layout = None
+        self._empty_params_label = None
         while self.content_layout.count():
             item = self.content_layout.takeAt(0)
             widget = item.widget()
@@ -368,7 +410,9 @@ class ParamPanel(QWidget):
         if not ordered_groups:
             empty = QLabel("该算子没有可配置参数。", self.content)
             empty.setObjectName("hintLabel")
+            self._empty_params_label = empty
             self.content_layout.addWidget(empty)
+            self._build_output_section()
             self.content_layout.addStretch(1)
             return
         for group_name, params in ordered_groups.items():
@@ -384,7 +428,106 @@ class ParamPanel(QWidget):
                 keys.append(param.key)
             self.content_layout.addWidget(group)
             self._groups.append((group, keys))
+        self._build_output_section()
         self.content_layout.addStretch(1)
+
+    # ------------------------------------------------------------------ 输出数据
+    def _build_output_section(self) -> None:
+        group = QGroupBox("输出数据", self.content)
+        group.setVisible(False)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(10, 14, 10, 8)
+        layout.setSpacing(6)
+        self._output_group = group
+        self._output_layout = layout
+        self.content_layout.addWidget(group)
+        self._refresh_output_section()
+
+    def _refresh_output_section(self) -> None:
+        layout = self._output_layout
+        group = self._output_group
+        if layout is None or group is None:
+            return
+        _clear_layout(layout)
+        entries: list[tuple[str, Any]] = []
+        if self._last_result is not None:
+            outputs = getattr(self._last_result, "outputs", {}) or {}
+            labels = getattr(self._last_result, "port_labels", {}) or {}
+            entries = [
+                (labels.get(key, key), value)
+                for key, value in outputs.items()
+                if data_type_of(value) is not DataType.IMAGE
+            ]
+        if not entries:
+            group.setVisible(False)
+            if self._empty_params_label is not None:
+                self._empty_params_label.setVisible(True)
+            return
+        group.setVisible(True)
+        if self._empty_params_label is not None:
+            self._empty_params_label.setVisible(False)
+        for label, value in entries:
+            self._build_output_value(layout, label, value)
+
+    def _build_output_value(self, layout: QVBoxLayout, label: str, value: Any) -> None:
+        group = self._output_group
+        if group is None:
+            return
+        data_type = data_type_of(value)
+        type_label = data_type.label if data_type is not None else "未知数据"
+        title = QLabel(f"{label} · {type_label}", group)
+        title_font = QFont(title.font())
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        if isinstance(value, NumberValue):
+            number_text = format_number(value.value)
+            if value.unit:
+                number_text += f" {value.unit}"
+            number = QLabel(number_text, group)
+            number_font = QFont(number.font())
+            number_font.setPointSizeF(13.0)
+            number_font.setBold(True)
+            number.setFont(number_font)
+            number.setWordWrap(True)
+            layout.addWidget(number)
+
+        for line in self._output_detail_lines(value):
+            detail = QLabel(line, group)
+            detail.setObjectName("hintLabel")
+            detail.setWordWrap(True)
+            layout.addWidget(detail)
+        layout.addSpacing(6)
+
+    @staticmethod
+    def _output_detail_lines(value: Any) -> list[str]:
+        lines = [summarize_value(value)]
+        image_size = getattr(value, "image_size", None)
+        if image_size:
+            lines.append(f"画布：{image_size[0]} × {image_size[1]}")
+        if isinstance(value, EdgesData):
+            segments = value.segments
+            lines.append(f"折线：{len(segments)} 条")
+            if segments:
+                lines.append(f"首条形状：{segments[0].shape}")
+                lines.append(f"前几个点：{segments[0].reshape(-1, 2)[:4].tolist()}")
+        elif isinstance(value, ContoursData):
+            lines.append(f"轮廓：{len(value.contours)} 个")
+            if value.contours:
+                lines.append(f"首个形状：{value.contours[0].shape}")
+                lines.append(f"前几个点：{value.contours[0].reshape(-1, 2)[:4].tolist()}")
+            if value.hierarchy is not None:
+                lines.append(f"层级数组：{value.hierarchy.shape}")
+        elif isinstance(value, ComponentsData):
+            lines.append(f"标签图：{value.labels.shape} · {value.labels.dtype}")
+            lines.append(f"连通域：{value.count} 个 · 总面积 {value.total_area} 像素")
+            if value.areas:
+                lines.append(f"面积前 5：{list(value.areas[:5])}")
+            if value.centroids:
+                lines.append(f"质心前 3：{list(value.centroids[:3])}")
+        return lines
 
     def _build_row(self, param: ParamSpec, parent: QWidget) -> _ParamRow:
         row_widget = QWidget(parent)

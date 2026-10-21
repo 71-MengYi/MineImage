@@ -13,7 +13,8 @@
 * 连通域：:class:`ComponentsData`，标签图 + 每个连通域的面积 / 质心。
 
 所有容器都只读使用（``frozen`` 或约定不修改），并实现 ``summary()`` 供界面展示。
-结构化数据还可以通过 :func:`render_preview` 渲染成预览图，方便节点缩略图与右侧预览。
+结构化数据可以通过 :func:`render_preview` 渲染成图像，供算子显式生成可视化输出；
+主预览与节点缩略图不再自动渲染结构化数据，数组详情在参数面板中以文本展示。
 """
 
 from __future__ import annotations
@@ -454,7 +455,10 @@ def summarize_value(value: Any) -> str:
 
 
 def render_preview(value: Any) -> ImageData | None:
-    """把结构化数据渲染为预览图；数值等不可渲染的数据返回 ``None``。"""
+    """把结构化数据渲染成图像，供算子显式生成可视化输出。
+
+    引擎的主预览与节点缩略图不再自动调用本函数；数值等不可渲染的数据返回 None。
+    """
 
     if isinstance(value, ImageData):
         return value

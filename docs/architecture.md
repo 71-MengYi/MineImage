@@ -23,7 +23,7 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   定义 `image / number / edges / contours / components` 五种类型；
   `NumberValue / EdgesData / ContoursData / ComponentsData` 是结构化值的运行时
   容器；`coerce_data_type()` 归一化中英文别名，`render_preview()` /
-  `summarize_value()` 供预览与状态栏使用。`PortSpec.data_type` 声明端口类型
+  `summarize_value()` 供算子显式可视化与摘要使用。`PortSpec.data_type` 声明端口类型
   （默认图像），`port_types_compatible() / connection_error()` 决定连线是否允许，
   `validate_inputs()` 在执行前校验输入，`output_to_dict() / coerce_output_value()`
   按端口类型规范化算子返回值。
@@ -32,10 +32,15 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   `ComponentsData`；`NodeResult.outputs` 是泛化的 `dict[str, Any]`，
   `preview_image` 优先取图像输出、否则渲染结构化数据，`summary_text()` 汇总
   各端口摘要。
-* **输出预览节点**：`其他 → 可视化 → 输出预览`（`output.display`）把五类可选输入
-  汇总为 `display` 图像输出（在返回字典中放在首位，供 `preview_image` 使用），
-  同时把每路输入从同名端口原样透传；`spec.outputs` 中仍把 `image` 放第一位，
-  保证在连线上自动插入时选择透传端口而不是显示面板。
+* **结构化数据不再自动预览**：`NodeResult.preview_image` 只返回图像输出；数值、
+  边缘、轮廓、连通域不再由 `render_preview()` 转成主预览或节点缩略图。节点卡片对
+  单个数值直接显示、对图像显示缩略图、对数组提示「数组数据 / 双击查看」；参数面板的
+  「输出数据」区在结果包含非图像输出时自动出现，以文本详情展示数组的数量、画布尺寸、
+  形状、前几个点等，不再生成预览图。
+* **万能端口与输出节点**：`PortSpec(any_type=True)` 表示万能端口，输入可接收五类
+  数据中的任意一种，输出按运行时类型原样透传；连线校验只要任意一端为万能端口即兼容。
+  `其他 → 可视化 → 输出预览`（`output.display`）就用一个 `data` 输入和一个
+  `data` 输出实现任意链路的终点。
 * **算子**：`app/operators/spec.py` 定义 `OperatorSpec / ParamSpec / PortSpec /
   Operator`；`loader.py` 扫描目录。每个算子文件定义模块级 `OPERATOR`。
   参数联动 `visible_when/enabled_when` 使用受限 `eval`：支持裸参数名与
@@ -76,8 +81,9 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   `output_to_dict()` 按输出端口类型调用 `coerce_output_value()` 规范化返回值，
   不合法时报 `输出“xxx”的数据无效：...`。
 * 旧 `.mi` 工程仍可打开，历史连线不做回溯校验；新建 / 重新连线时才校验类型。
-* 结构化数据通过 `render_preview()` 渲染预览图，`summarize_value()` /
-  `summarize_outputs()` 生成状态栏与节点摘要；数值没有预览图。
+* 结构化数据不再自动渲染成主预览 / 缩略图；`render_preview()` 仅供算子显式
+  生成可视化输出。`summarize_value()` / `summarize_outputs()` 生成状态栏与节点摘要，
+  数组详情在参数面板的「输出数据」区以文本展示。
 
 ## 颜色 / dtype 约定
 

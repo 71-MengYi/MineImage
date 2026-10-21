@@ -282,10 +282,11 @@ class PortGeometryTestCase(unittest.TestCase):
             messages,
         )
 
-    def test_structured_result_uses_rendered_thumbnail(self) -> None:
+    def test_structured_result_shows_array_hint_without_thumbnail(self) -> None:
         from app.core.data_types import EdgesData
 
         item = self.add_node("test.typed_outputs")
+        base_height = item.size().height()
         result = NodeResult(
             item.node.id,
             {"edges": EdgesData(segments=([0, 0], [20, 20]), image_size=(24, 24))},
@@ -293,8 +294,10 @@ class PortGeometryTestCase(unittest.TestCase):
             item.node.revision,
         )
         item.set_result(result)
-        self.assertIsNotNone(item.thumbnail_pixmap)
-        self.assertFalse(item.thumbnail_pixmap.isNull())
+        # 结构化数据不再渲染成缩略图，只在节点内提示双击参数面板查看。
+        self.assertIsNone(item.thumbnail_pixmap)
+        self.assertEqual(item._content_mode, "array")
+        self.assertGreater(item.size().height(), base_height)
 
     # ------------------------------------------------------------ 连线几何
     def test_connection_endpoints_touch_ports(self) -> None:
