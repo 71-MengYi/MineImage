@@ -32,6 +32,7 @@ from app.operators.spec import (  # noqa: E402
     OperatorSpec,
     PortSpec,
     output_to_dict,
+    port_types_compatible,
     validate_inputs,
 )
 
@@ -155,6 +156,60 @@ class PortSpecTests(unittest.TestCase):
         self.assertTrue(
             any_port.accepts_value(ImageData(np.zeros((4, 4, 3), np.uint8)))
         )
+
+    def test_any_type_port_accepts_every_known_value(self) -> None:
+        port = PortSpec("data", "任意数据", any_type=True)
+        self.assertTrue(port.any_type)
+        self.assertEqual(port.accepts, ())
+        self.assertEqual(port.accept_text(), "任意数据")
+        self.assertEqual(port.type_text(), "任意数据")
+        values = (
+            ImageData(np.zeros((4, 4, 3), np.uint8)),
+            NumberValue(3.5, "数值"),
+            EdgesData((np.array([[0, 0], [2, 2]], np.int32),)),
+            ContoursData((np.array([[0, 0], [2, 0], [2, 2]], np.int32),)),
+            ComponentsData.from_labels(np.array([[0, 1], [1, 1]], np.int32)),
+        )
+        for value in values:
+            self.assertTrue(port.accepts_value(value))
+        self.assertFalse(port.accepts_value(object()))
+
+    def test_any_type_port_is_compatible_with_all_types(self) -> None:
+        any_port = PortSpec("data", "任意数据", any_type=True)
+        for data_type in (
+            DataType.IMAGE,
+            DataType.NUMBER,
+            DataType.EDGES,
+            DataType.CONTOURS,
+            DataType.COMPONENTS,
+        ):
+            port = PortSpec("value", "值", data_type=data_type)
+            self.assertTrue(port_types_compatible(any_port, port))
+            self.assertTrue(port_types_compatible(port, any_port))
+        self.assertTrue(port_types_compatible(any_port, any_port))
+
+    def test_any_type_validation_and_output_passthrough(self) -> None:
+        spec = OperatorSpec(
+            id="test.any_port",
+            name="万能端口测试",
+            inputs=(PortSpec("data", "任意数据", any_type=True),),
+            outputs=(PortSpec("data", "任意数据", any_type=True),),
+        )
+        values = (
+            ImageData(np.zeros((4, 4, 3), np.uint8)),
+            NumberValue(1.5, "数值"),
+            EdgesData((np.array([[0, 0], [2, 2]], np.int32),)),
+            ContoursData((np.array([[0, 0], [2, 2]], np.int32),)),
+            ComponentsData.from_labels(np.array([[0, 1], [1, 1]], np.int32)),
+        )
+        for value in values:
+            validate_inputs(spec, {"data": value})
+            outputs = output_to_dict(spec, value)
+            self.assertIs(outputs["data"], value)
+        with self.assertRaises(OperatorError):
+            validate_inputs(spec, {"data": object()})
+        with self.assertRaises(OperatorError):
+            validate_inputs(spec, {})
 
 
 class OutputNormalizationTests(unittest.TestCase):

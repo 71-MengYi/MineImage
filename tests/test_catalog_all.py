@@ -209,10 +209,10 @@ class OpenCVCatalogTests(unittest.TestCase):
                 self.assertTrue(spec.category, f"{entry.id} 缺少分类")
                 self.assertIn(spec.category[0], CATEGORY_ORDER)
                 self.assertTrue(spec.outputs, f"{entry.id} 没有输出")
-                self.assertIs(
-                    spec.outputs[0].data_type,
-                    DataType.IMAGE,
-                    f"{entry.id} 第一个输出必须是图像（预览依赖）",
+                self.assertTrue(
+                    spec.outputs[0].any_type
+                    or spec.outputs[0].data_type is DataType.IMAGE,
+                    f"{entry.id} 第一个输出必须是图像或万能端口（预览依赖）",
                 )
                 defaults = normalize_params(spec, None)
                 self.assertEqual(set(defaults), {param.key for param in spec.params})
@@ -260,11 +260,17 @@ class OpenCVCatalogTests(unittest.TestCase):
                         if port.key not in outputs:
                             continue
                         value = outputs[port.key]
-                        self.assertEqual(
-                            data_type_of(value),
-                            port.data_type,
-                            f"{entry.id} 输出 {port.key} 类型不匹配",
-                        )
+                        if port.any_type:
+                            self.assertIsNotNone(
+                                data_type_of(value),
+                                f"{entry.id} 万能输出 {port.key} 必须是已知数据类型",
+                            )
+                        else:
+                            self.assertEqual(
+                                data_type_of(value),
+                                port.data_type,
+                                f"{entry.id} 输出 {port.key} 类型不匹配",
+                            )
                         if isinstance(value, ImageData):
                             self.assertGreater(value.array.size, 0)
                             self.assertIn(value.array.ndim, (2, 3))

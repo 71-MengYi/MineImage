@@ -76,8 +76,11 @@ class ParamValidationError(OperatorError):
 class PortSpec:
     """端口声明。
 
-    ``data_type`` 是端口的唯一类型约束；``accepts`` 只在图像端口上有意义，
-    用于进一步限定颜色空间（``L`` / ``BGR`` / ``BGRA``）。
+    data_type 是端口的类型约束；accepts 只在图像端口上有意义，用于进一步限定
+    颜色空间（L / BGR / BGRA）。
+
+    any_type=True 表示万能端口：输入接收任意已知类型的数据，输出把上游数据
+    原样透传。此时 data_type 仅作为 UI 占位（默认图像），真正的类型由运行时值决定。
     """
 
     key: str
@@ -86,28 +89,33 @@ class PortSpec:
     optional: bool = False
     description: str = ""
     data_type: DataType | str = DataType.IMAGE
+    any_type: bool = False
 
     def __post_init__(self) -> None:
         data_type = coerce_data_type(self.data_type)
         object.__setattr__(self, "data_type", data_type)
-        if data_type is not DataType.IMAGE:
-            # 非图像端口不接受颜色空间声明，避免作者误以为会做额外校验。
+        if data_type is not DataType.IMAGE or self.any_type:
+            # 非图像端口 / 万能端口不接受颜色空间声明，避免作者误以为会做额外校验。
             object.__setattr__(self, "accepts", ())
         else:
             accepts = tuple(str(item).strip() for item in (self.accepts or ()) if str(item).strip())
             object.__setattr__(self, "accepts", accepts)
 
     def accepts_image(self, image: ImageData) -> bool:
-        if not self.accepts:
+        if self.any_type or not self.accepts:
             return True
         return image.color_space in self.accepts
 
     def accept_text(self) -> str:
+        if self.any_type:
+            return "任意数据"
         if self.data_type is not DataType.IMAGE:
             return self.data_type.label
         return "/".join(self.accepts) if self.accepts else "任意"
 
     def type_text(self) -> str:
+        if self.any_type:
+            return "任意数据"
         if self.data_type is DataType.IMAGE:
             return f"图像（{self.accept_text()}）"
         return self.data_type.label
@@ -115,6 +123,8 @@ class PortSpec:
     def accepts_value(self, value: Any) -> bool:
         """检查一个已规范化数据值是否满足本端口的类型 / 颜色空间约束。"""
 
+        if self.any_type:
+            return data_type_of(value) is not None
         if data_type_of(value) is not self.data_type:
             return False
         if isinstance(value, ImageData) and self.data_type is DataType.IMAGE:
@@ -494,10 +504,13 @@ def params_by_group(spec: OperatorSpec) -> dict[str, list[ParamSpec]]:
 def port_types_compatible(output_port: PortSpec, input_port: PortSpec) -> bool:
     """输出端口能否直接连接到输入端口。
 
-    * 数据类型必须完全一致；
+    * 任意一端声明为万能端口（any_type=True）时直接兼容；
+    * 否则数据类型必须完全一致；
     * 图像端口在双方都声明了颜色空间时，至少要有交集（实际像素仍会在执行时校验）。
     """
 
+    if output_port.any_type or input_port.any_type:
+        return True
     if output_port.data_type is not input_port.data_type:
         return False
     if output_port.data_type is DataType.IMAGE:
@@ -525,8 +538,14 @@ def validate_inputs(spec: OperatorSpec, inputs: Mapping[str, Any | None]) -> Non
             if not port.optional:
                 missing.append(port.label)
             continue
-        if data_type_of(value) is not port.data_type:
-            actual = data_type_of(value)
+        actual = data_type_of(value)
+        if port.any_type:
+            if actual is None:
+                raise OperatorError(
+                    f"输入“{port.label}”需要任意已知类型的数据，当前为{type(value).__name__}。"
+                )
+            continue
+        if actual is not port.data_type:
             actual_text = actual.label if actual is not None else type(value).__name__
             raise OperatorError(
                 f"输入“{port.label}”需要{port.data_type.label}数据，当前为{actual_text}。"
@@ -545,6 +564,13 @@ def coerce_output_value(port: PortSpec, value: Any) -> Any:
     key_label = f"输出“{port.label}”"
     if value is None:
         raise OperatorError(f"{key_label}没有数据")
+    if port.any_type:
+        if data_type_of(value) is None:
+            raise OperatorError(
+                f"{key_label}需要任意已知类型的数据，当前为{type(value).__name__}。"
+            )
+        # 万能输出不转换数据：保持原对象、原类型，直接透传给下游。
+        return value
     try:
         if port.data_type is DataType.IMAGE:
             if isinstance(value, ImageData):

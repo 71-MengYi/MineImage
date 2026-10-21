@@ -42,6 +42,7 @@ class PortItem(QGraphicsItem):
         self.index = index
         self.port_spec = port_spec
         self.data_type = port_spec.data_type if port_spec is not None else DataType.IMAGE
+        self.any_type = bool(port_spec.any_type) if port_spec is not None else False
         self._connected = False
         self._hover = False
         self._highlight = False
@@ -52,10 +53,15 @@ class PortItem(QGraphicsItem):
 
     def _tooltip_text(self) -> str:
         role = "输入" if self.is_input else "输出"
-        lines = [f"{role}端口：{self.label}", f"数据类型：{self.data_type.label}"]
+        type_text = (
+            "任意数据（图像 / 数值 / 边缘特征 / 轮廓特征 / 连通域）"
+            if self.any_type
+            else self.data_type.label
+        )
+        lines = [f"{role}端口：{self.label}", f"数据类型：{type_text}"]
         spec = self.port_spec
         if spec is not None:
-            if self.data_type is DataType.IMAGE:
+            if self.data_type is DataType.IMAGE and not self.any_type:
                 prefix = "接受图像" if self.is_input else "图像颜色空间"
                 lines.append(f"{prefix}：{spec.accept_text()}")
             if spec.optional:
@@ -87,6 +93,9 @@ class PortItem(QGraphicsItem):
         return self.scenePos()
 
     def type_color(self) -> QColor:
+        if self.any_type:
+            # 万能端口使用中性色，避免被误认为固定为图像类型。
+            return QColor("#64748b")
         return QColor(self.data_type.color)
 
     # --------------------------------------------------------------- 几何绘制

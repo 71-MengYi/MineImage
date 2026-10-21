@@ -884,9 +884,14 @@ class GraphView(QGraphicsView):
     def _compatible_output_key(self, spec: OperatorSpec, target: PortItem) -> str | None:
         target_spec = self.port_spec(target.node_item.node_id, target.key, True)
         for port in spec.outputs:
-            if port.data_type is not target.data_type:
-                continue
-            if target_spec is not None and not port_types_compatible(port, target_spec):
+            if target_spec is not None:
+                if not port_types_compatible(port, target_spec):
+                    continue
+            elif (
+                not port.any_type
+                and not target.any_type
+                and port.data_type is not target.data_type
+            ):
                 continue
             return port.key
         return None
@@ -894,9 +899,14 @@ class GraphView(QGraphicsView):
     def _compatible_input_key(self, spec: OperatorSpec, target: PortItem) -> str | None:
         target_spec = self.port_spec(target.node_item.node_id, target.key, False)
         for port in spec.inputs:
-            if port.data_type is not target.data_type:
-                continue
-            if target_spec is not None and not port_types_compatible(target_spec, port):
+            if target_spec is not None:
+                if not port_types_compatible(target_spec, port):
+                    continue
+            elif (
+                not port.any_type
+                and not target.any_type
+                and port.data_type is not target.data_type
+            ):
                 continue
             return port.key
         return None
@@ -916,14 +926,26 @@ class GraphView(QGraphicsView):
         target_spec = self.port_spec(connection.dst_node, connection.dst_port, True)
 
         def input_ok(port: PortSpec) -> bool:
-            if source_type is not None and port.data_type is not source_type:
+            if source_spec is not None:
+                return port_types_compatible(source_spec, port)
+            if (
+                source_type is not None
+                and not port.any_type
+                and port.data_type is not source_type
+            ):
                 return False
-            return source_spec is None or port_types_compatible(source_spec, port)
+            return True
 
         def output_ok(port: PortSpec) -> bool:
-            if target_type is not None and port.data_type is not target_type:
+            if target_spec is not None:
+                return port_types_compatible(port, target_spec)
+            if (
+                target_type is not None
+                and not port.any_type
+                and port.data_type is not target_type
+            ):
                 return False
-            return target_spec is None or port_types_compatible(port, target_spec)
+            return True
 
         input_key = next((port.key for port in spec.inputs if input_ok(port)), None)
         output_key = next((port.key for port in spec.outputs if output_ok(port)), None)
