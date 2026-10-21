@@ -308,6 +308,50 @@ class OpenCVCatalogTests(unittest.TestCase):
         self.assertGreaterEqual(outputs["count"].value, 4.0)
         self.assertGreater(outputs["image"].array.size, 0)
 
+    def test_fft_ifft_roundtrip_uses_spectrum_port(self) -> None:
+        """FFT 的复频谱输出应能接入 IFFT 并精确重建原图。"""
+        array = self.samples["gray8"]
+        fft = self.registry.entry("analysis.fft")
+        ifft = self.registry.entry("analysis.ifft")
+        self.assertIsNotNone(fft)
+        self.assertIsNotNone(ifft)
+        self.assertIn(
+            "spectrum",
+            {port.key for port in fft.spec.outputs},
+            "FFT 应输出复频谱端口",
+        )
+        self.assertIn(
+            "spectrum",
+            {port.key for port in ifft.spec.inputs},
+            "IFFT 应接受复频谱输入",
+        )
+
+        fft_outputs = output_to_dict(
+            fft.spec,
+            fft.operator.process(
+                image=ImageData(array),
+                **normalize_params(fft.spec, None),
+            ),
+        )
+        spectrum = fft_outputs["spectrum"]
+        self.assertEqual(spectrum.array.dtype, np.float32)
+        self.assertEqual(spectrum.color_space, "BGR")
+
+        restored = output_to_dict(
+            ifft.spec,
+            ifft.operator.process(
+                image=ImageData(array),
+                spectrum=spectrum,
+                **normalize_params(ifft.spec, None),
+            ),
+        )["image"].array
+        self.assertEqual(restored.shape, array.shape)
+        self.assertLessEqual(
+            int(np.abs(restored.astype(np.int16) - array.astype(np.int16)).max()),
+            1,
+            "FFT → IFFT 往返误差应不超过 1 个灰度级",
+        )
+
     def test_histogram_compare_returns_number(self) -> None:
         entry = self.registry.entry("analysis.hist_compare")
         self.assertIsNotNone(entry)

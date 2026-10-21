@@ -66,6 +66,46 @@ def _colorize(values: np.ndarray, colormap: int = cv2.COLORMAP_JET) -> np.ndarra
     return cv2.applyColorMap(gray, colormap)
 
 
+def _restore_gray(values: np.ndarray) -> np.ndarray:
+    """把逆变换结果恢复为 8 位灰度：0–255 内保持原尺度，超出时才拉伸。"""
+    work = np.nan_to_num(np.asarray(values, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    low = float(work.min()) if work.size else 0.0
+    high = float(work.max()) if work.size else 0.0
+    if not (low >= -0.5 and high <= 255.5):
+        if high - low > 1e-12:
+            work = (work - low) / (high - low) * 255.0
+        else:
+            work = np.zeros_like(work)
+    return np.clip(np.rint(work), 0, 255).astype(np.uint8)
+
+
+def _encode_spectrum(spectrum: np.ndarray) -> np.ndarray:
+    """把 ``(H, W, 2)`` 复频谱编码为 float32 BGR：B=实部，G=虚部，R=0。"""
+    height, width = spectrum.shape[:2]
+    encoded = np.zeros((height, width, 3), dtype=np.float32)
+    encoded[:, :, 0] = spectrum[:, :, 0]
+    encoded[:, :, 1] = spectrum[:, :, 1]
+    return encoded
+
+
+def _decode_spectrum(spectrum) -> np.ndarray:
+    """把 FFT 输出的 float32 BGR 复频谱解码为 ``(H, W, 2)``。"""
+    array = _cv.source_bgr(spectrum, "复频谱")
+    if array.shape[2] != 3:
+        raise OperatorError("复频谱必须是三通道图像（B=实部，G=虚部）。")
+    if array.dtype != np.float32:
+        array = array.astype(np.float32)
+    return np.dstack([array[:, :, 0], array[:, :, 1]]).astype(np.float32)
+
+
+def _lowpass_mask(height: int, width: int, radius: float) -> np.ndarray:
+    """生成中心化频谱的低通掩码，``radius`` 为相对短边的半径比例。"""
+    mask = np.zeros((height, width, 2), dtype=np.float32)
+    pixel_radius = max(1, int(round(min(height, width) * float(radius) / 2.0)))
+    cv2.circle(mask, (width // 2, height // 2), pixel_radius, (1, 1), -1)
+    return mask
+
+
 def _gaussian_kernel(ksize: int, sigma: float) -> np.ndarray:
     size = max(int(ksize), 1)
     kernel = cv2.getGaussianKernel(size, float(sigma) if float(sigma) > 0 else 0.0)
@@ -308,16 +348,18 @@ class AnalysisHuMoments(Operator):
 class AnalysisFft(Operator):
     spec = OperatorSpec(
         id="analysis.fft",
-        name="傅里叶频谱",
+        name="傅里叶变换（FFT）",
         category=("特征与分析", "频域"),
         description=(
-            "把灰度图转换为 float32，做二维离散傅里叶变换并中心化，"
-            "用 log(1 + 幅值) 压缩动态范围后渲染成频谱热力图。输出频谱图与频谱总能量。"
+            "把灰度图转换为 float32，做二维离散傅里叶变换，输出频谱热力图、频谱总能量，"
+            "以及供“逆傅里叶变换（IFFT）”使用的复频谱。复频谱用 float32 BGR 承载："
+            "B 通道为实部、G 通道为虚部、R 通道为 0，未中心化保存。"
         ),
-        keywords=("FFT", "傅里叶", "频谱", "dft", "频域"),
+        keywords=("FFT", "fft", "傅里叶", "频谱", "dft", "频域", "复频谱"),
         inputs=(PortSpec("image", "输入图像"),),
         outputs=(
             PortSpec("image", "频谱热力图", accepts=("BGR",)),
+            PortSpec("spectrum", "复频谱（B=实部 G=虚部）", accepts=("BGR",)),
             PortSpec("energy", "频谱总能量", data_type=DataType.NUMBER),
         ),
     )
@@ -330,29 +372,48 @@ class AnalysisFft(Operator):
         energy = float(magnitude.sum()) if magnitude.size else 0.0
         return {
             "image": _colorize(np.log1p(magnitude), cv2.COLORMAP_VIRIDIS),
+            "spectrum": _encode_spectrum(spectrum),
             "energy": NumberValue(value=energy, label="频谱总能量"),
         }
 
 
 # ---------------------------------------------------------------------------
-# 7. IFFT 低通重建
+# 7. IFFT 逆变换 / 低通重建
 # ---------------------------------------------------------------------------
 class AnalysisIfft(Operator):
     spec = OperatorSpec(
         id="analysis.ifft",
-        name="逆傅里叶重建（低通）",
+        name="逆傅里叶变换（IFFT）",
         category=("特征与分析", "频域"),
         description=(
-            "对灰度图做傅里叶变换，保留中心半径内的低频分量后做逆变换，"
-            "得到低通滤波后的重建图像。半径越小图像越模糊。输出重建图与保留频率比例。"
+            "优先使用 spectrum 端口输入的复频谱（来自“傅里叶变换（FFT）”的复频谱输出，"
+            "B=实部、G=虚部）做逆变换，得到与 FFT 严格配对的 IFFT；未连接 spectrum 时"
+            "对 image 先做正向 FFT 再逆变换。勾选低通后仅保留中心半径内的频率，"
+            "半径越小图像越模糊。输出重建图与保留频率比例。"
         ),
-        keywords=("IFFT", "逆傅里叶", "低通", "频域滤波", "idft"),
-        inputs=(PortSpec("image", "输入图像"),),
+        keywords=("IFFT", "ifft", "逆傅里叶", "逆变换", "低通", "频域滤波", "idft"),
+        inputs=(
+            PortSpec("image", "输入图像"),
+            PortSpec(
+                "spectrum",
+                "复频谱（可选）",
+                accepts=("BGR",),
+                optional=True,
+                description="连接 FFT 的“复频谱”输出即可做真正的逆变换。",
+            ),
+        ),
         outputs=(
-            PortSpec("image", "低通重建图", accepts=("L",)),
+            PortSpec("image", "重建图", accepts=("L",)),
             PortSpec("ratio", "保留频率比例", data_type=DataType.NUMBER),
         ),
         params=(
+            ParamSpec(
+                "lowpass",
+                "低通滤波",
+                "bool",
+                default=False,
+                tooltip="开启后只保留中心半径内的频率；关闭时做完整逆变换。",
+            ),
             ParamSpec(
                 "radius",
                 "保留半径比例",
@@ -361,35 +422,46 @@ class AnalysisIfft(Operator):
                 min=0.02,
                 max=1.0,
                 step=0.01,
+                visible_when="lowpass",
+                enabled_when="lowpass",
                 tooltip="相对于图像短边的半径比例，1.0 表示保留全部频率。",
             ),
         ),
     )
 
-    def process(self, image=None, radius: float = 0.25, **_: Any):
+    def process(
+        self,
+        image=None,
+        spectrum=None,
+        lowpass: bool = False,
+        radius: float = 0.25,
+        **_: Any,
+    ):
         gray = _cv.source_gray8(image, "输入图像").astype(np.float32)
         height, width = gray.shape[:2]
-        spectrum = cv2.dft(gray, flags=cv2.DFT_COMPLEX_OUTPUT)
-        shifted = np.fft.fftshift(spectrum, axes=(0, 1))
-        mask = np.zeros((height, width, 2), dtype=np.float32)
-        pixel_radius = max(1, int(round(min(height, width) * float(radius) / 2.0)))
-        cv2.circle(mask, (width // 2, height // 2), pixel_radius, (1, 1), -1)
-        filtered = shifted * mask
+        if spectrum is not None:
+            complex_spectrum = _decode_spectrum(spectrum)
+            if complex_spectrum.shape[:2] != (height, width):
+                raise OperatorError(
+                    f"复频谱尺寸 {complex_spectrum.shape[1]}×{complex_spectrum.shape[0]} "
+                    f"与输入图像 {width}×{height} 不一致。"
+                )
+        else:
+            complex_spectrum = cv2.dft(gray, flags=cv2.DFT_COMPLEX_OUTPUT)
+
+        shifted = np.fft.fftshift(complex_spectrum, axes=(0, 1))
+        if lowpass:
+            mask = _lowpass_mask(height, width, radius)
+            shifted = shifted * mask
+            ratio = float(mask[:, :, 0].mean()) * 100.0 if mask.size else 0.0
+        else:
+            ratio = 100.0
         restored = cv2.idft(
-            np.fft.ifftshift(filtered, axes=(0, 1)),
+            np.fft.ifftshift(shifted, axes=(0, 1)),
             flags=cv2.DFT_SCALE | cv2.DFT_REAL_OUTPUT,
         )
-        values = np.nan_to_num(restored.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-        low = float(values.min()) if values.size else 0.0
-        high = float(values.max()) if values.size else 0.0
-        if high - low > 1e-12:
-            values = (values - low) / (high - low) * 255.0
-        else:
-            values = np.zeros_like(values)
-        image = np.clip(np.rint(values), 0, 255).astype(np.uint8)
-        ratio = float(mask[:, :, 0].mean()) * 100.0 if mask.size else 0.0
         return {
-            "image": image,
+            "image": _restore_gray(restored),
             "ratio": NumberValue(value=ratio, label="保留频率比例", unit="%"),
         }
 
