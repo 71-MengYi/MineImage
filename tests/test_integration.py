@@ -16,9 +16,12 @@ from PySide6.QtWidgets import QApplication
 
 from app.config import AppSettings
 from app.core.imageio import save_image
+from app.core.model import WorkspaceModel
 from app.core.types import ImageData
+from app.operators.loader import OperatorRegistry
 from app.ui.main_window import MainWindow
 from app.ui.theme import apply_theme
+from app.ui.workspace import WorkspaceWidget, _is_legacy_splitter_sizes
 
 _TMP = Path(__file__).resolve().parent.parent / ".test_tmp"
 _TMP.mkdir(exist_ok=True)
@@ -90,12 +93,11 @@ class MainWindowIntegrationTests(unittest.TestCase):
         self.assertIn("节点:", self.win._status_labels["node"].text())
         self.assertNotEqual(self.win._status_labels["size"].text(), "图像: --")
         self.assertIsNotNone(widget.graph_view.items() if hasattr(widget.graph_view, "items") else True)
-        # 初始三栏比例为 1:1:4（算子库 : 画布 : 预览）
+        # 初始三栏比例为 1:2:4（算子库 : 画布 : 预览）
         sizes = widget.splitter.sizes()
-        self.assertAlmostEqual(sizes[0], sizes[1], delta=max(8, sizes[0] * 0.1))
-        self.assertAlmostEqual(sizes[2], sizes[0] * 4, delta=max(24, sizes[0] * 0.4))
-        self.assertGreater(sizes[2], sizes[0] * 3)
-        self.assertGreater(sizes[2], sizes[1] * 3)
+        self.assertAlmostEqual(sizes[1], sizes[0] * 2, delta=max(16, sizes[0] * 0.2))
+        self.assertGreater(sizes[1], sizes[0] * 1.5)
+        self.assertGreater(sizes[2], sizes[1] * 1.5)
 
     def test_copy_paste_nodes_in_workspace(self) -> None:
         widget = self._open()
@@ -358,6 +360,42 @@ class MainWindowIntegrationTests(unittest.TestCase):
         self.win.undo()
         self._wait_idle(widget)
         self.assertTrue(self.win.act_redo.isEnabled())
+
+
+class SplitterRatioTests(unittest.TestCase):
+    """三栏默认比例 1:2:4 与旧配置迁移。"""
+
+    def test_legacy_default_ratios_are_detected(self) -> None:
+        # 1:1:3 / 1:1:4 以及窗口缩放后保存的实际宽度，都应识别为旧默认值。
+        self.assertTrue(_is_legacy_splitter_sizes((200, 200, 600)))
+        self.assertTrue(_is_legacy_splitter_sizes((200, 200, 800)))
+        self.assertTrue(_is_legacy_splitter_sizes((423, 452, 1665)))
+
+    def test_new_default_and_custom_widths_are_kept(self) -> None:
+        self.assertFalse(_is_legacy_splitter_sizes((200, 400, 800)))
+        self.assertFalse(_is_legacy_splitter_sizes((300, 600, 700)))
+        self.assertFalse(_is_legacy_splitter_sizes((0, 0, 0)))
+
+    def test_legacy_widths_are_migrated_into_new_ratio(self) -> None:
+        settings = AppSettings(_TMP / f"ratio_{uuid.uuid4().hex[:8]}.ini")
+        settings.workspace_splitter_sizes = [423, 452, 1665]
+        widget = WorkspaceWidget(WorkspaceModel("旧配置"), OperatorRegistry(), settings)
+        try:
+            self.assertTrue(widget._splitter_ratio_pending)
+            widget.resize(1480, 900)
+            widget.show()
+            _APP.processEvents()
+            QTest.qWait(60)
+            _APP.processEvents()
+            sizes = widget.splitter.sizes()
+            # 算子库 : 画布 = 1 : 2；预览占剩余宽度。
+            self.assertAlmostEqual(sizes[1], sizes[0] * 2, delta=max(16, sizes[0] * 0.2))
+            self.assertGreater(sizes[2], sizes[1])
+        finally:
+            widget.shutdown()
+            widget.close()
+            widget.deleteLater()
+            _APP.processEvents()
 
 
 if __name__ == "__main__":

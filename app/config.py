@@ -196,13 +196,13 @@ class AppSettings:
 
     @property
     def workspace_splitter_sizes(self) -> list[int]:
-        # 默认三栏比例为 算子库 : 画布 : 显示 = 1:1:4。
-        raw = self.value("window/workspace_sizes", [200, 200, 800])
+        # 默认三栏比例为 算子库 : 画布 : 显示 = 1:2:4。
+        raw = self.value("window/workspace_sizes", [200, 400, 800])
         try:
             sizes = [int(x) for x in raw]
         except (TypeError, ValueError):
-            return [200, 200, 800]
-        return sizes if len(sizes) == 3 else [200, 200, 800]
+            return [200, 400, 800]
+        return sizes if len(sizes) == 3 else [200, 400, 800]
 
     @workspace_splitter_sizes.setter
     def workspace_splitter_sizes(self, value: list[int]) -> None:

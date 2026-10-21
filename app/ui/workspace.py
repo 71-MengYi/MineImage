@@ -27,10 +27,29 @@ from app.ui.library import OperatorLibrary
 from app.ui.params import ParamPanel
 from app.ui.preview import PreviewWidget
 
-#: 三栏默认宽度比例 算子库 : 画布 : 显示 = 1:1:4。
-DEFAULT_SPLITTER_SIZES = (200, 200, 800)
-#: 旧版本默认值（1:1:3）；读到旧配置时也按未自定义处理，自动校正为新比例。
-LEGACY_SPLITTER_SIZES = (200, 200, 600)
+#: 三栏默认宽度比例 算子库 : 画布 : 显示 = 1:2:4。
+DEFAULT_SPLITTER_SIZES = (200, 400, 800)
+#: 旧版本默认比例（1:1:3 / 1:1:4）；保存的宽度受窗口大小影响，按比例识别。
+LEGACY_SPLITTER_RATIOS = ((1, 1, 3), (1, 1, 4))
+#: 识别旧默认比例时允许的相对误差（窗口缩放与最小宽度会改变实际数值）。
+LEGACY_RATIO_TOLERANCE = 0.22
+
+
+def _is_legacy_splitter_sizes(sizes: tuple[int, ...]) -> bool:
+    """判断保存的三栏宽度是否仍是旧版本的默认比例（视为“未自定义”）。"""
+
+    if len(sizes) != 3 or min(sizes) <= 0:
+        return False
+    first = float(sizes[0])
+    for first_ratio, second_ratio, third_ratio in LEGACY_SPLITTER_RATIOS:
+        expected_second = first * second_ratio / first_ratio
+        expected_third = first * third_ratio / first_ratio
+        if (
+            abs(sizes[1] - expected_second) <= expected_second * LEGACY_RATIO_TOLERANCE
+            and abs(sizes[2] - expected_third) <= expected_third * LEGACY_RATIO_TOLERANCE
+        ):
+            return True
+    return False
 
 
 class WorkspaceWidget(QWidget):
@@ -65,10 +84,11 @@ class WorkspaceWidget(QWidget):
         self._current_image = None
         self._last_pixel_sample = None
         self._last_undo_index = 0
-        # 默认比例 1:1:4；旧版本保存的 1:1:3 也视为“未自定义”，首次显示时校正。
-        self._splitter_ratio_pending = tuple(self.settings.workspace_splitter_sizes) in (
-            DEFAULT_SPLITTER_SIZES,
-            LEGACY_SPLITTER_SIZES,
+        # 默认比例 1:2:4；旧版本默认比例（1:1:3 / 1:1:4）也视为“未自定义”，
+        # 首次显示时校正，避免已有配置一直保留旧比例。
+        saved_sizes = tuple(self.settings.workspace_splitter_sizes)
+        self._splitter_ratio_pending = (
+            saved_sizes == DEFAULT_SPLITTER_SIZES or _is_legacy_splitter_sizes(saved_sizes)
         )
 
         self._build_ui()
@@ -113,7 +133,7 @@ class WorkspaceWidget(QWidget):
         self.splitter.addWidget(self.center)
         self.splitter.addWidget(self.preview)
         self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setStretchFactor(1, 2)
         self.splitter.setStretchFactor(2, 4)
         sizes = self.settings.workspace_splitter_sizes
         if len(sizes) != 3 or sum(sizes) <= 0:
@@ -136,13 +156,13 @@ class WorkspaceWidget(QWidget):
             QTimer.singleShot(0, self._apply_default_splitter_ratio)
 
     def _apply_default_splitter_ratio(self) -> None:
-        """首次显示时按 1:1:4 设置三栏宽度（QSplitter 最小尺寸提示可能压缩比例）。"""
+        """首次显示时按 1:2:4 设置三栏宽度（算子库最小宽度可能压缩预览比例）。"""
         available = self.splitter.width() - self.splitter.handleWidth() * 2
         if available <= 0:
             return
-        unit = max(1, available // 6)
-        first = unit
-        second = unit
+        unit = max(1, available // 7)
+        first = max(unit, self.library.minimumWidth())
+        second = first * 2
         third = max(1, available - first - second)
         self.splitter.setSizes([first, second, third])
 

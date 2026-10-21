@@ -9,7 +9,7 @@
 
     原始图像 ──> 灰度化 ──> 高斯模糊
 
-这是最小、最稳的三节点链路：在默认 1500×920 窗口 + 1:1:4 三栏下，打开工程后
+这是最小、最稳的三节点链路：在默认 1500×920 窗口 + 1:2:4 三栏下，打开工程后
 三个节点都完整可见。多输入/多输出端口的演示请见
 ``examples/custom_operators/highlight.py``（双输入/双输出）。
 
@@ -123,7 +123,7 @@ def main() -> int:
     widget.save_to(TARGET)
     sizes = widget.splitter.sizes()
     print(f"已生成：{TARGET.relative_to(ROOT)}  ({TARGET.stat().st_size / 1024:.1f} KiB)")
-    print(f"三栏宽度：{sizes}（1:1:4）")
+    print(f"三栏宽度：{sizes}（1:2:4）")
 
     # 回读校验 + 打开后的可视性检查
     loaded = load_project(TARGET)

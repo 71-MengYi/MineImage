@@ -143,8 +143,8 @@ class ParamPanel(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        # 参数面板与画布共用中间一栏；默认三栏比例 1:1:4 时约 240px 宽，
-        # 面板内部有滚动区，220px 仍可正常使用，避免把 1:1 挤成 1:1.3。
+        # 参数面板与画布共用中间一栏；默认三栏比例 1:2:4 时约 420px 宽，
+        # 面板内部有滚动区，用户把分隔条拖窄到 220px 时仍可正常使用。
         self.setMinimumWidth(220)
         self._node: NodeModel | None = None
         self._operator: Operator | None = None
@@ -242,7 +242,7 @@ class ParamPanel(QWidget):
         footer_layout.addWidget(self.error_label)
         buttons = QHBoxLayout()
         buttons.setSpacing(6)
-        # 中间栏在 1:1:4 下约 240px；按钮文案保持简短，完整说明放在 tooltip 中。
+        # 中间栏在 1:2:4 下约 420px；按钮文案保持简短，完整说明放在 tooltip 中。
         self.reset_button = QPushButton("重置", self.footer)
         self.reset_button.setObjectName("subtleButton")
         self.reset_button.setToolTip("把所有参数恢复为算子声明的默认值")
@@ -388,8 +388,8 @@ class ParamPanel(QWidget):
 
     def _build_row(self, param: ParamSpec, parent: QWidget) -> _ParamRow:
         row_widget = QWidget(parent)
-        # 中间一栏在默认 1:1:4 布局下只有约 240px，横向“标签 + 控件”会挤压
-        # 数字滑杆 / 拾取按钮；改为标签在上、控件占满整行，窄栏也能完整显示。
+        # 中间一栏在默认 1:2:4 布局下约 420px，但用户可能把分隔条拖窄；横向
+        # “标签 + 控件”会挤压数字滑杆 / 拾取按钮，改为标签在上、控件占满整行。
         layout = QVBoxLayout(row_widget)
         layout.setContentsMargins(0, 2, 0, 2)
         layout.setSpacing(3)
