@@ -75,7 +75,7 @@ GROUP_ALL_IDS = (
     "analysis.match_shapes",
 )
 
-#: 默认参数必须成功的算子（dnn.infer 需要模型文件，单独测试）。
+#: 默认参数必须成功的算子（dnn.infer 使用预置 MobileNetV2，缺模型时单独测试）。
 RUNNABLE_IDS = tuple(op_id for op_id in GROUP_ALL_IDS if op_id != "dnn.infer")
 
 #: 本组允许出现的一级分类。
@@ -207,11 +207,17 @@ class CatalogVideoAnalysisTests(unittest.TestCase):
                 if param.enabled_when:
                     self.assertNotIn("params.", param.enabled_when, f"{op_id}.{param.key} 用了属性访问")
 
-    def test_dnn_infer_default_requires_model(self) -> None:
+    def test_dnn_infer_without_model_reports_download_hint(self) -> None:
+        if models.is_model_ready("image_classification_mobilenetv2"):
+            self.skipTest("预置 MobileNetV2 已缓存，跳过缺模型分支")
         with self.assertRaises(OperatorError) as context:
-            self.run_operator("dnn.infer", {"image": gray8()})
+            self.run_operator(
+                "dnn.infer",
+                {"image": gray8()},
+                {"path": "", "auto_download": False},
+            )
         message = str(context.exception)
-        self.assertTrue(message, "dnn.infer 未给出提示")
+        self.assertIn("opencv_zoo", message)
         self.assertTrue(contains_cjk(message), f"dnn.infer 的提示应为中文：{message}")
 
     # ------------------------------------------------------------------ 默认参数矩阵

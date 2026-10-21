@@ -55,8 +55,9 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   同一个撤销宏。`PortItem` 按 `DataType` 着色并过滤可连接端口：只有同类型端口
   才能建立连线，图像端口还要求颜色空间有交集。
 * **界面**：`app/ui/*`，主窗口与工作区负责组装，其余控件保持可独立测试。
-* **ONNX 模型下载**：`app/core/models.py` 维护 OpenCV Zoo 模型清单（YuNet / SFace）、
-  本地缓存目录与下载逻辑（进度 / 取消 / 原子落盘 / HTML 与 SHA-256 校验）；
+* **ONNX 模型下载**：`app/core/models.py` 维护 OpenCV Zoo 模型清单（YuNet / SFace /
+  MobileNetV2）、本地缓存目录与下载逻辑（进度 / 取消 / 原子落盘 / HTML 与 SHA-256
+  校验）；
   `app/ui/model_download.py` 用 Qt 线程池把下载放到后台，参数面板与设置对话框
   共用。默认自动下载可用 `MINEIMAGE_AUTO_DOWNLOAD_MODELS=0` 关闭，缓存目录可用
   `MINEIMAGE_MODEL_DIR` 覆盖。

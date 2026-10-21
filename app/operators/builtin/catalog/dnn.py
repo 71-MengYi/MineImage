@@ -5,8 +5,8 @@
 约定
 ----
 * ``dnn.blob`` 默认参数即可运行，不需要模型文件；
-* ``dnn.infer`` 的模型路径默认为空字符串，未选择模型时抛出中文 ``OperatorError``，
-  这属于预期行为（没有模型无法推理），测试中会跳过它；
+* ``dnn.infer`` 的模型路径留空时使用预置 MobileNetV2 图像分类模型（可自动下载）；
+  下载失败或显式关闭自动下载时抛出中文 ``OperatorError``；
 * 推理结果统一渲染成文本面板 / 特征条图，主输出保持图像。
 """
 
@@ -18,9 +18,14 @@ from typing import Any
 import cv2
 import numpy as np
 
+from app.core import models
 from app.core.data_types import DataType, NumberValue
 from app.operators.builtin.catalog import _cv
 from app.operators.spec import Operator, OperatorError, OperatorSpec, ParamSpec, PortSpec
+
+
+#: DNN 推理默认预置模型：MobileNetV2 ImageNet 分类（输出 1000 维得分）。
+DNN_PRESET_MODEL_KEY = "image_classification_mobilenetv2"
 
 
 def _to_display(values: np.ndarray) -> np.ndarray:
@@ -165,8 +170,10 @@ class DnnInfer(Operator):
         category=("深度学习", "DNN"),
         description=(
             "加载 ONNX / Caffe / TensorFlow 等模型文件，按统一参数生成 Blob 并前向推理，"
-            "把输出向量中最强的若干响应画成柱状图。模型路径为空时不会执行推理，"
-            "而是提示先选择模型文件；请先通过参数面板选择模型后再运行。"
+            "把输出向量中最强的若干响应画成柱状图。模型路径留空时使用预置的 "
+            "MobileNetV2 ImageNet 分类模型（可一键下载或在运行时自动下载）；"
+            "也可以点「浏览…」选择自己的模型文件。预置模型默认使用 224×224、"
+            "ImageNet 均值与 1/255 缩放，替换模型时请按模型文档调整尺寸与归一化参数。"
         ),
         keywords=("DNN", "推理", "infer", "ONNX", "模型", "深度学习"),
         inputs=(PortSpec("image", "输入图像"),),
@@ -181,9 +188,25 @@ class DnnInfer(Operator):
                 "模型文件",
                 "path",
                 default="",
-                placeholder="请选择 ONNX / Caffe 模型",
+                placeholder="留空使用预置 MobileNetV2 模型",
                 group="模型",
-                tooltip="必填；留空时算子会提示先选择模型文件。",
+                tooltip=(
+                    "留空时使用预置 MobileNetV2 分类模型（可点击下载或自动下载）；"
+                    "也可点「浏览…」选择任意 ONNX / Caffe 模型。"
+                ),
+                widget="model_file",
+                widget_options={"model": DNN_PRESET_MODEL_KEY},
+            ),
+            ParamSpec(
+                "auto_download",
+                "自动下载预置模型",
+                "bool",
+                default=True,
+                group="模型",
+                tooltip=(
+                    "模型路径留空且预置模型缺失时，自动从 OpenCV Zoo 下载 "
+                    "MobileNetV2（约 13 MB）。"
+                ),
             ),
             ParamSpec("width", "输入宽度", "int", default=224, min=8, max=2048, step=8, unit="px", group="尺寸"),
             ParamSpec("height", "输入高度", "int", default=224, min=8, max=2048, step=8, unit="px", group="尺寸"),
@@ -209,6 +232,7 @@ class DnnInfer(Operator):
         self,
         image=None,
         path: str = "",
+        auto_download: bool = True,
         width: int = 224,
         height: int = 224,
         mean_b: float = 104.0,
@@ -221,7 +245,11 @@ class DnnInfer(Operator):
     ):
         model_path = str(path or "").strip()
         if not model_path:
-            raise OperatorError("请先选择模型文件（ONNX 等）后再运行 DNN 推理。")
+            auto = bool(auto_download) and models.auto_download_enabled()
+            try:
+                model_path = str(models.ensure_model(DNN_PRESET_MODEL_KEY, auto=auto))
+            except models.ModelError as exc:
+                raise OperatorError(str(exc)) from exc
         if not os.path.isfile(model_path):
             raise OperatorError(f"模型文件不存在：{model_path}")
         try:

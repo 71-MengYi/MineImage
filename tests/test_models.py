@@ -115,6 +115,24 @@ class ModelDownloadTests(unittest.TestCase):
             f"应保留 GitHub LFS 备用地址：{spec.urls}",
         )
 
+    def test_builtin_mobilenet_is_available_for_dnn_infer(self) -> None:
+        spec = models.MODELS["image_classification_mobilenetv2"]
+        self.assertEqual(spec.filename, "image_classification_mobilenetv2_2022apr.onnx")
+        self.assertTrue(
+            spec.url.startswith(
+                "https://github.com/opencv/opencv_zoo/raw/main/"
+                "models/image_classification_mobilenet/"
+            ),
+            spec.url,
+        )
+        self.assertIn("image_classification_mobilenet", spec.homepage)
+        self.assertGreaterEqual(spec.size, 10_000_000)
+        self.assertGreaterEqual(spec.min_size, 1_000_000)
+        self.assertTrue(
+            any("media.githubusercontent.com" in url for url in spec.urls),
+            f"应保留 GitHub LFS 备用地址：{spec.urls}",
+        )
+
     def test_unknown_model_raises(self) -> None:
         with self.assertRaises(models.ModelError):
             models.resolve_model("not-a-real-model")

@@ -445,7 +445,8 @@ ParamSpec("gain", "增益", "float", default=1.0, min=0.1, max=4.0,
 * 控件 `model_file`：模型路径 + 浏览 + 后台下载 + 状态 + 官方下载地址。配置为
   `widget_options={"model": "<app.core.models.MODELS 中的 key>"}`；未知 key 只禁用
   下载，不抛异常。内置模型 key：`face_detection_yunet`、
-  `face_recognition_sface`。
+  `face_recognition_sface`、`image_classification_mobilenetv2`（DNN 推理预置的
+  MobileNetV2 分类模型）。
 
 最小示例（放在算子模块或 UI 插件模块中；只在界面创建参数行时才会调用工厂）：
 

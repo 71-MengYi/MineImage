@@ -29,8 +29,9 @@ MineImage 是一个基于 **PySide6 + OpenCV** 的节点式图像处理实验工
 * **自动发现算子**：把符合规范的 Python 文件放入 `operators/` 或设置中的额外目录，
   启动时或按 F5 自动扫描；扫描失败不影响其它算子，可在“算子 → 查看加载日志”排错。
 * **OpenCV ONNX 模型**：OpenCV 5 移除了 Haar / HOG 等传统 objdetect API，人脸检测
-  改用 YuNet ONNX 模型；参数面板直接显示官方下载地址并支持后台下载，算子也可在
-  运行时自动下载。模型缓存到 `<应用目录>/models`。
+  改用 YuNet ONNX 模型，DNN 推理预置 MobileNetV2 分类模型；参数面板直接显示官方
+  下载地址并支持后台下载，算子也可在运行时自动下载。模型缓存到
+  `<应用目录>/models`。
 * **工程文件**：`.mi` 是 zip 压缩容器，内嵌源图像（npz，保真 uint16/float32/alpha），
   换机器打开不丢图。
 * **设置持久化**：`config/MineImage.ini`（便携式，可用 `MINEIMAGE_CONFIG` 覆盖）。
@@ -98,22 +99,25 @@ OPERATOR = MyOp
 ## OpenCV ONNX 模型与自动下载
 
 OpenCV 5.0 移除了 `cv2.CascadeClassifier` 与 `cv2.HOGDescriptor`，因此
-“人脸检测”算子改用 OpenCV Zoo 的 **YuNet ONNX** 模型。模型文件不随
-`opencv-python` 安装，需要下载后放到本机：
+“人脸检测”算子改用 OpenCV Zoo 的 **YuNet ONNX** 模型；“DNN 推理”算子在模型
+路径留空时预置 **MobileNetV2** 图像分类模型。模型文件不随 `opencv-python`
+安装，需要下载后放到本机：
 
 | 模型 | 用途 | 官方下载地址 |
 | --- | --- | --- |
 | YuNet（约 230 KB） | 人脸检测 | <https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx> |
 | SFace（约 37 MB） | 人脸特征 / 比对 | <https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx> |
+| MobileNetV2（约 13 MB） | DNN 推理 / ImageNet 分类 | <https://github.com/opencv/opencv_zoo/raw/main/models/image_classification_mobilenet/image_classification_mobilenetv2_2022apr.onnx> |
 
 模型来自 [OpenCV Zoo](https://github.com/opencv/opencv_zoo)，版权与许可归各模型
 作者，使用前请阅读对应模型目录下的 LICENSE。
 
 **下载方式（任选其一）**
 
-1. 双击“人脸检测”节点，在「模型文件」参数下点击 **下载模型**：面板显示官方地址、
-   下载进度与本地缓存状态；
-2. 保持「自动下载模型」开启（默认），首次运行算子时自动从 OpenCV Zoo 下载；
+1. 双击“人脸检测”或“DNN 推理”节点，在「模型文件」参数下点击 **下载模型**：
+   面板显示官方地址、下载进度与本地缓存状态；
+2. 保持「自动下载模型 / 自动下载预置模型」开启（默认），首次运行算子时自动从
+   OpenCV Zoo 下载；
 3. **设置 → 模型** 页集中查看所有内置模型的状态、下载地址并下载；
 4. 手动下载后放进 `<应用目录>/models/`，或在参数面板点「浏览…」选择文件。
 
@@ -143,7 +147,7 @@ OpenCV 5.0 移除了 `cv2.CascadeClassifier` 与 `cv2.HOGDescriptor`，因此
 | 图像增强 | 17 | 非局部均值、TV-L1、修复、无缝克隆、HDR、去雾、Retinex |
 | 视频与运动 | 10 | 光流、背景建模、CamShift、ECC、目标跟踪 |
 | 立体与标定 | 6 | 棋盘格、畸变校正、立体视差 / 深度、单应、全景 |
-| 深度学习 | 6 | YuNet 人脸（ONNX）、二维码 / 条码检测、DNN Blob 与推理；Haar / HOG 仅 OpenCV 4.x |
+| 深度学习 | 6 | YuNet 人脸（ONNX）、二维码 / 条码检测、DNN Blob、DNN 推理（预置 MobileNetV2）；Haar / HOG 仅 OpenCV 4.x |
 | 交互处理 | 19 | ROI、线 / 矩形 / 圆 / 文本 / 箭头 / 水印、布局拼接 |
 | 其他 | 3 | OpenCV 通用调用（任意 cv2 函数）、构建信息、输出预览（万能入口 / 出口） |
 

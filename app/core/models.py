@@ -46,6 +46,11 @@ OPENCV_ZOO_YUNET_URL = "https://github.com/opencv/opencv_zoo/tree/main/models/fa
 #: OpenCV Zoo 人脸识别 SFace 模型页面。
 OPENCV_ZOO_SFACE_URL = "https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface"
 
+#: OpenCV Zoo MobileNetV2 图像分类模型页面。
+OPENCV_ZOO_MOBILENET_URL = (
+    "https://github.com/opencv/opencv_zoo/tree/main/models/image_classification_mobilenet"
+)
+
 ProgressCallback = Callable[[int, int], None]
 """下载进度回调：`(已下载字节, 总字节)`；总字节未知时为 0。"""
 
@@ -127,6 +132,29 @@ MODELS: dict[str, ModelSpec] = {
         ),
         min_size=1_000_000,
         size=38_696_353,
+    ),
+    "image_classification_mobilenetv2": ModelSpec(
+        key="image_classification_mobilenetv2",
+        name="MobileNetV2 图像分类模型",
+        filename="image_classification_mobilenetv2_2022apr.onnx",
+        url=(
+            "https://github.com/opencv/opencv_zoo/raw/main/"
+            "models/image_classification_mobilenet/"
+            "image_classification_mobilenetv2_2022apr.onnx"
+        ),
+        mirrors=(
+            "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/"
+            "models/image_classification_mobilenet/"
+            "image_classification_mobilenetv2_2022apr.onnx",
+        ),
+        homepage=OPENCV_ZOO_MOBILENET_URL,
+        description=(
+            "OpenCV Zoo 官方 MobileNetV2 ImageNet 1000 类分类模型（约 13 MB），"
+            "输出 1000 维分类得分，适合「DNN 推理」算子做 top-K 响应可视化。"
+            "默认预处理为 224×224、ImageNet 均值（BGR 约 104/117/124）与 1/255 缩放。"
+        ),
+        min_size=5_000_000,
+        size=13_964_571,
     ),
 }
 
