@@ -63,6 +63,13 @@ from app.operators.spec import (
     normalize_params,
     param_defaults,
 )
+from app.ui.param_widgets import (
+    ParamField,
+    ParamLayoutContext,
+    ParamWidgetContext,
+    get_param_layout,
+    get_param_widget,
+)
 
 _INTERACTIVE_TYPES = ("points", "roi", "line")
 _PICK_TOOLS = {"points", "rect", "line"}
@@ -139,6 +146,20 @@ def _clear_layout(layout: QVBoxLayout) -> None:
         if widget is not None:
             widget.setParent(None)
             widget.deleteLater()
+
+
+def _coerce_param_field(result: Any) -> ParamField | None:
+    """把自定义控件工厂的返回值规范化为 :class:`ParamField`；无效返回 None。"""
+
+    if isinstance(result, ParamField):
+        widget, getter, setter = result.widget, result.getter, result.setter
+    elif isinstance(result, (tuple, list)) and len(result) == 3:
+        widget, getter, setter = result
+    else:
+        return None
+    if not isinstance(widget, QWidget) or not callable(getter) or not callable(setter):
+        return None
+    return ParamField(widget=widget, getter=getter, setter=setter)
 
 
 def _color_icon(color: str) -> QIcon:
@@ -376,6 +397,11 @@ class ParamPanel(QWidget):
         row.setter(value)
         self._on_editor_changed()
 
+    def notify_edited(self) -> None:
+        """自定义控件完成编辑后调用：刷新联动条件并触发防抖预览。"""
+
+        self._on_editor_changed()
+
     def param_row_visible(self, key: str) -> bool:
         row = self._rows.get(key)
         return bool(row and not row.row.isHidden())
@@ -530,26 +556,78 @@ class ParamPanel(QWidget):
         return lines
 
     def _build_row(self, param: ParamSpec, parent: QWidget) -> _ParamRow:
-        row_widget = QWidget(parent)
-        # 中间一栏在默认 1:2:4 布局下约 420px，但用户可能把分隔条拖窄；横向
-        # “标签 + 控件”会挤压数字滑杆 / 拾取按钮，改为标签在上、控件占满整行。
-        layout = QVBoxLayout(row_widget)
-        layout.setContentsMargins(0, 2, 0, 2)
-        layout.setSpacing(3)
-        label = QLabel(param.label, row_widget)
+        label = QLabel(param.label, parent)
         label.setWordWrap(True)
         label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         if param.tooltip:
             label.setToolTip(param.tooltip)
-        field, getter, setter = self._create_field(param, row_widget)
+        field, getter, setter = self._create_field(param, parent)
         field.setToolTip(param.tooltip or param.label)
+        row_widget = self._create_row_layout(param, parent, label, field)
+        return _ParamRow(param, row_widget, label, field, getter, setter)
+
+    def _create_row_layout(
+        self,
+        param: ParamSpec,
+        parent: QWidget,
+        label: QLabel,
+        field: QWidget,
+    ) -> QWidget:
+        """按 ``ParamSpec.layout`` 构造参数行；未注册 / 异常时回退 stacked。"""
+
+        layout_name = (param.layout or "stacked").strip() or "stacked"
+        explicit = bool(param.layout and param.layout.strip())
+        factory = get_param_layout(layout_name)
+        if factory is None:
+            if explicit:
+                self.status_message.emit(
+                    f"未注册的参数布局“{layout_name}”，已回退默认布局。"
+                )
+            factory = get_param_layout("stacked")
+        if factory is not None:
+            try:
+                row = factory(
+                    ParamLayoutContext(
+                        param=param,
+                        panel=self,
+                        parent=parent,
+                        label=label,
+                        field=field,
+                        options=dict(param.widget_options),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - 作者布局异常不能拖垮面板
+                self.status_message.emit(
+                    f"参数布局“{layout_name}”创建失败，已回退默认布局：{exc}"
+                )
+            else:
+                if isinstance(row, QWidget):
+                    return row
+                self.status_message.emit(
+                    f"参数布局“{layout_name}”未返回有效控件，已回退默认布局。"
+                )
+        return self._default_row_widget(parent, label, field)
+
+    @staticmethod
+    def _default_row_widget(parent: QWidget, label: QLabel, field: QWidget) -> QWidget:
+        # 中间一栏在默认 1:2:4 布局下约 420px，但用户可能把分隔条拖窄；横向
+        # “标签 + 控件”会挤压数字滑杆 / 拾取按钮，改为标签在上、控件占满整行。
+        row_widget = QWidget(parent)
+        row_widget.setObjectName("paramRow")
+        layout = QVBoxLayout(row_widget)
+        layout.setContentsMargins(0, 2, 0, 2)
+        layout.setSpacing(3)
         layout.addWidget(label, 0)
         layout.addWidget(field, 1)
-        return _ParamRow(param, row_widget, label, field, getter, setter)
+        return row_widget
 
     def _create_field(
         self, param: ParamSpec, parent: QWidget
     ) -> tuple[QWidget, Callable[[], Any], Callable[[Any], None]]:
+        if param.widget:
+            custom = self._create_custom_field(param, parent)
+            if custom is not None:
+                return custom
         if param.type == "int":
             return self._create_int(param, parent)
         if param.type == "float":
@@ -570,6 +648,41 @@ class ParamPanel(QWidget):
         line.setReadOnly(True)
         line.setText(str(param.default_value()))
         return line, line.text, line.setText
+
+    def _create_custom_field(
+        self, param: ParamSpec, parent: QWidget
+    ) -> tuple[QWidget, Callable[[], Any], Callable[[Any], None]] | None:
+        """按 ``ParamSpec.widget`` 创建自定义控件；失败时回退默认控件。"""
+
+        name = param.widget
+        factory = get_param_widget(name)
+        if factory is None:
+            self.status_message.emit(
+                f"未注册的参数控件“{name}”，已回退默认控件。"
+            )
+            return None
+        try:
+            field = _coerce_param_field(
+                factory(
+                    ParamWidgetContext(
+                        param=param,
+                        panel=self,
+                        parent=parent,
+                        options=dict(param.widget_options),
+                    )
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - 作者控件异常不能拖垮面板
+            self.status_message.emit(
+                f"参数控件“{name}”创建失败，已回退默认控件：{exc}"
+            )
+            return None
+        if field is None:
+            self.status_message.emit(
+                f"参数控件“{name}”未返回有效控件，已回退默认控件。"
+            )
+            return None
+        return field.widget, field.getter, field.setter
 
     # ------------------------------------------------------------------ int
     def _create_int(

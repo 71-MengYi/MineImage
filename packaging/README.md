@@ -42,6 +42,8 @@ python -m PyInstaller --noconfirm --clean packaging/MineImage.spec
   `算子库：N 个算子，M 个加载问题`）
 * 文档 / 示例图像 / 演示工程：`dist/docs/`、`dist/sample_images/`、`dist/examples/`
   （由 `build_exe.ps1` 复制）
+* 模型：`dist/models/`（首次运行人脸检测时自动下载 YuNet ONNX，或手动放入；
+  可用 `MINEIMAGE_MODEL_DIR` 指向其它目录）
 
 ## 说明
 

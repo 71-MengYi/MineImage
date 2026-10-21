@@ -270,7 +270,7 @@ MineImage 的算子库按 OpenCV 模块组织，目标是让常见图像处理�
 | `dnn.blob` | DNN 预处理（Blob） | DNN | 执行与 cv2.dnn.blobFromImage 一致的预处理：缩放到指定尺寸、减均… |
 | `dnn.infer` | DNN 推理 | DNN | 加载 ONNX / Caffe / TensorFlow 等模型文件，按统一参数生成 … |
 | `detect.barcode` | 条码识别 | 目标检测 | 用 OpenCV 的 BarcodeDetector 定位并解码一维条码，画出条码四边… |
-| `detect.face` | 人脸检测（Haar） | 目标检测 | 用 OpenCV 自带的 Haar 级联分类器检测正面人脸，并在画面上画出人脸框。模型… |
+| `detect.face` | 人脸检测（YuNet / Haar） | 目标检测 | 用 OpenCV Zoo 的 YuNet ONNX 模型检测正面人脸，并在画面上画出人… |
 | `detect.hog_people` | 行人检测（HOG） | 目标检测 | 用 HOG + SVM 默认行人检测器扫描图像，输出带行人框的标注图与人数。检测器要求… |
 | `detect.qr` | 二维码识别 | 目标检测 | 用 OpenCV 的 QRCodeDetector 定位并解码二维码，在画面上画出二维… |
 

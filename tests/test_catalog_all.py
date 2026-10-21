@@ -17,13 +17,17 @@ import unittest
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# 测试环境不自动下载模型；人脸检测在模型缺失时跳过默认执行。
+os.environ.setdefault("MINEIMAGE_AUTO_DOWNLOAD_MODELS", "0")
 
+import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.core import models  # noqa: E402
 from app.core.constants import CATEGORY_ORDER  # noqa: E402
 from app.core.data_types import (  # noqa: E402
     ComponentsData,
@@ -47,6 +51,20 @@ from app.operators.spec import (  # noqa: E402
 NEW_CATEGORIES = ("图像增强", "视频与运动", "立体与标定", "深度学习")
 #: 需要外部模型 / 大文件，默认参数允许失败的算子。
 ASSET_REQUIRED = {"dnn.infer"}
+
+
+def face_detection_runnable() -> bool:
+    """OpenCV 4 带 Haar，或 OpenCV 5 已缓存 YuNet 模型时可运行 detect.face。"""
+
+    if hasattr(cv2, "CascadeClassifier"):
+        return True
+    return hasattr(cv2, "FaceDetectorYN") and models.is_model_ready("face_detection_yunet")
+
+
+def hog_people_runnable() -> bool:
+    """OpenCV 5.0 移除了 cv2.HOGDescriptor，HOG 行人检测仅在 4.x 可运行。"""
+
+    return hasattr(cv2, "HOGDescriptor") and hasattr(cv2, "HOGDescriptor_getDefaultPeopleDetector")
 
 #: 任务书要求交付的算子 id（缺失即失败）。
 REQUIRED_IDS = {
@@ -228,6 +246,12 @@ class OpenCVCatalogTests(unittest.TestCase):
     def test_all_catalog_operators_run_with_defaults(self) -> None:
         for entry in self.catalog_entries:
             if entry.id in ASSET_REQUIRED:
+                continue
+            if entry.id == "detect.face" and not face_detection_runnable():
+                # 与 dnn.infer 同理：需要外部 YuNet 模型，测试环境不自动下载。
+                continue
+            if entry.id == "detect.hog_people" and not hog_people_runnable():
+                # OpenCV 5.0 移除了 cv2.HOGDescriptor。
                 continue
             spec = entry.spec
             sample_items = self.samples.items() if spec.inputs else [("gray8", self.samples["gray8"])]

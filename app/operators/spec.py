@@ -27,7 +27,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Iterable, Mapping, Sequence
 
 from app.core.data_types import (
@@ -40,6 +40,9 @@ from app.core.data_types import (
     data_type_of,
 )
 from app.core.types import ImageData
+
+#: 自定义控件 / 布局的注册名允许的字符（与 :mod:`app.ui.param_widgets` 保持一致）。
+PARAM_UI_NAME_PATTERN = r"^[A-Za-z_][A-Za-z0-9_.-]*$"
 
 PARAM_TYPES = (
     "int",
@@ -153,6 +156,12 @@ class ParamSpec:
     multiline: bool = False
     placeholder: str = ""
 
+    # 可选的自定义界面扩展：只是替换编辑器控件 / 参数行布局，值类型仍由 type 决定。
+    # widget 仅用于非交互参数；交互参数（points/roi/line）必须走预览拾取。
+    widget: str = ""
+    layout: str = ""
+    widget_options: Mapping[str, Any] = field(default_factory=dict, compare=False, hash=False)
+
     def __post_init__(self) -> None:
         if not self.key or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", self.key):
             raise ValueError(f"非法参数 key：{self.key!r}")
@@ -168,6 +177,21 @@ class ParamSpec:
             raise ValueError(f"只有 points/roi/line 参数可以指定 interactive")
         if self.count and self.type != "points":
             raise ValueError(f"只有 points 参数可以使用 count")
+        if not isinstance(self.widget, str):
+            raise ValueError(f"参数 {self.key} 的自定义控件名非法：{self.widget!r}")
+        if self.widget:
+            if not re.match(PARAM_UI_NAME_PATTERN, self.widget):
+                raise ValueError(f"参数 {self.key} 的自定义控件名非法：{self.widget!r}")
+            if self.type in INTERACTIVE_TOOLS:
+                raise ValueError(f"交互参数 {self.key} 不能指定自定义控件")
+        if not isinstance(self.layout, str):
+            raise ValueError(f"参数 {self.key} 的自定义布局名非法：{self.layout!r}")
+        if self.layout and not re.match(PARAM_UI_NAME_PATTERN, self.layout):
+            raise ValueError(f"参数 {self.key} 的自定义布局名非法：{self.layout!r}")
+        if not isinstance(self.widget_options, Mapping):
+            raise ValueError(f"参数 {self.key} 的 widget_options 必须是映射（dict）")
+        # 复制一份，避免算子作者在构造后原地修改共享配置影响界面。
+        object.__setattr__(self, "widget_options", dict(self.widget_options))
 
         normalized: list[tuple[Any, str]] = []
         for item in self.choices or ():

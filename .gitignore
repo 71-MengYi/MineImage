@@ -21,5 +21,8 @@ sample_images/*.jpg
 !sample_images/.gitkeep
 settings.ini
 config/
+# 自动下载的 OpenCV ONNX 模型（体积较大，不入库）
+models/
+.models_write_probe
 *.mi
 !examples/*.mi

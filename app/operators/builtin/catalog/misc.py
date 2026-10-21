@@ -13,6 +13,7 @@ from typing import Any
 import cv2
 import numpy as np
 
+from app.core import models
 from app.operators.builtin.catalog import _cv
 from app.operators.spec import Operator, OperatorError, OperatorSpec, ParamSpec, PortSpec
 
@@ -186,12 +187,22 @@ class Cv2Info(Operator):
             ("dnn", hasattr(cv2, "dnn")),
             ("photo", hasattr(cv2, "inpaint")),
             ("features2d", hasattr(cv2, "SIFT_create")),
-            ("objdetect", hasattr(cv2, "CascadeClassifier")),
+            ("objdetect", hasattr(cv2, "CascadeClassifier") or hasattr(cv2, "FaceDetectorYN")),
+            ("Haar(4.x)", hasattr(cv2, "CascadeClassifier")),
+            ("YuNet(5.x)", hasattr(cv2, "FaceDetectorYN")),
             ("stitching", hasattr(cv2, "Stitcher_create")),
             ("3d/stereo (5.0)", hasattr(cv2, "stereo") or hasattr(cv2, "StereoMatcher")),
         ]
         lines.append("模块：" + "  ".join(f"{name}={'✓' if ok else '×'}" for name, ok in modules))
-        return _cv.text_panel(620, 190, lines)
+        try:
+            model_state = models.model_status_text("face_detection_yunet")
+            model_file = models.model_path("face_detection_yunet")
+        except Exception:  # noqa: BLE001 - 信息面板不应因模型目录异常而崩溃
+            model_state, model_file = "未知", ""
+        lines.append(f"YuNet 人脸模型：{model_state}")
+        if model_file:
+            lines.append(f"模型路径：{model_file}")
+        return _cv.text_panel(700, 250, lines)
 
 
 OPERATORS = (Cv2Call, Cv2Info)

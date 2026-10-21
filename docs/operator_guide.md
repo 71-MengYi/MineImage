@@ -335,6 +335,7 @@ ParamSpec(
     visible_when="params['mode'] == 'blur'",
     enabled_when="params['mode'] == 'blur'",
     count=0, interactive=None, multiline=False, placeholder="",
+    widget="", layout="", widget_options={},
 )
 ```
 
@@ -357,6 +358,9 @@ ParamSpec(
 | `interactive` | `str / None` | `None` | 仅 points/roi/line；显式指定拾取工具 |
 | `multiline` | `bool` | `False` | 仅 string；多行文本框 |
 | `placeholder` | `str` | `""` | string/path/roi/line 的占位提示 |
+| `widget` | `str` | `""` | 自定义控件注册名；仅非交互参数（见 5.4） |
+| `layout` | `str` | `""` | 自定义参数行布局注册名；空为 `stacked`（见 5.4） |
+| `widget_options` | `Mapping` | `{}` | 传给控件/布局工厂的只读配置副本，不参与校验 |
 
 构造时校验：
 
@@ -364,6 +368,10 @@ ParamSpec(
 * `count` 只能用于 points，且不能为负数；
 * `interactive` 只能用于 points/roi/line；
 * 只有 points 可以使用 `count`；
+* `widget` / `layout` 必须是合法注册名（字母、数字、下划线、点、连字符），且
+  `widget` 不能用于 points/roi/line 交互参数；在可能被重复加载的算子模块里，
+  注册时可传 `override=True` 避免“已注册”错误；
+* `widget_options` 必须是映射，构造时会复制一份；
 * 参数默认值会立即做一次类型/范围校验。
 
 ### 5.2 参数类型
@@ -376,7 +384,7 @@ ParamSpec(
 | `enum` | 下拉框 | `choices` 中的原值 | 必须与某个 choice 的 value **完全相等**；不会做字符串转换 |
 | `string` | 单行/多行输入 | `str` | `multiline=False` 时去除首尾空白 |
 | `color` | 颜色按钮 + 取色器 | `str` | `#RRGGBB` 或 `#RRGGBBAA`，统一转小写 |
-| `path` | 文本框 + 浏览按钮 | `str` | 只做字符串处理，**不检查文件是否存在**；需要时在 process/validate 里检查 |
+| `path` | 文本框 + 浏览按钮（可用 `widget="model_file"` 换成模型下载控件） | `str` | 只做字符串处理，**不检查文件是否存在**；需要时在 process/validate 里检查 |
 | `points` | 只读摘要 + 拾取/清除 | `list[[float, float]]` | 每个点必须 `[x, y]`；`count>0` 时数量必须精确匹配 |
 | `roi` | 只读摘要 + 拾取/清除 | `list[float]`（4 项）或 `None` | `[x, y, w, h]`；宽高必须 > 0；不自动裁剪到图像范围 |
 | `line` | 只读摘要 + 拾取/清除 | `list[float]`（4 项）或 `None` | `[x1, y1, x2, y2]`；是否重合由算子在 process 中判断 |
@@ -417,6 +425,73 @@ ParamSpec("gain", "增益", "float", default=1.0, min=0.1, max=4.0,
 
 因此隐藏参数的默认值/旧值必须始终合法，`process()` 也要能接受它们（通常只
 在对应模式下读取）。不要依赖“隐藏参数就不会传进来”。
+
+### 5.4 自定义控件与布局
+
+参数面板支持算子作者在不修改 `app/ui/params.py` 的前提下替换某个参数的编辑器
+或整行的排布方式。实现位于 `app/ui/param_widgets.py`：
+
+| API | 用途 |
+| --- | --- |
+| `register_param_widget(name, factory, *, override=False)` | 注册 `ParamSpec.widget` 控件 |
+| `register_param_layout(name, factory, *, override=False)` | 注册 `ParamSpec.layout` 行布局 |
+| `ParamWidgetContext` | 控件工厂上下文：`param / panel / parent / options` |
+| `ParamField(widget, getter, setter)` | 控件工厂返回值 |
+| `ParamLayoutContext` | 布局工厂上下文：`param / panel / parent / label / field / options` |
+
+内置名称：
+
+* 布局 `stacked`（默认，标签在上）与 `inline`（标签在左，固定约 120px）；
+* 控件 `model_file`：模型路径 + 浏览 + 后台下载 + 状态 + 官方下载地址。配置为
+  `widget_options={"model": "<app.core.models.MODELS 中的 key>"}`；未知 key 只禁用
+  下载，不抛异常。内置模型 key：`face_detection_yunet`、
+  `face_recognition_sface`。
+
+最小示例（放在算子模块或 UI 插件模块中；只在界面创建参数行时才会调用工厂）：
+
+```python
+from PySide6.QtWidgets import QHBoxLayout, QLineEdit, QWidget
+
+from app.ui.param_widgets import (
+    ParamField, ParamLayoutContext, ParamWidgetContext,
+    register_param_layout, register_param_widget,
+)
+
+def line_widget(context: ParamWidgetContext) -> ParamField:
+    line = QLineEdit(context.parent)
+    line.setPlaceholderText(str(context.options.get("placeholder", "")))
+    line.textChanged.connect(lambda _text: context.panel.notify_edited())
+    return ParamField(
+        widget=line,
+        getter=line.text,
+        setter=lambda value: line.setText("" if value is None else str(value)),
+    )
+
+def inline_row(context: ParamLayoutContext) -> QWidget:
+    row = QWidget(context.parent)
+    layout = QHBoxLayout(row)
+    layout.addWidget(context.label, 0)
+    layout.addWidget(context.field, 1)
+    return row
+
+register_param_widget("my.line", line_widget)
+register_param_layout("my.inline", inline_row)
+
+# 在算子声明中引用
+ParamSpec("endpoint", "服务地址", "string", widget="my.line", layout="my.inline")
+```
+
+约定与注意事项：
+
+* 工厂抛异常 / 返回无效对象 / 注册名不存在时，参数面板会回退到默认控件或
+  `stacked` 布局，并在状态栏提示，不会导致整个面板崩溃；
+* `getter()` 返回当前值，`setter(value)` 接收规范化后的新值（重置、撤销、拾取
+  回填都会调用）；setter 内部应屏蔽控件自身信号，避免重复触发预览；
+* 自定义控件只改变编辑方式，**不改变** `ParamSpec.type` 的校验与传给
+  `process()` 的值类型；
+* 下载 / 耗时操作应使用 `app.ui.model_download.start_model_download` 或其它后台
+  机制，不要在控件工厂里阻塞；
+* 算子模块被无界面环境加载时也可以注册工厂，但不要在模块顶层创建 Qt 控件。
 
 ---
 
@@ -491,7 +566,8 @@ visible_when="not params.otsu"       # 错误：运行时 AttributeError
 * 拾取基于**当前节点已计算出的结果图**，结果还没算完时状态栏会提示
   “请等待当前节点计算完成后再拾取”；
 * 坐标是图像坐标，不是控件坐标；缩放/平移/对比模式下会自动做换算；
-* 只有点/矩形/线支持拾取；`path` 类型只有文件浏览按钮。
+* 只有点/矩形/线支持拾取；`path` 默认只有文件浏览按钮，也可以给
+  `ParamSpec.widget="model_file"` 增加后台下载与官方地址显示。
 
 ### 7.2 算子侧处理
 

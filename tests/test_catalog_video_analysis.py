@@ -16,6 +16,8 @@ import unittest
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# 测试环境不自动下载模型；缺少 YuNet 模型时跳过 detect.face 的默认执行。
+os.environ.setdefault("MINEIMAGE_AUTO_DOWNLOAD_MODELS", "0")
 
 import cv2
 import numpy as np
@@ -24,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.core import models  # noqa: E402
 from app.core.data_types import DataType, is_data_value  # noqa: E402
 from app.core.types import ImageData  # noqa: E402
 from app.operators.loader import OperatorRegistry  # noqa: E402
@@ -86,6 +89,20 @@ CJK_START, CJK_END = "\u4e00", "\u9fff"
 
 def contains_cjk(text: str) -> bool:
     return any(CJK_START <= char <= CJK_END for char in str(text))
+
+
+def face_detection_runnable() -> bool:
+    """OpenCV 4 带 Haar，或 OpenCV 5 已缓存 YuNet 模型时可运行 detect.face。"""
+
+    if hasattr(cv2, "CascadeClassifier"):
+        return True
+    return hasattr(cv2, "FaceDetectorYN") and models.is_model_ready("face_detection_yunet")
+
+
+def hog_people_runnable() -> bool:
+    """OpenCV 5.0 移除了 cv2.HOGDescriptor，HOG 行人检测仅在 4.x 可运行。"""
+
+    return hasattr(cv2, "HOGDescriptor") and hasattr(cv2, "HOGDescriptor_getDefaultPeopleDetector")
 
 
 # ---------------------------------------------------------------------------
@@ -198,9 +215,21 @@ class CatalogVideoAnalysisTests(unittest.TestCase):
         self.assertTrue(contains_cjk(message), f"dnn.infer 的提示应为中文：{message}")
 
     # ------------------------------------------------------------------ 默认参数矩阵
+    @unittest.skipIf(face_detection_runnable(), "当前环境已有 Haar 或 YuNet 模型")
+    def test_face_without_model_reports_download_url(self) -> None:
+        with self.assertRaises(OperatorError) as context:
+            self.run_operator("detect.face", {"image": gray8()})
+        message = str(context.exception)
+        self.assertIn("opencv_zoo", message)
+        self.assertTrue(contains_cjk(message), message)
+
     def test_all_group_operators_run_and_do_not_mutate_inputs(self) -> None:
         arrays = sample_arrays()
         for op_id in RUNNABLE_IDS:
+            if op_id == "detect.face" and not face_detection_runnable():
+                continue
+            if op_id == "detect.hog_people" and not hog_people_runnable():
+                continue
             for name, array in arrays.items():
                 before = array.copy()
                 outputs = self.run_operator(op_id, {"image": array})
