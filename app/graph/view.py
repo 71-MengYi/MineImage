@@ -34,6 +34,7 @@ from app.config import AppSettings
 from app.core.constants import MIME_IMAGE_PATHS, MIME_OPERATOR, SINGLE_CLICK_DELAY_MS
 from app.core.data_types import DataType
 from app.core.model import ConnectionModel, GraphError, GraphModel, NodeModel, WorkspaceModel, new_id
+from app.graph.collapse_item import CollapseBadgeItem
 from app.graph.commands import (
     AddConnectionCommand,
     AddNodeCommand,
@@ -136,6 +137,8 @@ class GraphView(QGraphicsView):
 
         self._nodes: dict[str, NodeItem] = {}
         self._connections: dict[str, ConnectionItem] = {}
+        self._collapse_badges: dict[str, CollapseBadgeItem] = {}
+        self._collapsed: set[str] = set()
         self._results: dict[str, Any] = {}
         self._errors: dict[str, str] = {}
         self._thumbnails_enabled = bool(settings.show_node_thumbnails)
@@ -232,6 +235,11 @@ class GraphView(QGraphicsView):
             self.status_message.emit("请先选择要复制的节点")
             return False
         selected = set(node_ids)
+        # 复制折叠点时连同被隐藏的下游节点一起复制。
+        for node_id in list(selected):
+            if node_id in self._collapsed:
+                selected.update(self.graph.descendants(node_id))
+        node_ids = [node.id for node in self.graph.nodes.values() if node.id in selected]
         payload = {
             "kind": NODE_CLIPBOARD_KIND,
             "nodes": [copy.deepcopy(self.graph.nodes[node_id].to_dict()) for node_id in node_ids],
@@ -519,9 +527,131 @@ class GraphView(QGraphicsView):
             self._create_node_item(node)
         for connection in list(self.graph.connections.values()):
             self._create_connection_item(connection)
-        self._update_scene_rect()
-        if selected and selected in self._nodes:
+        self._refresh_collapse_state()
+        if selected and selected in self._nodes and self._nodes[selected].isVisible():
             self.set_selected_node(selected)
+
+    # ------------------------------------------------------------ 折叠 / 展开
+    def _branch_node_ids(self) -> set[str]:
+        """有至少两个不同下游子节点的节点（多分支连接点）。"""
+
+        return {
+            node_id
+            for node_id in self.graph.nodes
+            if len(self.graph.successors(node_id)) >= 2
+        }
+
+    def is_node_collapsed(self, node_id: str) -> bool:
+        return node_id in self._collapsed
+
+    def hidden_node_ids(self) -> set[str]:
+        """当前被折叠隐藏的全部下游节点。"""
+
+        hidden: set[str] = set()
+        for node_id in self._collapsed:
+            hidden.update(self.graph.descendants(node_id))
+        return hidden
+
+    def toggle_node_collapsed(self, node_id: str) -> None:
+        if node_id in self._collapsed:
+            self.expand_node(node_id)
+        else:
+            self.collapse_node(node_id)
+
+    def collapse_node(self, node_id: str) -> None:
+        """折叠多分支节点的全部下游子节点。"""
+
+        node = self.graph.nodes.get(node_id)
+        if node is None or node_id in self._collapsed:
+            return
+        if len(self.graph.successors(node_id)) < 2:
+            return
+        count = len(self.graph.descendants(node_id))
+        if count == 0:
+            return
+        self._collapsed.add(node_id)
+        self._refresh_collapse_state()
+        self.status_message.emit(f"已折叠“{node.display_title()}”的 {count} 个下游节点")
+
+    def expand_node(self, node_id: str, *, announce: bool = True) -> None:
+        if node_id not in self._collapsed:
+            return
+        self._collapsed.discard(node_id)
+        self._refresh_collapse_state()
+        node = self.graph.nodes.get(node_id)
+        if announce and node is not None:
+            self.status_message.emit(f"已展开“{node.display_title()}”的子节点")
+
+    def _auto_expand_on_insert(self, node_id: str) -> None:
+        """向折叠点插入新连线 / 算子时自动展开，避免新内容被藏起来。"""
+
+        if node_id not in self._collapsed:
+            return
+        self._collapsed.discard(node_id)
+        self._refresh_collapse_state()
+        node = self.graph.nodes.get(node_id)
+        if node is not None:
+            self.status_message.emit(
+                f"检测到向折叠点插入新节点，已自动展开“{node.display_title()}”"
+            )
+
+    def _refresh_collapse_state(self) -> None:
+        """同步折叠状态：隐藏下游条目、维护按钮并刷新画布范围。"""
+
+        for node_id in list(self._collapsed):
+            if node_id not in self.graph.nodes or not self.graph.descendants(node_id):
+                self._collapsed.discard(node_id)
+        hidden = self.hidden_node_ids()
+        for node_id, item in self._nodes.items():
+            visible = node_id not in hidden
+            if not visible and item.isSelected():
+                item.setSelected(False)
+            item.setVisible(visible)
+        for item in self._connections.values():
+            visible = item.src_node not in hidden and item.dst_node not in hidden
+            if not visible and item.isSelected():
+                item.setSelected(False)
+            item.setVisible(visible)
+
+        wanted = (self._branch_node_ids() | self._collapsed) & set(self._nodes)
+        for node_id in list(self._collapse_badges):
+            if node_id in wanted:
+                continue
+            badge = self._collapse_badges.pop(node_id)
+            if badge.scene() is self._scene:
+                self._scene.removeItem(badge)
+        for node_id in wanted:
+            node_item = self._nodes[node_id]
+            badge = self._collapse_badges.get(node_id)
+            if badge is None:
+                badge = CollapseBadgeItem(self, node_id)
+                self._scene.addItem(badge)
+                self._collapse_badges[node_id] = badge
+            badge.set_state(node_id in self._collapsed, len(self.graph.descendants(node_id)))
+            badge.setVisible(node_item.isVisible())
+            self._position_collapse_badge(node_id)
+
+        if self._highlighted_ports and any(
+            port.node_item.node_id in hidden for port in self._highlighted_ports
+        ):
+            self._clear_target_highlight()
+        if (
+            self._highlighted_connection is not None
+            and not self._highlighted_connection.isVisible()
+        ):
+            self._clear_target_highlight()
+        self._update_scene_rect()
+
+    def _position_collapse_badge(self, node_id: str) -> None:
+        badge = self._collapse_badges.get(node_id)
+        item = self._nodes.get(node_id)
+        if badge is None or item is None:
+            return
+        size = item.size()
+        badge.setPos(
+            item.pos().x() + size.width() / 2.0,
+            item.pos().y() + size.height() + CollapseBadgeItem.BOTTOM_OFFSET,
+        )
 
     def _clear_pending_interaction(self) -> None:
         """清掉拖动中的临时状态，避免删除后仍引用已移除的条目。"""
@@ -536,7 +666,12 @@ class GraphView(QGraphicsView):
         connection_items = [item for item in self._scene.selectedItems() if isinstance(item, ConnectionItem)]
         if not node_items and not connection_items:
             return
-        node_ids = {item.node_id for item in node_items}
+        selected_ids = {item.node_id for item in node_items}
+        node_ids = set(selected_ids)
+        # 删除折叠点时连同被隐藏的下游节点一起删除，避免留下孤立分支。
+        for node_id in selected_ids:
+            if node_id in self._collapsed:
+                node_ids.update(self.graph.descendants(node_id))
         connections_to_remove: list[ConnectionModel] = []
         for item in connection_items:
             connection = self.graph.connections.get(item.connection_id)
@@ -548,19 +683,23 @@ class GraphView(QGraphicsView):
 
         self._undo_stack.beginMacro("删除选中对象")
         try:
-            for item in node_items:
-                if item.node_id in self.graph.nodes:
-                    self._undo_stack.push(RemoveNodeCommand(self.graph, item.node_id))
+            for node_id in node_ids:
+                if node_id in self.graph.nodes:
+                    self._undo_stack.push(RemoveNodeCommand(self.graph, node_id))
             for connection in connections_to_remove:
                 if connection.id in self.graph.connections:
                     self._undo_stack.push(RemoveConnectionCommand(self.graph, connection))
         finally:
             self._undo_stack.endMacro()
 
+        hidden_extra = len(node_ids) - len(selected_ids)
         self._update_scene_rect()
         self._selection_timer.stop()
         self.selection_changed.emit(self.selected_node_id() or "")
-        self.status_message.emit("已删除选中对象")
+        if hidden_extra:
+            self.status_message.emit(f"已删除选中对象（含 {hidden_extra} 个折叠的下游节点）")
+        else:
+            self.status_message.emit("已删除选中对象")
 
     def delete_node_with_children(self, node_id: str) -> None:
         """删除指定节点及其全部下游子节点，整次删除一步撤销。"""
@@ -627,7 +766,7 @@ class GraphView(QGraphicsView):
         self.fit_graph()
 
     def fit_graph(self) -> None:
-        rect = self._scene.itemsBoundingRect()
+        rect = self._content_bounding_rect()
         if rect.isNull() or not rect.isValid() or rect.isEmpty():
             self.resetTransform()
             self.centerOn(0.0, 0.0)
@@ -676,7 +815,7 @@ class GraphView(QGraphicsView):
         if node.id in self._nodes:
             return
         self._create_node_item(node)
-        self._update_scene_rect()
+        self._refresh_collapse_state()
 
     def _on_node_removed(self, node_id: str) -> None:
         if any(port.node_item.node_id == node_id for port in self._highlighted_ports):
@@ -696,10 +835,14 @@ class GraphView(QGraphicsView):
                 if connection.scene() is self._scene:
                     self._scene.removeItem(connection)
                 self._connections.pop(connection_id, None)
+        self._collapsed.discard(node_id)
+        badge = self._collapse_badges.pop(node_id, None)
+        if badge is not None and badge.scene() is self._scene:
+            self._scene.removeItem(badge)
         self._results.pop(node_id, None)
         self._errors.pop(node_id, None)
         self.node_removed.emit(node_id)
-        self._update_scene_rect()
+        self._refresh_collapse_state()
 
     def _on_node_changed(self, node_id: str) -> None:
         node = self.graph.nodes.get(node_id)
@@ -710,10 +853,15 @@ class GraphView(QGraphicsView):
         item.refresh_from_model()
         item.update_port_states()
         self._update_connections_for(node_id)
+        self._position_collapse_badge(node_id)
 
     def _on_connection_added(self, connection: ConnectionModel) -> None:
         if connection.id not in self._connections:
             self._create_connection_item(connection)
+        if connection.src_node in self._collapsed:
+            self._auto_expand_on_insert(connection.src_node)
+        else:
+            self._refresh_collapse_state()
         self.connection_changed.emit(connection.dst_node)
 
     def _on_connection_removed(self, connection: ConnectionModel) -> None:
@@ -729,6 +877,7 @@ class GraphView(QGraphicsView):
             self._scene.removeItem(item)
         self._update_connections_for(connection.src_node)
         self._update_connections_for(connection.dst_node)
+        self._refresh_collapse_state()
         self.connection_changed.emit(connection.dst_node)
 
     def _update_connections_for(self, node_id: str) -> None:
@@ -748,6 +897,7 @@ class GraphView(QGraphicsView):
         for connection in self._connections.values():
             if item.node_id in (connection.src_node, connection.dst_node):
                 connection.update_path()
+        self._position_collapse_badge(item.node_id)
         if not self._scene.sceneRect().contains(item.sceneBoundingRect()):
             self._update_scene_rect()
         # 仅跟踪单节点拖动，多选整体移动时不做自动连接，避免歧义。
@@ -812,7 +962,7 @@ class GraphView(QGraphicsView):
                 continue
             in_center = in_port.center_scene_pos()
             for other in self._nodes.values():
-                if other is item:
+                if other is item or not other.isVisible():
                     continue
                 for out_port in other.output_ports.values():
                     distance = self._port_distance(out_port.center_scene_pos(), in_center)
@@ -838,7 +988,7 @@ class GraphView(QGraphicsView):
         for key, out_port in item.output_ports.items():
             out_center = out_port.center_scene_pos()
             for other in self._nodes.values():
-                if other is item:
+                if other is item or not other.isVisible():
                     continue
                 for in_port in other.input_ports.values():
                     distance = self._port_distance(out_center, in_port.center_scene_pos())
@@ -933,6 +1083,9 @@ class GraphView(QGraphicsView):
     # ------------------------------------------------------------------ 连线
     def port_items(self, is_input: bool) -> Iterable[PortItem]:
         for node_item in self._nodes.values():
+            # 折叠隐藏的节点不参与连线吸附 / 高亮。
+            if not node_item.isVisible():
+                continue
             ports = node_item.input_ports if is_input else node_item.output_ports
             for port in ports.values():
                 yield port
@@ -1117,7 +1270,7 @@ class GraphView(QGraphicsView):
         best: ConnectionItem | None = None
         best_distance = float("inf")
         for item in self._connections.values():
-            if not item.hit_test(scene_pos):
+            if not item.isVisible() or not item.hit_test(scene_pos):
                 continue
             center = item.boundingRect().center()
             distance = (center - scene_pos).manhattanLength()
@@ -1126,11 +1279,25 @@ class GraphView(QGraphicsView):
                 best_distance = distance
         return best
 
+    def _badge_at(self, scene_pos: QPointF) -> CollapseBadgeItem | None:
+        for badge in self._collapse_badges.values():
+            if badge.isVisible() and badge.hit_test(scene_pos):
+                return badge
+        return None
+
     def _drop_target_at(
         self, scene_pos: QPointF, spec: OperatorSpec | None
     ) -> _DropTarget | None:
-        """库拖拽落点命中检测：优先吸附端口，其次命中已有连线。"""
+        """库拖拽落点命中检测：优先折叠按钮，其次端口，最后已有连线。"""
 
+        if spec is not None and spec.inputs:
+            badge = self._badge_at(scene_pos)
+            if badge is not None:
+                node_item = self._nodes.get(badge.node_id)
+                if node_item is not None and node_item.isVisible():
+                    for out_port in node_item.output_ports.values():
+                        if self._compatible_input_key(spec, out_port) is not None:
+                            return _DropTarget("output", port=out_port)
         if spec is not None:
             best_port: PortItem | None = None
             best_kind = ""
@@ -1409,6 +1576,28 @@ class GraphView(QGraphicsView):
             )
         if not moves:
             return
+
+        # 折叠点被拖动时，隐藏的下游节点一起平移，展开后仍保持相对布局。
+        moved_ids = {node_id for node_id, _old, _new in moves}
+        for node_id, old_pos, new_pos in list(moves):
+            if node_id not in self._collapsed:
+                continue
+            dx = new_pos[0] - old_pos[0]
+            dy = new_pos[1] - old_pos[1]
+            for descendant in self.graph.descendants(node_id):
+                if descendant in moved_ids:
+                    continue
+                child = self.graph.nodes.get(descendant)
+                if child is None:
+                    continue
+                moved_ids.add(descendant)
+                moves.append(
+                    (
+                        descendant,
+                        (float(child.pos[0]), float(child.pos[1])),
+                        (round(child.pos[0] + dx, 2), round(child.pos[1] + dy, 2)),
+                    )
+                )
 
         connection_commands, action_message = self._build_move_connection_commands(target)
         if not connection_commands and reason is not None and target is None:
@@ -1733,6 +1922,19 @@ class GraphView(QGraphicsView):
                 lambda: self.delete_node_with_children(node_item.node_id),
             )
             menu.addAction("重命名节点", lambda: self.rename_node(node_item.node_id))
+            if (
+                node_item.node_id in self._collapsed
+                or len(self.graph.successors(node_item.node_id)) >= 2
+            ):
+                label = (
+                    "展开子节点"
+                    if node_item.node_id in self._collapsed
+                    else "折叠子节点"
+                )
+                menu.addAction(
+                    label,
+                    lambda nid=node_item.node_id: self.toggle_node_collapsed(nid),
+                )
             menu.addSeparator()
             menu.addAction("自动布局", self.auto_layout)
             menu.addAction("适应视图", self.fit_graph)
@@ -1887,6 +2089,9 @@ class GraphView(QGraphicsView):
         self._syncing_selection = True
         try:
             self._scene.cancel_connection_drag()
+            for badge in self._collapse_badges.values():
+                if badge.scene() is self._scene:
+                    self._scene.removeItem(badge)
             for connection in self._connections.values():
                 if connection.scene() is self._scene:
                     self._scene.removeItem(connection)
@@ -1895,11 +2100,28 @@ class GraphView(QGraphicsView):
                     self._scene.removeItem(node)
         finally:
             self._syncing_selection = False
+        self._collapse_badges.clear()
         self._connections.clear()
         self._nodes.clear()
 
+    def _content_bounding_rect(self) -> QRectF:
+        """可见内容的包围盒；被折叠隐藏的节点不参与适应视图 / 画布范围计算。"""
+
+        rect = QRectF()
+        for item in self._nodes.values():
+            if not item.isVisible():
+                continue
+            item_rect = item.sceneBoundingRect()
+            rect = item_rect if rect.isNull() else rect.united(item_rect)
+        for badge in self._collapse_badges.values():
+            if not badge.isVisible():
+                continue
+            badge_rect = badge.sceneBoundingRect()
+            rect = badge_rect if rect.isNull() else rect.united(badge_rect)
+        return rect
+
     def _update_scene_rect(self) -> None:
-        items_rect = self._scene.itemsBoundingRect()
+        items_rect = self._content_bounding_rect()
         visible = self.mapToScene(self.viewport().rect()).boundingRect()
         if items_rect.isNull() or not items_rect.isValid() or items_rect.isEmpty():
             base_rect = QRectF(-500.0, -350.0, 1000.0, 700.0)

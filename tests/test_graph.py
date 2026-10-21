@@ -185,6 +185,29 @@ class GraphViewTestCase(unittest.TestCase):
     def item(self, node: NodeModel):
         return self.view._nodes[node.id]
 
+    def make_branch(
+        self,
+    ) -> tuple[NodeModel, NodeModel, NodeModel, NodeModel, tuple]:
+        """构造一个两分支 + 一个孙节点的画布：root -> left/right，left -> leaf。"""
+
+        root = self.add_node(pos=(0.0, 0.0))
+        left = self.add_node(pos=(-280.0, 220.0))
+        right = self.add_node(pos=(280.0, 220.0))
+        leaf = self.add_node(pos=(-280.0, 440.0))
+        connections = (
+            self.connect(root, left),
+            self.connect(root, right),
+            self.connect(left, leaf),
+        )
+        self.view.show()
+        if _APP is not None:
+            _APP.processEvents()
+        self.view.fit_graph()
+        if _APP is not None:
+            _APP.processEvents()
+        return root, left, right, leaf, connections
+
+
     # ---------------------------------------------------------------- 自动布局
     def test_auto_layout_branching_dag(self) -> None:
         source = self.add_source(pos=(600.0, 120.0))
@@ -650,6 +673,233 @@ class GraphViewTestCase(unittest.TestCase):
         self.assertIn(first_link.id, self.graph.connections)
         self.assertEqual(len(self.view._nodes), 4)
         self.assertEqual(len(self.view._connections), 2)
+
+    # ------------------------------------------------------------ 折叠 / 展开
+    def test_collapse_badge_appears_only_for_multi_branch_nodes(self) -> None:
+        root = self.add_node(pos=(0.0, 0.0))
+        first = self.add_node(pos=(-200.0, 200.0))
+        second = self.add_node(pos=(200.0, 200.0))
+        first_link = self.connect(root, first)
+        self.assertNotIn(root.id, self.view._collapse_badges)
+
+        self.connect(root, second)
+        self.assertIn(root.id, self.view._collapse_badges)
+        badge = self.view._collapse_badges[root.id]
+        self.assertTrue(badge.isVisible())
+        self.assertFalse(badge.collapsed)
+        self.assertEqual(badge.count, 2)
+        self.assertNotIn(first.id, self.view._collapse_badges)
+
+        # 少一个分支后按钮消失。
+        self.graph.remove_connection(first_link.id)
+        self.assertNotIn(root.id, self.view._collapse_badges)
+
+    def test_collapse_hides_subtree_and_badge_shows_count(self) -> None:
+        root, left, right, leaf, connections = self.make_branch()
+        extra = self.add_node(pos=(700.0, 0.0))
+        if _APP is not None:
+            _APP.processEvents()
+        badge = self.view._collapse_badges[root.id]
+        self.assertEqual(badge.count, 3)
+
+        self.view.toggle_node_collapsed(root.id)
+        if _APP is not None:
+            _APP.processEvents()
+
+        self.assertTrue(self.view.is_node_collapsed(root.id))
+        self.assertEqual(self.view.hidden_node_ids(), {left.id, right.id, leaf.id})
+        for node in (left, right, leaf):
+            self.assertFalse(self.view._nodes[node.id].isVisible())
+        self.assertTrue(self.view._nodes[root.id].isVisible())
+        self.assertTrue(self.view._nodes[extra.id].isVisible())
+        for connection in connections:
+            self.assertFalse(self.view._connections[connection.id].isVisible())
+        self.assertTrue(badge.isVisible())
+        self.assertTrue(badge.collapsed)
+        self.assertEqual(badge.count, 3)
+        self.assertEqual(len(self.graph.nodes), 5)
+        visible_inputs = {port.node_item.node_id for port in self.view.port_items(True)}
+        self.assertNotIn(left.id, visible_inputs)
+        self.assertNotIn(leaf.id, visible_inputs)
+        self.assertIn(extra.id, visible_inputs)
+
+        self.view.toggle_node_collapsed(root.id)
+        if _APP is not None:
+            _APP.processEvents()
+        self.assertFalse(self.view.is_node_collapsed(root.id))
+        for node in (left, right, leaf):
+            self.assertTrue(self.view._nodes[node.id].isVisible())
+        for connection in connections:
+            self.assertTrue(self.view._connections[connection.id].isVisible())
+        self.assertFalse(badge.collapsed)
+
+    def test_nested_collapse_keeps_inner_state_when_expanded(self) -> None:
+        outer = self.add_node(pos=(0.0, 0.0))
+        left = self.add_node(pos=(-280.0, 220.0))
+        right = self.add_node(pos=(280.0, 220.0))
+        deep = self.add_node(pos=(-420.0, 440.0))
+        deep2 = self.add_node(pos=(-140.0, 440.0))
+        self.connect(outer, left)
+        self.connect(outer, right)
+        self.connect(left, deep)
+        self.connect(left, deep2)
+        self.view.show()
+        if _APP is not None:
+            _APP.processEvents()
+
+        self.view.collapse_node(left.id)
+        self.view.collapse_node(outer.id)
+        if _APP is not None:
+            _APP.processEvents()
+        self.assertEqual(self.view.hidden_node_ids(), {left.id, right.id, deep.id, deep2.id})
+        outer_badge = self.view._collapse_badges[outer.id]
+        left_badge = self.view._collapse_badges[left.id]
+        self.assertTrue(outer_badge.isVisible())
+        self.assertTrue(outer_badge.collapsed)
+        self.assertEqual(outer_badge.count, 4)
+        self.assertFalse(left_badge.isVisible())
+
+        self.view.expand_node(outer.id)
+        if _APP is not None:
+            _APP.processEvents()
+        self.assertTrue(self.view.is_node_collapsed(left.id))
+        self.assertTrue(self.view._nodes[left.id].isVisible())
+        self.assertFalse(self.view._nodes[deep.id].isVisible())
+        self.assertTrue(left_badge.isVisible())
+        self.assertEqual(left_badge.count, 2)
+
+        self.view.expand_node(left.id)
+        if _APP is not None:
+            _APP.processEvents()
+        self.assertFalse(self.view.hidden_node_ids())
+        self.assertTrue(self.view._nodes[deep.id].isVisible())
+        self.assertTrue(self.view._nodes[deep2.id].isVisible())
+
+    def test_click_collapse_badge_toggles(self) -> None:
+        root, left, right, leaf, connections = self.make_branch()
+        badge = self.view._collapse_badges[root.id]
+        point = self.view.mapFromScene(badge.scenePos())
+
+        QTest.mouseClick(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            point,
+        )
+        if _APP is not None:
+            _APP.processEvents()
+        self.assertTrue(self.view.is_node_collapsed(root.id))
+        self.assertTrue(badge.collapsed)
+
+        QTest.mouseClick(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            point,
+        )
+        if _APP is not None:
+            _APP.processEvents()
+        self.assertFalse(self.view.is_node_collapsed(root.id))
+        self.assertFalse(badge.collapsed)
+
+    def test_collapsed_branch_auto_expands_on_new_connection(self) -> None:
+        root, left, right, leaf, connections = self.make_branch()
+        extra = self.add_node(pos=(700.0, 300.0))
+        self.view.collapse_node(root.id)
+        self.assertTrue(self.view.is_node_collapsed(root.id))
+        status: list[str] = []
+        self.view.status_message.connect(status.append)
+
+        self.view.connect_ports(root.id, "image", extra.id, "image")
+        if _APP is not None:
+            _APP.processEvents()
+
+        self.assertFalse(self.view.is_node_collapsed(root.id))
+        for node in (left, right, leaf):
+            self.assertTrue(self.view._nodes[node.id].isVisible())
+        link = self.graph.input_connection(extra.id, "image")
+        self.assertIsNotNone(link)
+        self.assertIn(link.id, self.view._connections)
+        self.assertTrue(self.view._connections[link.id].isVisible())
+        self.assertTrue(any("自动展开" in message for message in status))
+
+    def test_drop_operator_on_collapsed_badge_expands_and_connects(self) -> None:
+        root, _left, _right, _leaf, _connections = self.make_branch()
+        self.view.collapse_node(root.id)
+        badge = self.view._collapse_badges[root.id]
+
+        new_node_id = self.view.add_operator_at("test.blur", QPointF(badge.scenePos()))
+        if _APP is not None:
+            _APP.processEvents()
+
+        self.assertIsNotNone(new_node_id)
+        assert new_node_id is not None
+        self.assertFalse(self.view.is_node_collapsed(root.id))
+        self.assertIn(new_node_id, self.graph.nodes)
+        self.assertTrue(self.view._nodes[new_node_id].isVisible())
+        link = self.graph.input_connection(new_node_id, "image")
+        self.assertIsNotNone(link)
+        self.assertEqual(link.src_node, root.id)
+        self.assertIn(link.id, self.view._connections)
+        self.assertTrue(self.view._connections[link.id].isVisible())
+
+    def test_collapsed_group_moves_with_root(self) -> None:
+        root, left, right, leaf, _connections = self.make_branch()
+        self.view.collapse_node(root.id)
+        node_ids = (root.id, left.id, right.id, leaf.id)
+        before = {node_id: self.graph.nodes[node_id].pos for node_id in node_ids}
+        item = self.view._nodes[root.id]
+        self.view._scene.clearSelection()
+        item.setSelected(True)
+
+        self.view.begin_move_tracking()
+        item.setPos(item.pos().x() + 120.0, item.pos().y() + 60.0)
+        self.view.finish_move_tracking()
+        if _APP is not None:
+            _APP.processEvents()
+
+        after = {node_id: self.graph.nodes[node_id].pos for node_id in node_ids}
+        dx = after[root.id][0] - before[root.id][0]
+        dy = after[root.id][1] - before[root.id][1]
+        self.assertAlmostEqual(dx, 120.0, places=1)
+        self.assertAlmostEqual(dy, 60.0, places=1)
+        for node_id in (left.id, right.id, leaf.id):
+            self.assertAlmostEqual(after[node_id][0], before[node_id][0] + dx, places=1)
+            self.assertAlmostEqual(after[node_id][1], before[node_id][1] + dy, places=1)
+
+        self.undo.undo()
+        if _APP is not None:
+            _APP.processEvents()
+        for node_id in node_ids:
+            self.assertEqual(self.graph.nodes[node_id].pos, before[node_id])
+
+    def test_collapsed_group_copy_and_delete(self) -> None:
+        root, left, right, leaf, _connections = self.make_branch()
+        self.view.collapse_node(root.id)
+        self.view._scene.clearSelection()
+        self.view._nodes[root.id].setSelected(True)
+
+        self.assertTrue(self.view.copy_selected())
+        payload = json.loads(QApplication.clipboard().text())
+        self.assertEqual(len(payload["nodes"]), 4)
+        self.assertEqual(len(payload["connections"]), 3)
+
+        self.view.delete_selected()
+        if _APP is not None:
+            _APP.processEvents()
+        self.assertFalse(self.graph.nodes)
+        self.assertFalse(self.view._nodes)
+
+        self.undo.undo()
+        if _APP is not None:
+            _APP.processEvents()
+        self.assertEqual(
+            set(self.graph.nodes),
+            {root.id, left.id, right.id, leaf.id},
+        )
+        self.assertEqual(len(self.graph.connections), 3)
+        self.assertEqual(len(self.view._nodes), 4)
+        self.assertEqual(len(self.view._connections), 3)
 
     # ------------------------------------------------------------------ 拖放
     def test_mime_operator_drop_creates_node(self) -> None:
