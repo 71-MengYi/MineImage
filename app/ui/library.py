@@ -39,7 +39,6 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStyle,
     QStyleOptionViewItem,
-    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -123,42 +122,6 @@ def _port_text(ports, label: str) -> str:
     return f"{label}：" + "；".join(items)
 
 
-class _CategoryRowDelegate(QStyledItemDelegate):
-    """一级分类行的整行背景：展开浅蓝、收起浅灰，左侧强调条。"""
-
-    def __init__(self, tree: QTreeWidget) -> None:
-        super().__init__(tree)
-        self._tree = tree
-
-    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # noqa: N802
-        item = self._tree.itemFromIndex(index)
-        is_category = item is not None and item.parent() is None
-        if is_category:
-            expanded = item.isExpanded()
-            painter.save()
-            # 分支箭头区域由 QTreeView 绘制，背景只铺 item 文本区，避免盖住箭头。
-            painter.fillRect(
-                option.rect,
-                QColor("#eaf2ff") if expanded else QColor("#f8fafc"),
-            )
-            painter.restore()
-            # 一级分类使用整行底色表达选中 / 展开，不需要 Fusion 的虚线焦点框。
-            option.state = option.state & ~QStyle.StateFlag.State_HasFocus
-        super().paint(painter, option, index)
-        if is_category and item.isExpanded() and index.column() == 0:
-            painter.save()
-            painter.fillRect(
-                QRectF(
-                    0.0,
-                    float(option.rect.top() + 4),
-                    3.0,
-                    float(max(0, option.rect.height() - 8)),
-                ),
-                QColor("#2563eb"),
-            )
-            painter.restore()
-
-
 class _OperatorTree(QTreeWidget):
     """算子库主树：一级分类为整行折叠标题，叶子可拖拽。
 
@@ -189,9 +152,87 @@ class _OperatorTree(QTreeWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         self.setColumnWidth(1, 52)
-        self.setItemDelegate(_CategoryRowDelegate(self))
+        self.setMouseTracking(True)
+        self._hover_item: QTreeWidgetItem | None = None
         self.itemClicked.connect(self._on_item_clicked)
         self.itemActivated.connect(self._on_item_activated)
+
+    # ------------------------------------------------------------------ 绘制
+    def _row_background(self, item: QTreeWidgetItem | None) -> QColor | None:
+        """整行底色：一级分类按展开状态，其余按选中 / 悬停。"""
+
+        if item is None:
+            return None
+        if item.parent() is None:
+            return QColor("#eaf2ff") if item.isExpanded() else QColor("#f8fafc")
+        if item.isSelected():
+            return QColor("#dbeafe")
+        if item is self._hover_item:
+            return QColor("#eef4ff")
+        return None
+
+    def drawRow(  # noqa: N802 - Qt 命名
+        self,
+        painter: QPainter,
+        option: QStyleOptionViewItem,
+        index,
+    ) -> None:
+        """整行铺一个圆角底色，并屏蔽 Qt 自带的逐列高亮。
+
+        Qt 默认会把「分支缩进区」和「每个单元格」分别画成带圆角的选中块，
+        选中算子行时左侧会多出一个空白方框、右侧多出箭头所在单元格的外框；
+        这里改为先行绘制整行底色，再让基类只画文字、图标与展开三角。
+        """
+
+        item = self.itemFromIndex(index)
+        background = self._row_background(item)
+        if background is not None:
+            row = QRectF(
+                0.0,
+                float(option.rect.top()) + 1.0,
+                float(self.viewport().width()),
+                float(option.rect.height()) - 2.0,
+            )
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(background)
+            painter.drawRoundedRect(row, 6.0, 6.0)
+            painter.restore()
+
+        plain = QStyleOptionViewItem(option)
+        plain.state = plain.state & ~(
+            QStyle.StateFlag.State_Selected
+            | QStyle.StateFlag.State_MouseOver
+            | QStyle.StateFlag.State_HasFocus
+        )
+        super().drawRow(painter, plain, index)
+
+        # 展开的一级分类：左侧强调条。
+        if item is not None and item.parent() is None and item.isExpanded():
+            painter.save()
+            painter.fillRect(
+                QRectF(
+                    0.0,
+                    float(option.rect.top() + 4),
+                    3.0,
+                    float(max(0, option.rect.height() - 8)),
+                ),
+                QColor("#2563eb"),
+            )
+            painter.restore()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        item = self.itemAt(event.position().toPoint())
+        if item is not self._hover_item:
+            self._hover_item = item
+            self.viewport().update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        if self._hover_item is not None:
+            self._hover_item = None
+            self.viewport().update()
+        super().leaveEvent(event)
 
     def startDrag(self, supported_actions) -> None:  # noqa: N802 - Qt 命名
         item = self.currentItem()
@@ -705,13 +746,6 @@ class OperatorLibrary(QWidget):
                 | Qt.ItemFlag.ItemIsDragEnabled
             )
             item.setSizeHint(0, QSize(0, 26))
-            item.setData(
-                1,
-                Qt.ItemDataRole.TextAlignmentRole,
-                int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-            )
-            item.setForeground(1, QBrush(QColor("#cbd5e1")))
-            item.setText(1, "›")
             parent.addChild(item)
             self._entry_items[entry.id] = item
             total += 1

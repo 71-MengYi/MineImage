@@ -178,20 +178,25 @@ QToolButton:hover {{
 QToolButton:pressed {{
     background-color: #e2e8f0;
 }}
-/* 算子库手风琴树：一级分类行由 item 背景色区分，叶子保持简洁。 */
+/* 算子库手风琴树：一级分类行由 item 背景色区分，叶子保持简洁。
+   行底色统一由 _OperatorTree.drawRow 整行绘制，这里关掉 Qt 自带的
+   “分支区 + 各列分别高亮”，避免缩进区出现多余的选中方框。 */
 QTreeWidget#operatorTree {{
     background: transparent;
     border: none;
+    show-decoration-selected: 0;
 }}
 QTreeWidget#operatorTree::item {{
     padding: 1px 6px;
     border-radius: 6px;
 }}
+/* 行底色（悬停 / 选中 / 分类展开）统一在 _OperatorTree.drawRow 里整行绘制，
+   这里让 Qt 不再按单元格铺一层选中底色，避免出现多余的内层色块。 */
 QTreeWidget#operatorTree::item:hover {{
-    background-color: #eef4ff;
+    background: transparent;
 }}
 QTreeWidget#operatorTree::item:selected {{
-    background-color: {ACCENT_SOFT};
+    background: transparent;
     color: #1e3a8a;
 }}
 QToolButton#treeAction {{
