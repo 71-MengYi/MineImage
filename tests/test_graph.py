@@ -39,7 +39,7 @@ from app.graph.commands import (
     RemoveNodeTreeCommand,
     SetNodeParamsCommand,
 )
-from app.graph.layout import compute_layout
+from app.graph.layout import GRID, compute_layout
 from app.graph.node_item import NodeItem
 from app.graph.view import GraphView
 from app.operators.spec import OperatorSpec, ParamSpec, PortSpec, param_defaults
@@ -248,7 +248,7 @@ class GraphViewTestCase(unittest.TestCase):
         left_center = items[left.id].sceneBoundingRect().center().x()
         right_center = items[right.id].sceneBoundingRect().center().x()
         merge_center = items[merge.id].sceneBoundingRect().center().x()
-        self.assertAlmostEqual(merge_center, (left_center + right_center) / 2.0, delta=2.0)
+        self.assertAlmostEqual(merge_center, (left_center + right_center) / 2.0, delta=GRID)
 
         # 任意两个节点包围盒不重叠
         rects = [(node_id, item.sceneBoundingRect()) for node_id, item in items.items()]
