@@ -371,6 +371,79 @@ class GraphViewTestCase(unittest.TestCase):
         self.assertEqual(self.graph.nodes[node.id].pos, (30.0, 30.0))
         self.assertEqual(self.view._nodes[node.id].pos(), QPointF(30.0, 30.0))
 
+    def test_copy_paste_nodes_preserves_internal_connections_and_undo(self) -> None:
+        first = self.add_node("test.blur", pos=(0.0, 0.0), params={"ksize": 9})
+        second = self.add_node("test.blur", pos=(0.0, 240.0))
+        original = self.connect(first, second)
+        self.view._nodes[first.id].setSelected(True)
+        self.view._nodes[second.id].setSelected(True)
+
+        self.assertTrue(self.view.copy_selected())
+        new_ids = self.view.paste_nodes()
+        self.assertEqual(len(new_ids), 2)
+        self.assertEqual(len(self.graph.nodes), 4)
+        self.assertTrue(all(self.view._nodes[node_id].isSelected() for node_id in new_ids))
+        new_nodes = [self.graph.nodes[node_id] for node_id in new_ids]
+        self.assertTrue(all(node.op_id == "test.blur" for node in new_nodes))
+        self.assertEqual(new_nodes[0].params.get("ksize"), 9)
+        self.assertNotEqual(new_nodes[0].pos, first.pos)
+        self.assertNotEqual(new_nodes[1].pos, second.pos)
+        # 原节点之间的连线只在副本之间复制一条，不复制到原有节点。
+        copied_connections = [
+            connection
+            for connection in self.graph.connections.values()
+            if connection.id != original.id
+        ]
+        self.assertEqual(len(copied_connections), 1)
+        pasted_connection = copied_connections[0]
+        self.assertIn(pasted_connection.src_node, new_ids)
+        self.assertIn(pasted_connection.dst_node, new_ids)
+        self.assertEqual(pasted_connection.src_port, "image")
+        self.assertEqual(pasted_connection.dst_port, "image")
+
+        # 整次粘贴一步撤销，节点与副本连线一起回退。
+        self.assertEqual(self.undo.count(), 1)
+        self.undo.undo()
+        self.assertEqual(len(self.graph.nodes), 2)
+        self.assertEqual(len(self.graph.connections), 1)
+        self.assertIn(original.id, self.graph.connections)
+        self.undo.redo()
+        self.assertEqual(len(self.graph.nodes), 4)
+        self.assertEqual(len(self.graph.connections), 2)
+
+    def test_copy_paste_one_node_does_not_copy_dangling_connection(self) -> None:
+        first = self.add_node("test.blur", pos=(0.0, 0.0))
+        second = self.add_node("test.blur", pos=(0.0, 240.0))
+        self.connect(first, second)
+        self.view._nodes[first.id].setSelected(True)
+        self.assertTrue(self.view.copy_selected())
+        new_ids = self.view.paste_nodes()
+        self.assertEqual(len(new_ids), 1)
+        self.assertEqual(len(self.graph.nodes), 3)
+        self.assertEqual(len(self.graph.connections), 1)
+
+    def test_copy_paste_keyboard_shortcuts(self) -> None:
+        first = self.add_node("test.blur", pos=(0.0, 0.0))
+        self.view.show()
+        self.view.setFocus()
+        if _APP is not None:
+            _APP.processEvents()
+        self.view.set_selected_node(first.id)
+        QTest.keyClick(
+            self.view,
+            Qt.Key.Key_C,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        QTest.keyClick(
+            self.view,
+            Qt.Key.Key_V,
+            Qt.KeyboardModifier.ControlModifier,
+        )
+        if _APP is not None:
+            _APP.processEvents()
+        self.assertEqual(len(self.graph.nodes), 2)
+        self.assertEqual(len(self.graph.connections), 0)
+
     def test_move_tracking_pushes_command(self) -> None:
         node = self.add_node(pos=(10.0, 10.0))
         item = self.view._nodes[node.id]

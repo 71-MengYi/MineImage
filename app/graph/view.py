@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from collections import deque
@@ -17,8 +18,16 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QUndoCommand, QUndoStack
-from PySide6.QtWidgets import QFrame, QGraphicsItem, QGraphicsView, QInputDialog, QMenu
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QFont,
+    QKeySequence,
+    QPainter,
+    QUndoCommand,
+    QUndoStack,
+)
+from PySide6.QtWidgets import QApplication, QFrame, QGraphicsItem, QGraphicsView, QInputDialog, QMenu
 
 from app.config import AppSettings
 from app.core.constants import MIME_IMAGE_PATHS, MIME_OPERATOR, SINGLE_CLICK_DELAY_MS
@@ -58,6 +67,10 @@ _IMAGE_SUFFIXES = {
 SNAP_RADIUS = 26.0
 #: 自动连线时新节点端口与目标端口之间的垂直间距。
 AUTO_CONNECT_GAP = 48.0
+#: 节点复制粘贴的剪贴板数据标识。
+NODE_CLIPBOARD_KIND = "mineimage/nodes"
+#: 粘贴时相对原位置的级联偏移。
+PASTE_CASCADE = 36.0
 
 
 @dataclass(frozen=True)
@@ -122,6 +135,7 @@ class GraphView(QGraphicsView):
         self._pending_move_reason: str | None = None
         self._highlighted_ports: list[PortItem] = []
         self._highlighted_connection: ConnectionItem | None = None
+        self._paste_count = 0
         self._zoom_min = 0.15
         self._zoom_max = 3.0
 
@@ -181,6 +195,168 @@ class GraphView(QGraphicsView):
                 self.ensureVisible(item, 24, 24)
         finally:
             self._syncing_selection = False
+
+    # ------------------------------------------------------------ 复制 / 粘贴
+    def copy_selected(self) -> bool:
+        """复制选中的节点及它们之间的连线到系统剪贴板。"""
+
+        node_ids = [
+            node.id
+            for node in self.graph.nodes.values()
+            if node.id in self._nodes and self._nodes[node.id].isSelected()
+        ]
+        if not node_ids:
+            self.status_message.emit("请先选择要复制的节点")
+            return False
+        selected = set(node_ids)
+        payload = {
+            "kind": NODE_CLIPBOARD_KIND,
+            "nodes": [copy.deepcopy(self.graph.nodes[node_id].to_dict()) for node_id in node_ids],
+            "connections": [
+                copy.deepcopy(connection.to_dict())
+                for connection in self.graph.connections.values()
+                if connection.src_node in selected and connection.dst_node in selected
+            ],
+        }
+        QApplication.clipboard().setText(
+            json.dumps(payload, ensure_ascii=False, default=str)
+        )
+        self._paste_count = 0
+        self.status_message.emit(f"已复制 {len(node_ids)} 个节点")
+        return True
+
+    def paste_nodes(self) -> list[str]:
+        """从剪贴板粘贴节点，保留副本之间的连线；整次粘贴是一步撤销。"""
+
+        data = self._clipboard_node_payload()
+        if data is None:
+            self.status_message.emit("剪贴板中没有可粘贴的节点")
+            return []
+
+        source_nodes: list[NodeModel] = []
+        skipped = 0
+        for raw in data["nodes"]:
+            try:
+                node = NodeModel.from_dict(raw)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                node.is_source
+                and node.source_image_id
+                and node.source_image_id not in self.workspace.images
+            ):
+                skipped += 1
+                continue
+            source_nodes.append(node)
+        if not source_nodes:
+            self.status_message.emit("剪贴板中的节点无法粘贴到此工作区")
+            return []
+
+        self._paste_count += 1
+        min_x = min(node.pos[0] for node in source_nodes)
+        min_y = min(node.pos[1] for node in source_nodes)
+        max_x = max(node.pos[0] for node in source_nodes)
+        max_y = max(node.pos[1] for node in source_nodes)
+        origin = self._paste_origin(min_x, min_y, max_x - min_x, max_y - min_y)
+        dx = origin.x() - min_x
+        dy = origin.y() - min_y
+
+        id_map: dict[str, str] = {}
+        new_ids: list[str] = []
+        self._undo_stack.beginMacro("粘贴节点")
+        try:
+            for node in source_nodes:
+                clone = NodeModel(
+                    id=new_id("n"),
+                    op_id=node.op_id,
+                    title=node.title,
+                    pos=(round(node.pos[0] + dx, 2), round(node.pos[1] + dy, 2)),
+                    params=copy.deepcopy(node.params),
+                    source_image_id=node.source_image_id,
+                    source_path=node.source_path,
+                )
+                id_map[node.id] = clone.id
+                new_ids.append(clone.id)
+                self._undo_stack.push(AddNodeCommand(self.graph, clone))
+
+            for raw in data.get("connections", []):
+                try:
+                    src_node = id_map[str(raw["src_node"])]
+                    dst_node = id_map[str(raw["dst_node"])]
+                    src_port = str(raw["src_port"])
+                    dst_port = str(raw["dst_port"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                try:
+                    self._undo_stack.push(
+                        AddConnectionCommand(
+                            self.graph, src_node, src_port, dst_node, dst_port
+                        )
+                    )
+                except GraphError as exc:
+                    self.status_message.emit(f"粘贴连线失败：{exc}")
+        finally:
+            self._undo_stack.endMacro()
+
+        self._select_nodes(new_ids, new_ids[-1])
+        self.node_created.emit(new_ids[-1])
+        message = f"已粘贴 {len(new_ids)} 个节点"
+        if skipped:
+            message += f"（跳过 {skipped} 个源图像节点：当前工作区缺少对应图像）"
+        self.status_message.emit(message)
+        return new_ids
+
+    def _paste_origin(
+        self,
+        min_x: float,
+        min_y: float,
+        width: float,
+        height: float,
+    ) -> QPointF:
+        """粘贴位置：鼠标在画布内时以光标为中心，否则按原位置级联偏移。"""
+
+        viewport_pos = self.viewport().mapFromGlobal(QCursor.pos())
+        if self.viewport().underMouse() and self.viewport().rect().contains(viewport_pos):
+            center = self.mapToScene(viewport_pos)
+            cascade = PASTE_CASCADE * self._paste_count
+            return QPointF(
+                center.x() - width / 2.0 + cascade,
+                center.y() - height / 2.0 + cascade,
+            )
+        offset = PASTE_CASCADE * self._paste_count
+        return QPointF(min_x + offset, min_y + offset)
+
+    def _clipboard_node_payload(self) -> dict[str, Any] | None:
+        text = QApplication.clipboard().text().strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(data, dict) or data.get("kind") != NODE_CLIPBOARD_KIND:
+            return None
+        if not isinstance(data.get("nodes"), list) or not data["nodes"]:
+            return None
+        if not isinstance(data.get("connections"), list):
+            data["connections"] = []
+        return data
+
+    def _select_nodes(self, node_ids: list[str], primary: str | None = None) -> None:
+        self._selection_timer.stop()
+        self._syncing_selection = True
+        try:
+            self._scene.clearSelection()
+            for node_id in node_ids:
+                item = self._nodes.get(node_id)
+                if item is not None:
+                    item.setSelected(True)
+            primary_item = self._nodes.get(primary or "")
+            if primary_item is not None:
+                self.ensureVisible(primary_item, 24, 24)
+        finally:
+            self._syncing_selection = False
+        self.selection_changed.emit(primary or (node_ids[-1] if node_ids else ""))
 
     def notify_result(self, node_id: str, result: Any) -> None:
         self._results[node_id] = result
@@ -1207,6 +1383,14 @@ class GraphView(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self.copy_selected()
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.Paste):
+            self.paste_nodes()
+            event.accept()
+            return
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.delete_selected()
             event.accept()
@@ -1263,6 +1447,7 @@ class GraphView(QGraphicsView):
         if node_item is not None:
             if not node_item.isSelected():
                 self.set_selected_node(node_item.node_id)
+            menu.addAction("复制节点", self.copy_selected)
             menu.addAction("删除节点", self.delete_selected)
             menu.addAction("重命名节点", lambda: self.rename_node(node_item.node_id))
             menu.addSeparator()
@@ -1281,6 +1466,8 @@ class GraphView(QGraphicsView):
             menu.addAction("自动布局", self.auto_layout)
             menu.addAction("适应视图", self.fit_graph)
         else:
+            menu.addAction("粘贴节点", self.paste_nodes)
+            menu.addSeparator()
             menu.addAction("自动布局", self.auto_layout)
             menu.addAction("适应视图", self.fit_graph)
         menu.exec(event.globalPos())

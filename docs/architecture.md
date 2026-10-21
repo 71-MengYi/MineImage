@@ -90,6 +90,8 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 | 保存 | `engine.commit_node(id)`：使该节点与下游失效，后台重算下游子树 |
 | 切换节点 | 直接读取该节点快照；不触发下游计算 |
 | 修改连线 / 删除节点 | 由工作区使目标节点及下游失效 |
+| 移动节点 / 自动布局 | 只更新位置，不清空结果快照、不重算 |
+| 复制粘贴节点 | 新节点与副本间连线一步入栈；完成后使相关下游失效 |
 | 打开工程 | 重新创建引擎并清空缓存 |
 
 后台任务由 generation 编号；新请求会取消旧任务，旧结果不得写入界面。
@@ -115,6 +117,8 @@ notify_result(node_id: str, result: NodeResult) -> None
 notify_error(node_id: str, message: str | None) -> None
 selected_node_id() -> str | None
 set_selected_node(node_id: str) -> None
+copy_selected() -> bool              # Ctrl+C：复制选中节点及副本间连线
+paste_nodes() -> list[str]           # Ctrl+V：粘贴并返回新节点 id，整次一步撤销
 auto_layout() -> None
 fit_graph() -> None
 set_thumbnails_enabled(enabled: bool) -> None

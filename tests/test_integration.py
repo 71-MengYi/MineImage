@@ -97,6 +97,57 @@ class MainWindowIntegrationTests(unittest.TestCase):
         self.assertGreater(sizes[2], sizes[0] * 3)
         self.assertGreater(sizes[2], sizes[1] * 3)
 
+    def test_copy_paste_nodes_in_workspace(self) -> None:
+        widget = self._open()
+        graph = widget.workspace.graph
+        source = graph.source_nodes()[0]
+        node_id = widget.graph_view.add_operator_at("basic.grayscale")
+        self.assertIsNotNone(node_id)
+        graph.add_connection(source.id, "image", node_id, "image")
+        widget.graph_view.set_selected_node(node_id)
+
+        self.assertTrue(widget.graph_view.copy_selected())
+        new_ids = widget.graph_view.paste_nodes()
+        self.assertEqual(len(new_ids), 1)
+        self.assertIn(new_ids[0], graph.nodes)
+        self.assertNotEqual(new_ids[0], node_id)
+        self.assertTrue(widget.dirty)
+        self._wait_idle(widget)
+
+        widget.undo_stack.undo()
+        self.assertNotIn(new_ids[0], graph.nodes)
+        self.assertIn(node_id, graph.nodes)
+
+    def test_moving_node_does_not_recompute_cached_result(self) -> None:
+        widget = self._open()
+        graph = widget.workspace.graph
+        source = graph.source_nodes()[0]
+        node_id = widget.graph_view.add_operator_at("basic.grayscale")
+        self.assertIsNotNone(node_id)
+        graph.add_connection(source.id, "image", node_id, "image")
+        widget._on_node_selected(node_id)
+        self._wait_idle(widget)
+        before = widget.engine.result(node_id)
+        self.assertIsNotNone(before)
+
+        item = widget.graph_view._nodes[node_id]
+        start = item.pos()
+        item.setSelected(True)
+        widget.graph_view.begin_move_tracking()
+        item.setPos(start.x() + 120.0, start.y() + 40.0)
+        widget.graph_view.finish_move_tracking()
+        QTest.qWait(100)
+        self._wait_idle(widget)
+
+        # 纯位置移动不应清空节点快照，也不应触发重算。
+        self.assertIs(widget.engine.result(node_id), before)
+        self.assertFalse(widget.engine.busy)
+
+        # 撤销移动同样只改变位置。
+        widget.undo_stack.undo()
+        self._wait_idle(widget)
+        self.assertIs(widget.engine.result(node_id), before)
+
     def test_add_operator_connect_params_undo_and_project(self) -> None:
         widget = self._open()
         graph = widget.workspace.graph

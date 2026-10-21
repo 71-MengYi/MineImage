@@ -636,8 +636,10 @@ class OperatorLibrary(QWidget):
             category_font.setBold(True)
             category_font.setPointSizeF(max(10.0, category_font.pointSizeF()))
             category.setFont(0, category_font)
-            category.setTextAlignment(
-                1, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            category.setData(
+                1,
+                Qt.ItemDataRole.TextAlignmentRole,
+                int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
             )
             category.setSizeHint(0, QSize(0, 36))
             category.setToolTip(0, f"{name} · 单击展开 / 折叠")
@@ -665,8 +667,10 @@ class OperatorLibrary(QWidget):
             group_font.setBold(True)
             group.setFont(0, group_font)
             group.setForeground(0, QBrush(QColor("#475569")))
-            group.setTextAlignment(
-                1, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            group.setData(
+                1,
+                Qt.ItemDataRole.TextAlignmentRole,
+                int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
             )
             group.setForeground(1, QBrush(QColor("#94a3b8")))
             group.setSizeHint(0, QSize(0, 28))
@@ -701,8 +705,10 @@ class OperatorLibrary(QWidget):
                 | Qt.ItemFlag.ItemIsDragEnabled
             )
             item.setSizeHint(0, QSize(0, 26))
-            item.setTextAlignment(
-                1, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            item.setData(
+                1,
+                Qt.ItemDataRole.TextAlignmentRole,
+                int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
             )
             item.setForeground(1, QBrush(QColor("#cbd5e1")))
             item.setText(1, "›")

@@ -20,7 +20,7 @@ from app.core.imageio import ImageIOError, load_image, save_image
 from app.core.model import NodeModel, WorkspaceModel
 from app.core.project import save_project
 from app.engine.engine import ExecutionEngine, NodeResult
-from app.graph.commands import SetNodeParamsCommand
+from app.graph.commands import MoveNodeCommand, SetNodeParamsCommand
 from app.graph.view import GraphView
 from app.operators.loader import OperatorRegistry
 from app.ui.library import OperatorLibrary
@@ -64,6 +64,7 @@ class WorkspaceWidget(QWidget):
         self._param_session_old: dict = {}
         self._current_image = None
         self._last_pixel_sample = None
+        self._last_undo_index = 0
         # 默认比例 1:1:4；旧版本保存的 1:1:3 也视为“未自定义”，首次显示时校正。
         self._splitter_ratio_pending = tuple(self.settings.workspace_splitter_sizes) in (
             DEFAULT_SPLITTER_SIZES,
@@ -414,12 +415,49 @@ class WorkspaceWidget(QWidget):
         self._mark_dirty()
 
     def _on_undo_index_changed(self, _index: int) -> None:
+        previous = self._last_undo_index
+        self._last_undo_index = self.undo_stack.index()
         self._mark_dirty()
+        # 只改变节点位置（拖拽 / 自动布局）不影响计算结果，不要清空快照或重算。
+        if self._is_layout_only_change(previous, self._last_undo_index):
+            self._emit_status()
+            return
         # 撤销/重做可能改变参数或连线；清空所有快照并重新预览当前节点。
         self.engine.invalidate_all()
         if self._current_node_id and self._current_node_id in self.workspace.graph.nodes:
             self.engine.preview_node(self._current_node_id)
         self._emit_status()
+
+    def _is_layout_only_change(self, previous: int, current: int) -> bool:
+        """判断本次 undo/redo 是否只改变节点位置（不触发重算）。"""
+
+        if current == previous:
+            return False
+        try:
+            command = (
+                self.undo_stack.command(current)
+                if current < previous
+                else self.undo_stack.command(current - 1)
+            )
+        except (IndexError, RuntimeError):
+            return False
+        return self._is_layout_only_command(command)
+
+    def _is_layout_only_command(self, command) -> bool:
+        if command is None:
+            return False
+        if isinstance(command, MoveNodeCommand):
+            return True
+        try:
+            child_count = command.childCount()
+        except (AttributeError, RuntimeError):
+            return False
+        if child_count <= 0:
+            return False
+        return all(
+            self._is_layout_only_command(command.child(index))
+            for index in range(child_count)
+        )
 
     # ------------------------------------------------------------------ 拾取
     def _on_pick_requested(self, node_id: str, param_key: str, tool: str) -> None:
