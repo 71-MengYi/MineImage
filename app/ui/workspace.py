@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -33,6 +34,8 @@ DEFAULT_SPLITTER_SIZES = (200, 400, 800)
 LEGACY_SPLITTER_RATIOS = ((1, 1, 3), (1, 1, 4))
 #: 识别旧默认比例时允许的相对误差（窗口缩放与最小宽度会改变实际数值）。
 LEGACY_RATIO_TOLERANCE = 0.22
+
+LOG = logging.getLogger(__name__)
 
 
 def _is_legacy_splitter_sizes(sizes: tuple[int, ...]) -> bool:
@@ -238,10 +241,12 @@ class WorkspaceWidget(QWidget):
         try:
             image = load_image(path)
         except ImageIOError as exc:
+            LOG.error("无法打开图像 %s：%s", path, exc)
             QMessageBox.critical(self, "无法打开图像", str(exc))
             self.status_message.emit(str(exc))
             return False
         except Exception as exc:  # noqa: BLE001
+            LOG.exception("无法打开图像 %s", path)
             QMessageBox.critical(self, "无法打开图像", f"{exc.__class__.__name__}: {exc}")
             return False
         position = self.workspace.next_source_position()
@@ -688,6 +693,7 @@ class WorkspaceWidget(QWidget):
         try:
             save_image(path, result.primary)
         except (ImageIOError, OSError) as exc:
+            LOG.error("导出图像失败 %s：%s", path, exc)
             QMessageBox.critical(self, "导出失败", str(exc))
             return False
         self.status_message.emit(f"已导出：{Path(path).name}")

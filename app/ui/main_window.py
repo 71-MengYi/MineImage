@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import platform
 from pathlib import Path
 
@@ -28,19 +29,36 @@ from PySide6.QtWidgets import (
 )
 
 from app import APP_DISPLAY_NAME, __version__
-from app.config import AppSettings, application_root, default_user_operator_dir, resource_root
+from app.config import (
+    AppSettings,
+    application_root,
+    default_log_db_path,
+    default_user_operator_dir,
+    resource_root,
+)
 from app.core.constants import IMAGE_FILTER, PROJECT_FILTER
+from app.core.logstore import LogStore
 from app.core.model import WorkspaceModel
 from app.core.project import ProjectFormatError, load_project
 from app.operators.loader import OperatorRegistry
+from app.ui.log_dialog import LogDialog
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.workspace import WorkspaceWidget
 
+LOG = logging.getLogger(__name__)
+
 
 class MainWindow(QMainWindow):
-    def __init__(self, settings: AppSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: AppSettings | None = None,
+        log_store: LogStore | None = None,
+    ) -> None:
         super().__init__()
         self.settings = settings or AppSettings()
+        # 由 app.main 注入与日志处理器共用的仓库；未注入时在首次打开日志时创建。
+        self.log_store = log_store
+        self._log_dialog: LogDialog | None = None
         self.registry = self._build_registry()
         self._workspace_counter = 0
         self._workspaces: list[WorkspaceWidget] = []
@@ -78,10 +96,19 @@ class MainWindow(QMainWindow):
             path = str(Path(raw).expanduser())
             if path not in dirs:
                 dirs.append(path)
-        return OperatorRegistry.build(
+        registry = OperatorRegistry.build(
             dirs,
             include_builtin=self.settings.builtin_operators_enabled,
         )
+        for issue in registry.issues:
+            LOG.warning(
+                "算子加载问题 [%s] %s：%s",
+                issue.level,
+                issue.path,
+                issue.message,
+                extra={"log_detail": issue.traceback or ""},
+            )
+        return registry
 
     def _startup_status(self) -> None:
         if self.tabs.count():
@@ -172,6 +199,12 @@ class MainWindow(QMainWindow):
         )
         self.act_open_operator_dir = self._action("打开用户算子目录", self.open_user_operator_dir)
         self.act_load_log = self._action("查看加载日志…", self.show_load_log)
+        self.act_logs = self._action(
+            "日志…",
+            self.show_logs,
+            "Ctrl+Shift+L",
+            QStyle.StandardPixmap.SP_FileDialogDetailedView,
+        )
 
         self.act_settings = self._action("首选项…", self.open_settings, "Ctrl+,")
         self.act_operator_guide = self._action("算子编写指南", self.open_operator_guide)
@@ -297,6 +330,8 @@ class MainWindow(QMainWindow):
 
         help_menu = menu.addMenu("帮助(&H)")
         help_menu.addAction(self.act_operator_guide)
+        help_menu.addSeparator()
+        help_menu.addAction(self.act_logs)
         help_menu.addAction(self.act_about)
 
     def _create_toolbar(self) -> None:
@@ -524,9 +559,11 @@ class MainWindow(QMainWindow):
         try:
             workspace = load_project(path)
         except ProjectFormatError as exc:
+            LOG.error("无法打开工程 %s：%s", path, exc)
             QMessageBox.critical(self, "无法打开工程", str(exc))
             return
         except Exception as exc:  # noqa: BLE001
+            LOG.exception("无法打开工程 %s", path)
             QMessageBox.critical(self, "无法打开工程", f"{exc.__class__.__name__}: {exc}")
             return
         widget = self._add_workspace(workspace, Path(path))
@@ -575,6 +612,7 @@ class MainWindow(QMainWindow):
         try:
             saved = widget.save_to(target)
         except Exception as exc:  # noqa: BLE001
+            LOG.exception("保存工程失败：%s", target)
             QMessageBox.critical(self, "保存失败", str(exc))
             return False
         self.settings.add_recent_file(str(saved))
@@ -788,6 +826,30 @@ class MainWindow(QMainWindow):
         dialog.exec()
         dialog.deleteLater()
 
+    # ------------------------------------------------------------------ 日志
+    def show_logs(self) -> None:
+        """打开/前置 SQLite 应用日志查看器（帮助 → 日志）。
+
+        使用非模态窗口：用户可以一边操作主界面、复现问题，一边观察日志
+        自动刷新；再次触发菜单时只前置已有窗口。
+        """
+        try:
+            if self.log_store is None:
+                self.log_store = LogStore(default_log_db_path())
+            dialog = self._log_dialog
+            if dialog is None or not dialog.isVisible():
+                if dialog is not None:
+                    dialog.deleteLater()
+                dialog = LogDialog(self.log_store, self)
+                dialog.setModal(False)
+                self._log_dialog = dialog
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+        except Exception as exc:  # noqa: BLE001
+            LOG.exception("无法打开应用日志")
+            QMessageBox.critical(self, "无法打开日志", f"{exc.__class__.__name__}: {exc}")
+
     # ------------------------------------------------------------------ 帮助
     def open_operator_guide(self) -> None:
         candidates = [
@@ -863,6 +925,12 @@ class MainWindow(QMainWindow):
             if not self._maybe_close_workspace(widget):
                 event.ignore()
                 return
+        # 非模态日志窗口是主窗口的子窗口；显式关闭，避免主窗口退出后
+        # 它仍作为可见顶层窗口阻止 QApplication 退出。
+        if self._log_dialog is not None:
+            self._log_dialog.close()
+            self._log_dialog.deleteLater()
+            self._log_dialog = None
         self.settings.window_geometry = bytes(self.saveGeometry())
         self.settings.window_state = bytes(self.saveState())
         self.settings.sync()

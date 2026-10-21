@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import threading
 import time
 import traceback
@@ -37,6 +38,8 @@ from app.operators.spec import (
     output_to_dict,
     validate_inputs,
 )
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass
@@ -394,6 +397,13 @@ class ExecutionEngine(QObject):
         """主线程侧的失败通知（例如快照创建失败）。"""
         node = self.workspace.graph.nodes.get(node_id)
         revision = node.revision if node is not None else 0
+        LOG.error(
+            "节点执行失败 [%s] %s：%s",
+            node_id,
+            node.title if node is not None else "?",
+            message,
+            extra={"log_detail": details},
+        )
         self._errors[node_id] = NodeError(node_id, message, details, revision)
         self._results.pop(node_id, None)
         self.node_failed.emit(node_id, message)
@@ -578,4 +588,12 @@ class _EvalState:
         self.error_nodes.add(node_id)
         snap = self.snapshot.nodes.get(node_id)
         revision = snap.revision if snap is not None else 0
+        LOG.error(
+            "节点执行失败 [%s] %s (%s)：%s",
+            node_id,
+            snap.title if snap is not None else "?",
+            snap.op_id if snap is not None else "?",
+            message,
+            extra={"log_detail": details},
+        )
         self.engine._failed.emit(self.generation, node_id, revision, message, details)

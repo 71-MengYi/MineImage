@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -29,11 +30,14 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from app.config import AppSettings  # noqa: E402
+from app.core.logstore import LogStore  # noqa: E402
+from app.ui.log_dialog import LogDialog  # noqa: E402
 from app.ui.main_window import MainWindow  # noqa: E402
 from app.ui.theme import apply_theme  # noqa: E402
 
 OUT_DIR = ROOT / "docs" / "images"
 INI_PATH = ROOT / ".test_tmp" / "capture_screenshots.ini"
+LOG_DB_PATH = ROOT / ".test_tmp" / "capture_logs.db"
 SAMPLE_IMAGE = ROOT / "sample_images" / "sample_color.png"
 
 WINDOW_SIZE = (1500, 920)
@@ -118,6 +122,88 @@ def build_chain(window: MainWindow, widget) -> tuple[str, str, str]:
     return source.id, grayscale, blur
 
 
+def capture_log_dialog(app: QApplication) -> Path:
+    """生成应用日志查看器截图（示例日志写入临时 SQLite 数据库）。"""
+
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(str(LOG_DB_PATH) + suffix)
+        candidate.unlink(missing_ok=True)
+    store = LogStore(LOG_DB_PATH)
+    now = datetime.now()
+    samples = [
+        ("INFO", "MineImage 0.1.0 启动，Python 3.14.3，设置 D:\\Code\\MineImage\\config\\MineImage.ini",
+         "mineimage", "", "main.py:114", "MainThread"),
+        ("INFO", "算子库：128 个算子，0 个加载问题", "mineimage", "", "main.py:122", "MainThread"),
+        ("WARNING", "算子加载问题 [warning] D:\\Code\\MineImage\\operators\\demo_bad.py：模块缺少 OPERATOR 变量",
+         "app.ui.main_window",
+         "Traceback (most recent call last):\n"
+         '  File "operators/demo_bad.py", line 4, in <module>\n'
+         "    OPERATOR_NAME = 1\n"
+         "AttributeError: 'int' object has no attribute 'id'",
+         "main_window.py:98", "MainThread"),
+        ("INFO", "已打开图像：sample.png", "app.ui.workspace", "", "workspace.py:254", "MainThread"),
+        ("ERROR", "节点执行失败 [n3] 高斯模糊 (filter.gaussian_blur)：算子执行失败：ValueError: ksize must be odd",
+         "app.engine.engine",
+         "Traceback (most recent call last):\n"
+         '  File "app/engine/engine.py", line 550, in _execute\n'
+         "    output = entry.operator.process(**call_kwargs)\n"
+         '  File "app/operators/builtin/gaussian_blur.py", line 41, in process\n'
+         "    return cv2.GaussianBlur(image, (k, k), sigma)\n"
+         "ValueError: ksize must be odd",
+         "engine.py:563", "Dummy-3"),
+        ("ERROR", "无法打开工程 D:\\images\\broken.mi：工程文件缺少 project.json",
+         "app.ui.main_window", "ProjectFormatError: 工程文件缺少 project.json",
+         "main_window.py:529", "MainThread"),
+        ("WARNING", "参数校验失败：阈值必须在 0–255 之间（当前 300）", "app.ui.params", "", "params.py:512", "MainThread"),
+        ("ERROR", "导出图像失败 D:\\out\\result.png：[Errno 13] Permission denied", "app.ui.workspace",
+         "PermissionError: [Errno 13] Permission denied: 'D:\\out\\result.png'",
+         "workspace.py:691", "MainThread"),
+    ]
+    detail_error_id = ""
+    for index, (level, message, logger, detail, source, thread) in enumerate(reversed(samples)):
+        entry = store.append(
+            level,
+            message,
+            logger=logger,
+            detail=detail,
+            source=source,
+            thread=thread,
+            created_at=now - timedelta(minutes=len(samples) - index),
+        )
+        if "ksize must be odd" in message:
+            detail_error_id = entry.entry_id
+    store.append(
+        "CRITICAL",
+        "未捕获异常：ZeroDivisionError: division by zero",
+        logger="mineimage",
+        detail=(
+            "Traceback (most recent call last):\n"
+            '  File "app/ui/main_window.py", line 500, in open_project_path\n'
+            "    workspace = load_project(path)\n"
+            "ZeroDivisionError: division by zero"
+        ),
+        source="main_window.py:500",
+        thread="MainThread",
+        created_at=now,
+    )
+
+    dialog = LogDialog(store)
+    dialog.resize(1180, 760)
+    dialog.show()
+    app.processEvents()
+    row = dialog.model.row_for_entry_id(detail_error_id)
+    if row >= 0:
+        dialog.table_view.selectRow(row)
+        dialog.table_view.setCurrentIndex(dialog.model.index(row, 0))
+    target = capture(app, dialog, "app_logs.png")
+    dialog.close()
+    dialog.deleteLater()
+    app.processEvents()
+    for suffix in ("", "-wal", "-shm"):
+        Path(str(LOG_DB_PATH) + suffix).unlink(missing_ok=True)
+    return target
+
+
 def main() -> int:
     ensure_sample_image()
     app = QApplication.instance() or QApplication([])
@@ -177,6 +263,9 @@ def main() -> int:
         raise RuntimeError("未能显示 basic.grayscale 的说明浮层")
     capture(app, window, "operator_info.png")
     widget.library._hide_info_panel()
+
+    # 6) 应用日志查看器（帮助 → 日志）
+    capture_log_dialog(app)
 
     # 干净退出：避免关闭时的模态保存提示
     for ws in list(window._workspaces):

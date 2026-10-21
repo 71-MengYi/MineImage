@@ -106,6 +106,25 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 
 后台任务由 generation 编号；新请求会取消旧任务，旧结果不得写入界面。
 
+## 应用日志
+
+运行日志同时写入 `<应用目录>/config/MineImage.log`（文本）和
+`<应用目录>/config/MineImage-logs.db`（SQLite）。SQLite 是日志查看器的数据源：
+
+* `app/core/logstore.py`：`LogStore` 负责建表、追加、筛选、导出与保留最近
+  50 000 条；`SQLiteLogHandler` 把 `logging.LogRecord` 落库（异常堆栈进入
+  `detail`，也可通过 `extra={"log_detail": "..."}` 附加信息）。每次写入使用
+  独立连接并启用 WAL，因此 UI 查询与后台线程写入可以并发。
+* `app/main.py`：启动时把 SQLite handler 挂到根 logger，并安装未捕获异常 /
+  后台线程异常钩子；异常对话框会显示对应日志 ID。
+* `app/ui/log_dialog.py`：非模态查看器，按等级 / 日期 / 模块 / 关键字筛选，
+  支持表格复制、详情查看、CSV 导出与清空；`MainWindow.show_logs()` 负责
+  复用同一窗口并注入共享的 `LogStore`。
+
+重要失败路径（算子加载、工程打开/保存、图像读取/导出、节点执行、未捕获异常）
+都会写入日志；写入失败由 `logging.Handler.handleError` 吞掉，不能阻断业务。
+环境变量 `MINEIMAGE_LOG_DB` 可覆盖数据库位置。
+
 ## 主要跨模块接口（冻结）
 
 ### GraphView（`app/graph/view.py`）

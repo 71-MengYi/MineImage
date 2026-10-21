@@ -54,6 +54,17 @@ def default_config_path() -> Path:
         return Path(base) / _CONFIG_FILE_NAME
 
 
+def default_log_db_path() -> Path:
+    """应用日志 SQLite 数据库路径。
+
+    默认与配置文件放在同一目录；可用环境变量 MINEIMAGE_LOG_DB 覆盖。
+    """
+    override = os.environ.get("MINEIMAGE_LOG_DB", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return default_config_path().with_name("MineImage-logs.db")
+
+
 def default_user_operator_dir() -> Path:
     """内置的“用户算子”目录；放到这里的 .py 文件会自动出现在算子库中。"""
     return application_root() / "operators"
