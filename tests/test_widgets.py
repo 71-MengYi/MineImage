@@ -16,13 +16,13 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
-from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer
 from PySide6.QtGui import QKeyEvent, QMouseEvent, QPalette, QWheelEvent
 from PySide6.QtTest import QSignalSpy, QTest
-from PySide6.QtWidgets import QApplication, QListWidgetItem, QWidget
+from PySide6.QtWidgets import QApplication, QDialog, QListWidgetItem, QWidget
 
 from app.config import AppSettings
-from app.core.constants import MIME_OPERATOR
+from app.core.constants import FRAME_CATEGORY, MIME_OPERATOR
 from app.core.model import NodeModel
 from app.core.types import ImageData
 from app.operators.loader import OperatorRegistry
@@ -30,6 +30,7 @@ from app.operators.spec import Operator, OperatorSpec, ParamSpec
 from app.ui.library import OperatorLibrary
 from app.ui.params import ParamPanel
 from app.ui.preview import PreviewWidget
+from app.ui.replace_operator import ReplaceOperatorDialog
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.theme import apply_theme
 
@@ -832,6 +833,254 @@ class OperatorLibraryTests(unittest.TestCase):
             self.assertFalse(library.tree_bar.isVisible())
         finally:
             library.deleteLater()
+
+
+# ---------------------------------------------------------------------------
+# OperatorLibrary：用户自定义算子置顶 / 流程框算子标识
+# ---------------------------------------------------------------------------
+_FRAME_OPERATOR_TEMPLATE = '''import json
+
+from app.operators.frame import FrameOperator
+from app.operators.spec import OperatorSpec, PortSpec
+
+FRAME_DEFINITION = json.loads({definition!r})
+
+
+class _TestFrameOperator(FrameOperator):
+    spec = OperatorSpec(
+        id="{op_id}",
+        name="{name}",
+        category=("{category}",),
+        description="{description}",
+        keywords=("流程框", "自定义算子"),
+        inputs=(
+            PortSpec("input_1", "输入 1", any_type=True),
+        ),
+        outputs=(
+            PortSpec("output_1", "输出 1", any_type=True),
+        ),
+    )
+    frame_definition = FRAME_DEFINITION
+
+
+OPERATOR = _TestFrameOperator
+'''
+
+_FRAME_DEFINITION = {
+    "format": "mineimage-frame-definition",
+    "version": 1,
+    "name": "演示流程框",
+    "inputs": [{"key": "input_1", "label": "输入 1", "data_type": None}],
+    "outputs": [{"key": "output_1", "label": "输出 1", "data_type": "image"}],
+    "nodes": [],
+    "connections": [],
+}
+
+
+def _build_frame_fixture(root: Path) -> None:
+    """写入普通算子与流程框算子，构造含「用户自定义算子」分类的临时注册表。"""
+
+    files = {
+        "brightness.py": (
+            "test.brightness",
+            "亮度调整",
+            ("基础调整", "颜色"),
+            "调整图像亮度",
+            "亮度",
+        ),
+        "blur.py": (
+            "test.blur",
+            "高斯模糊",
+            ("滤波与平滑", "模糊"),
+            "对图像进行高斯模糊",
+            "模糊",
+        ),
+        "user_op.py": (
+            "test.user",
+            "我的亮度",
+            (FRAME_CATEGORY, "我的算子"),
+            "用户保存的普通算子",
+            "自定义",
+        ),
+    }
+    for filename, (op_id, name, category, description, keyword) in files.items():
+        (root / filename).write_text(
+            _OPERATOR_TEMPLATE.format(
+                op_id=op_id,
+                name=name,
+                category=category,
+                description=description,
+                keyword=keyword,
+            ),
+            encoding="utf-8",
+        )
+    (root / "frame_op.py").write_text(
+        _FRAME_OPERATOR_TEMPLATE.format(
+            definition=json.dumps(_FRAME_DEFINITION, ensure_ascii=False),
+            op_id="frame.demo",
+            name="演示流程框",
+            category=FRAME_CATEGORY,
+            description="由流程框保存生成的演示算子。",
+        ),
+        encoding="utf-8",
+    )
+
+
+class FrameOperatorLibraryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.root = _workspace_tempdir()
+        cls.addClassCleanup(_cleanup_tempdir, cls.root)
+        _build_frame_fixture(cls.root)
+        cls.registry = OperatorRegistry.build([cls.root], include_builtin=False)
+
+    def setUp(self) -> None:
+        self.library = OperatorLibrary()
+        self.library.resize(300, 600)
+        self.library.show()
+        self.library.set_registry(self.registry)
+        QApplication.processEvents()
+
+    def tearDown(self) -> None:
+        self.library.deleteLater()
+
+    def test_custom_category_is_first(self) -> None:
+        names = self.library.category_names()
+        self.assertEqual(names, [FRAME_CATEGORY, "基础调整", "滤波与平滑"])
+        first = self.library.category_items()[0]
+        self.assertEqual(first.text(0), FRAME_CATEGORY)
+        self.assertEqual(first.text(1), "2")
+        self.assertEqual(self.library.operator_count(), 4)
+
+    def test_frame_operator_info_panel_badge_ports_and_no_param_table(self) -> None:
+        self.assertTrue(self.library.show_operator_info("frame.demo"))
+        self.assertIn("流程框算子", self.library.info_meta.text())
+        self.assertIn("演示流程框", self.library.info_name.text())
+        self.assertIn("由流程框保存生成", self.library.info_desc.text())
+        self.assertIn("输入端口", self.library.info_ports.text())
+        self.assertIn("输出端口", self.library.info_ports.text())
+        self.assertFalse(self.library.info_table.isVisible())
+        self.assertTrue(self.library.info_no_params.isVisible())
+        self.assertIn("没有可配置参数", self.library.info_no_params.text())
+
+    def test_tree_tooltip_marks_frame_operator(self) -> None:
+        self.assertTrue(self.library.select_category(FRAME_CATEGORY))
+        tree = self.library.current_tree()
+        self.assertIsNotNone(tree)
+        assert tree is not None
+        item = self.library._entry_items["frame.demo"]  # noqa: SLF001 - 测试内部定位
+        self.assertIn("流程框算子", item.toolTip(0))
+
+    def test_regular_operator_has_no_frame_badge(self) -> None:
+        self.assertTrue(self.library.show_operator_info("test.brightness"))
+        self.assertNotIn("流程框算子", self.library.info_meta.text())
+        self.assertIn("参数", self.library.info_params_title.text())
+
+
+# ---------------------------------------------------------------------------
+# ReplaceOperatorDialog
+# ---------------------------------------------------------------------------
+class ReplaceOperatorDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.root = _workspace_tempdir()
+        cls.addClassCleanup(_cleanup_tempdir, cls.root)
+        _build_frame_fixture(cls.root)
+        cls.registry = OperatorRegistry.build([cls.root], include_builtin=False)
+
+    def setUp(self) -> None:
+        self.dialog = ReplaceOperatorDialog(self.registry)
+
+    def tearDown(self) -> None:
+        self.dialog.deleteLater()
+
+    def test_lists_non_frame_operators_by_category(self) -> None:
+        self.assertEqual(
+            self.dialog.category_names(),
+            [FRAME_CATEGORY, "基础调整", "滤波与平滑"],
+        )
+        self.assertEqual(
+            self.dialog.operator_ids(),
+            ["test.user", "test.brightness", "test.blur"],
+        )
+        self.assertNotIn("frame.demo", self.dialog.operator_ids())
+        self.assertIsNone(self.dialog.item_for("frame.demo"))
+        self.assertEqual(self.dialog.category_names()[0], FRAME_CATEGORY)
+
+    def test_search_filter_and_refresh(self) -> None:
+        self.dialog.show()
+        QApplication.processEvents()
+        self.assertEqual(self.dialog.filter("高斯"), 1)
+        self.assertEqual(self.dialog.matched_operator_ids(), ["test.blur"])
+        self.assertFalse(self.dialog.empty_label.isVisible())
+
+        self.assertEqual(self.dialog.filter("不存在的关键字"), 0)
+        self.assertEqual(self.dialog.matched_operator_ids(), [])
+        self.assertTrue(self.dialog.empty_label.isVisible())
+
+        self.assertEqual(self.dialog.filter(""), 3)
+        self.assertEqual(
+            set(self.dialog.matched_operator_ids()),
+            {"test.user", "test.brightness", "test.blur"},
+        )
+
+        # refresh 后重新应用当前搜索关键字。
+        self.dialog.filter("模糊")
+        self.dialog.refresh()
+        self.assertEqual(self.dialog.matched_operator_ids(), ["test.blur"])
+        self.dialog.filter("")
+        self.assertEqual(len(self.dialog.matched_operator_ids()), 3)
+
+    def test_selected_operator_id_on_accept_and_reject(self) -> None:
+        self.assertIsNone(self.dialog.selected_op_id())
+        self.assertFalse(self.dialog.ok_button.isEnabled())
+        self.assertFalse(self.dialog.select_operator("frame.demo"))
+
+        self.assertTrue(self.dialog.select_operator("test.blur"))
+        self.assertEqual(self.dialog.selected_op_id(), "test.blur")
+        self.assertTrue(self.dialog.ok_button.isEnabled())
+        self.dialog.accept()
+        self.assertEqual(self.dialog.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(self.dialog.selected_op_id(), "test.blur")
+
+        other = ReplaceOperatorDialog(self.registry)
+        self.addCleanup(other.deleteLater)
+        self.assertTrue(other.select_operator("test.user"))
+        other.reject()
+        self.assertEqual(other.result(), QDialog.DialogCode.Rejected)
+        self.assertIsNone(other.selected_op_id())
+
+    def test_double_click_accepts_selection(self) -> None:
+        item = self.dialog.item_for("test.blur")
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.dialog.tree.itemDoubleClicked.emit(item, 0)
+        self.assertEqual(self.dialog.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(self.dialog.selected_op_id(), "test.blur")
+
+    def test_current_frame_operator_allowed_in_list(self) -> None:
+        dialog = ReplaceOperatorDialog(self.registry, current_op_id="frame.demo")
+        self.addCleanup(dialog.deleteLater)
+        self.assertIn("frame.demo", dialog.operator_ids())
+        self.assertIn("当前算子", dialog.current_label.text())
+        current_item = dialog.item_for("frame.demo")
+        self.assertIsNotNone(current_item)
+        assert current_item is not None
+        self.assertEqual(current_item.text(1), "当前")
+
+    def test_exec_returns_selected_or_none(self) -> None:
+        self.assertTrue(self.dialog.select_operator("test.blur"))
+        QTimer.singleShot(0, self.dialog.accept)
+        result = self.dialog.exec()
+        self.assertEqual(result, QDialog.DialogCode.Accepted)
+        self.assertEqual(self.dialog.selected_op_id(), "test.blur")
+
+        rejected = ReplaceOperatorDialog(self.registry)
+        self.addCleanup(rejected.deleteLater)
+        QTimer.singleShot(0, rejected.reject)
+        result = rejected.exec()
+        self.assertEqual(result, QDialog.DialogCode.Rejected)
+        self.assertIsNone(rejected.selected_op_id())
 
 
 # ---------------------------------------------------------------------------

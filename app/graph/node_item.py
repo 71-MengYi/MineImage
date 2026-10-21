@@ -150,6 +150,16 @@ class NodeItem(QGraphicsItem):
         return self._thumb_pixmap
 
     @property
+    def is_stale(self) -> bool:
+        """节点引用的算子未注册 / 已失效。"""
+
+        return (
+            self.spec is None
+            and not self.node.is_source
+            and getattr(self.node, "frame", None) is None
+        )
+
+    @property
     def input_ports(self) -> dict[str, PortItem]:
         return self._input_ports
 
@@ -449,6 +459,8 @@ class NodeItem(QGraphicsItem):
             return "错误", QColor("#dc2626")
         if self.node.is_source:
             return "原始图像", QColor("#0f766e")
+        if self.is_stale:
+            return "失效", QColor("#b45309")
         return None
 
     def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget: QWidget | None = None) -> None:  # noqa: N802

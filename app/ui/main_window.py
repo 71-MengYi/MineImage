@@ -172,6 +172,7 @@ class MainWindow(QMainWindow):
             "重做", self.redo, "Ctrl+Y", QStyle.StandardPixmap.SP_ArrowForward
         )
         self.act_delete = self._action("删除选中", self.delete_selected, "Delete")
+        self.act_add_frame = self._action("添加流程框", self.add_frame, "Ctrl+Shift+F")
 
         self.act_compare_single = self._action("单视图", lambda: self._set_compare_mode("single"), "Ctrl+1", checkable=True)
         self.act_compare_side = self._action(
@@ -308,6 +309,8 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.act_redo)
         edit_menu.addSeparator()
         edit_menu.addAction(self.act_delete)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.act_add_frame)
 
         view_menu = menu.addMenu("视图(&V)")
         view_menu.addAction(self.act_compare_single)
@@ -405,6 +408,7 @@ class MainWindow(QMainWindow):
         widget.status_info.connect(lambda info, w=widget: self._on_status_info(w, info))
         widget.status_message.connect(lambda msg, w=widget: self._on_workspace_message(w, msg))
         widget.library.refresh_requested.connect(self.refresh_operators)
+        widget.operator_refresh_requested.connect(self.refresh_operators)
         widget.undo_stack.canUndoChanged.connect(self._refresh_edit_actions)
         widget.undo_stack.canRedoChanged.connect(self._refresh_edit_actions)
         widget.graph_view.node_created.connect(lambda _id: self._refresh_edit_actions())
@@ -703,6 +707,12 @@ class MainWindow(QMainWindow):
         widget = self._active_workspace()
         if widget is not None:
             widget.graph_view.delete_selected()
+
+    def add_frame(self) -> None:
+        """在当前画布视口中心添加一个流程框。"""
+        widget = self._active_workspace()
+        if widget is not None:
+            widget.graph_view.add_frame_at()
 
     def auto_layout(self) -> None:
         widget = self._active_workspace()

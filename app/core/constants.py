@@ -13,6 +13,10 @@ MIME_IMAGE_PATHS = "application/x-mineimage-image-paths"
 
 #: 源图像节点的 pseudo operator id
 SOURCE_OP_ID = "__source__"
+#: 流程框节点的 pseudo operator id（框的端口/内部图保存在 NodeModel.frame 中）
+FRAME_OP_ID = "__frame__"
+#: 由流程框保存的自定义算子所属一级分类（固定显示在算子库最顶部）
+FRAME_CATEGORY = "用户自定义算子"
 
 #: 工程文件扩展名
 PROJECT_EXTENSION = ".mi"
@@ -25,6 +29,7 @@ IMAGE_FILTER = (
 
 #: 一级分类的默认顺序；扫描到的未知分类排在后面（按名称排序）。
 CATEGORY_ORDER = (
+    FRAME_CATEGORY,
     "基础调整",
     "滤波与平滑",
     "阈值与分割",

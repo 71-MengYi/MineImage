@@ -101,6 +101,8 @@ class GraphScene(QGraphicsScene):
         best: PortItem | None = None
         best_distance = 16.0
         for port in self._view.port_items(is_input=True):
+            if not port.node_item.isVisible():
+                continue
             if port.node_item.node_id == source.node_item.node_id:
                 continue
             if not self._view.ports_compatible(
@@ -120,6 +122,8 @@ class GraphScene(QGraphicsScene):
         best: PortItem | None = None
         best_distance = 12.0
         for port in self._view.port_items(is_input=is_input):
+            if not port.node_item.isVisible():
+                continue
             distance = QLineF(port.center_scene_pos(), scene_pos).length()
             if distance <= best_distance:
                 best = port

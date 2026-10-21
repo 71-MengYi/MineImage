@@ -31,8 +31,14 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QApplication, QFrame, QGraphicsItem, QGraphicsView, QInputDialog, QMenu
 
 from app.config import AppSettings
-from app.core.constants import MIME_IMAGE_PATHS, MIME_OPERATOR, SINGLE_CLICK_DELAY_MS
+from app.core.constants import (
+    FRAME_OP_ID,
+    MIME_IMAGE_PATHS,
+    MIME_OPERATOR,
+    SINGLE_CLICK_DELAY_MS,
+)
 from app.core.data_types import DataType
+from app.core.frame import INVALID_LEVEL, FrameModel
 from app.core.model import ConnectionModel, GraphError, GraphModel, NodeModel, WorkspaceModel, new_id
 from app.graph.collapse_item import CollapseBadgeItem
 from app.graph.commands import (
@@ -44,14 +50,84 @@ from app.graph.commands import (
     RemoveNodeCommand,
     RemoveNodeTreeCommand,
     RenameNodeCommand,
+    ReplaceOperatorCommand,
+    SetParentFrameCommand,
 )
 from app.graph.connection_item import ConnectionItem
+from app.graph.frame_item import (
+    DEFAULT_FRAME_HEIGHT,
+    DEFAULT_FRAME_WIDTH,
+    FRAME_PADDING_BOTTOM,
+    FRAME_PADDING_TOP,
+    FRAME_PADDING_X,
+    FrameItem,
+)
 from app.graph.layout import compute_layout
 from app.graph.node_item import NodeItem
 from app.graph.port_item import PortItem
 from app.graph.scene import GraphScene
 from app.operators.loader import OperatorRegistry
 from app.operators.spec import OperatorSpec, PortSpec, connection_error, param_defaults, port_types_compatible
+
+# 流程框算子模块 / 替换对话框由其它协作方实现；延迟导入保证画布可独立加载。
+try:  # pragma: no cover - 集成后始终可用
+    from app.operators.frame import (
+        FrameOperator,
+        is_frame_operator,
+        materialize_frame_operator,
+        save_frame_operator,
+    )
+except Exception:  # noqa: BLE001
+    FrameOperator = None  # type: ignore[assignment]
+    is_frame_operator = None  # type: ignore[assignment]
+    materialize_frame_operator = None  # type: ignore[assignment]
+    save_frame_operator = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - shell-ui 尚未完成时保持可导入
+    from app.ui.replace_operator import ReplaceOperatorDialog
+except Exception:  # noqa: BLE001
+    ReplaceOperatorDialog = None  # type: ignore[assignment]
+
+
+def _ensure_frame_api() -> bool:
+    """按需加载流程框算子接口（测试环境可提前 patch 模块级函数）。"""
+
+    global FrameOperator, is_frame_operator, materialize_frame_operator, save_frame_operator
+    if all(
+        item is not None
+        for item in (is_frame_operator, materialize_frame_operator, save_frame_operator)
+    ):
+        return True
+    try:
+        from app.operators.frame import (
+            FrameOperator as _FrameOperator,
+            is_frame_operator as _is_frame_operator,
+            materialize_frame_operator as _materialize_frame_operator,
+            save_frame_operator as _save_frame_operator,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    if FrameOperator is None:
+        FrameOperator = _FrameOperator
+    if is_frame_operator is None:
+        is_frame_operator = _is_frame_operator
+    if materialize_frame_operator is None:
+        materialize_frame_operator = _materialize_frame_operator
+    if save_frame_operator is None:
+        save_frame_operator = _save_frame_operator
+    return True
+
+
+def _ensure_replace_dialog():
+    global ReplaceOperatorDialog
+    if ReplaceOperatorDialog is not None:
+        return ReplaceOperatorDialog
+    try:
+        from app.ui.replace_operator import ReplaceOperatorDialog as _ReplaceOperatorDialog
+    except Exception:  # noqa: BLE001
+        return None
+    ReplaceOperatorDialog = _ReplaceOperatorDialog
+    return ReplaceOperatorDialog
 
 _IMAGE_SUFFIXES = {
     ".png",
@@ -119,6 +195,7 @@ class GraphView(QGraphicsView):
     node_removed = Signal(str)
     images_dropped = Signal(list)  # list[str]，拖入的图像路径
     status_message = Signal(str)
+    operators_changed = Signal()  # 保存新的自定义流程框算子后通知主窗口刷新算子库
 
     def __init__(
         self,
@@ -155,6 +232,12 @@ class GraphView(QGraphicsView):
         self._paste_count = 0
         self._zoom_min = 0.15
         self._zoom_max = 3.0
+        #: 节点条目创建时的 (op_id, 是否流程框) 签名，用于替换算子后重建条目。
+        self._item_signatures: dict[str, tuple[str, bool]] = {}
+        #: 拖动流程框时，本帧上一次的条目位置（用于实时平移子节点）。
+        self._frame_live_last: dict[str, QPointF] = {}
+        self._suppress_move_events = False
+        self._syncing_frame_geometry = False
 
         self._scene = GraphScene(self)
         self.setScene(self._scene)
@@ -192,6 +275,8 @@ class GraphView(QGraphicsView):
         self.graph.node_changed.connect(self._on_node_changed)
         self.graph.connection_added.connect(self._on_connection_added)
         self.graph.connection_removed.connect(self._on_connection_removed)
+        self.graph.set_port_type_resolver(self._resolve_port_type)
+        self._undo_stack.indexChanged.connect(self._on_undo_stack_changed)
 
         self.refresh_all()
         self._update_scene_rect()
@@ -239,6 +324,11 @@ class GraphView(QGraphicsView):
         for node_id in list(selected):
             if node_id in self._collapsed:
                 selected.update(self.graph.descendants(node_id))
+        # 复制流程框时连同全部后代一起复制（parent_frame 在粘贴时重映射）。
+        for node_id in list(selected):
+            node = self.graph.nodes.get(node_id)
+            if node is not None and getattr(node, "frame", None) is not None:
+                selected.update(child.id for child in self.graph.frame_subtree(node_id))
         node_ids = [node.id for node in self.graph.nodes.values() if node.id in selected]
         payload = {
             "kind": NODE_CLIPBOARD_KIND,
@@ -292,21 +382,41 @@ class GraphView(QGraphicsView):
         dx = origin.x() - min_x
         dy = origin.y() - min_y
 
-        id_map: dict[str, str] = {}
+        id_map: dict[str, str] = {node.id: new_id("n") for node in source_nodes}
+        clones: list[NodeModel] = []
+        for node in source_nodes:
+            clone = NodeModel.from_dict(node.to_dict())
+            clone.id = id_map[node.id]
+            clone.pos = (round(node.pos[0] + dx, 2), round(node.pos[1] + dy, 2))
+            old_parent = node.parent_frame
+            if node.is_source:
+                clone.parent_frame = None
+            elif old_parent is not None and old_parent in id_map:
+                clone.parent_frame = id_map[old_parent]
+            else:
+                # 父流程框没有一起复制：粘贴为顶层，避免错误挂到原框。
+                clone.parent_frame = None
+            clones.append(clone)
+        cloned_by_id = {clone.id: clone for clone in clones}
+
+        def _clone_depth(clone: NodeModel) -> int:
+            depth = 0
+            parent = clone.parent_frame
+            seen = {clone.id}
+            while parent is not None and parent not in seen:
+                seen.add(parent)
+                depth += 1
+                parent_model = cloned_by_id.get(parent)
+                if parent_model is None:
+                    break
+                parent = parent_model.parent_frame
+            return depth
+
+        clones.sort(key=_clone_depth)
         new_ids: list[str] = []
         self._undo_stack.beginMacro("粘贴节点")
         try:
-            for node in source_nodes:
-                clone = NodeModel(
-                    id=new_id("n"),
-                    op_id=node.op_id,
-                    title=node.title,
-                    pos=(round(node.pos[0] + dx, 2), round(node.pos[1] + dy, 2)),
-                    params=copy.deepcopy(node.params),
-                    source_image_id=node.source_image_id,
-                    source_path=node.source_path,
-                )
-                id_map[node.id] = clone.id
+            for clone in clones:
                 new_ids.append(clone.id)
                 self._undo_stack.push(AddNodeCommand(self.graph, clone))
 
@@ -329,6 +439,7 @@ class GraphView(QGraphicsView):
         finally:
             self._undo_stack.endMacro()
 
+        self._sync_frame_geometries()
         self._select_nodes(new_ids, new_ids[-1])
         self.node_created.emit(new_ids[-1])
         message = f"已粘贴 {len(new_ids)} 个节点"
@@ -414,13 +525,16 @@ class GraphView(QGraphicsView):
         self._update_scene_rect()
 
     def add_operator_at(self, op_id: str, scene_pos: QPointF | None = None) -> str | None:
+        if scene_pos is None:
+            scene_pos = self.mapToScene(self.viewport().rect().center())
+        scene_pos = QPointF(scene_pos)
+        # 自定义流程框算子：展开成框 + 内部节点 + 连线，整次一步撤销。
+        if self._is_frame_operator_id(op_id):
+            return self._add_frame_operator_at(op_id, scene_pos)
         spec = self._registry.spec(op_id)
         if spec is None:
             self.status_message.emit(f"未找到算子：{op_id}")
             return None
-        if scene_pos is None:
-            scene_pos = self.mapToScene(self.viewport().rect().center())
-        scene_pos = QPointF(scene_pos)
 
         target = self._drop_target_at(scene_pos, spec)
         if target is not None:
@@ -445,14 +559,20 @@ class GraphView(QGraphicsView):
             target_item = target.port.node_item
             target_rect = QRectF(target_item.pos(), target_item.size())
             fallback_pos = QPointF(target_rect.right() + 32.0, target_rect.top())
+        if target is not None and target.port is not None:
+            parent_frame = self._scope_for_port_target(target.port, target.kind)
+        else:
+            parent_frame = self.frame_at(fallback_pos)
         node = NodeModel(
             id=new_id("n"),
             op_id=op_id,
             title=spec.name,
             pos=(fallback_pos.x(), fallback_pos.y()),
             params=param_defaults(spec),
+            parent_frame=parent_frame,
         )
         self._undo_stack.push(AddNodeCommand(self.graph, node))
+        self._sync_frame_geometries()
         self.set_selected_node(node.id)
         self.node_created.emit(node.id)
         self.status_message.emit(f"已添加节点“{spec.name}”")
@@ -493,6 +613,13 @@ class GraphView(QGraphicsView):
             return None
 
         scene_pos = QPointF(scene_pos)
+        parent_frame = self.frame_at(scene_pos)
+        source_level = self.graph.port_level(src_node_id, src_port, "src")
+        if source_level != INVALID_LEVEL and source_level != parent_frame:
+            self.status_message.emit(
+                "只能在同一流程框层级内连接；请通过流程框的输入 / 输出端口连接跨框数据"
+            )
+            return None
         node = NodeModel(
             id=new_id("n"),
             op_id=OUTPUT_NODE_OP_ID,
@@ -500,6 +627,7 @@ class GraphView(QGraphicsView):
             # 输入端口在节点上边缘且单端口居中：让落点正好落在输入端口上。
             pos=(scene_pos.x() - NodeItem.WIDTH / 2.0, scene_pos.y()),
             params=param_defaults(spec),
+            parent_frame=parent_frame,
         )
         self._undo_stack.beginMacro("添加输出节点并连接")
         try:
@@ -513,6 +641,7 @@ class GraphView(QGraphicsView):
             return None
         self._undo_stack.endMacro()
 
+        self._sync_frame_geometries()
         self._update_scene_rect()
         self._select_nodes([node.id], node.id)
         self.status_message.emit(
@@ -527,9 +656,469 @@ class GraphView(QGraphicsView):
             self._create_node_item(node)
         for connection in list(self.graph.connections.values()):
             self._create_connection_item(connection)
+        self._sync_frame_geometries()
         self._refresh_collapse_state()
         if selected and selected in self._nodes and self._nodes[selected].isVisible():
             self.set_selected_node(selected)
+
+    # ------------------------------------------------------------ 流程框基础设施
+    def is_operator_registered(self, op_id: str | None) -> bool:
+        """算子 id 是否已注册（失效节点 / 缺失依赖判断用）。"""
+
+        if not op_id:
+            return False
+        try:
+            return self._registry.spec(op_id) is not None
+        except Exception:  # noqa: BLE001 - 最小化测试注册表
+            return False
+
+    def _resolve_port_type(self, node_id: str, port_key: str, is_input: bool) -> DataType | None:
+        """注入 GraphModel 的端口类型解析器：由注册表 + 流程框端口决定类型。"""
+
+        spec = self.port_spec(node_id, port_key, is_input)
+        if spec is None or spec.any_type or spec.data_type is None:
+            return None
+        return spec.data_type
+
+    def _frame_nodes(self) -> list[NodeModel]:
+        return [node for node in self.graph.nodes.values() if getattr(node, "frame", None) is not None]
+
+    def _frame_depth(self, frame_id: str) -> int:
+        depth = 0
+        current = self.graph.nodes.get(frame_id)
+        seen: set[str] = set()
+        while current is not None and current.parent_frame:
+            if current.parent_frame in seen:
+                break
+            seen.add(current.parent_frame)
+            parent = self.graph.nodes.get(current.parent_frame)
+            if parent is None or getattr(parent, "frame", None) is None:
+                break
+            depth += 1
+            current = parent
+        return depth
+
+    def _frame_ancestors(self, node_id: str) -> list[str]:
+        ancestors: list[str] = []
+        current = self.graph.nodes.get(node_id)
+        seen: set[str] = set()
+        while current is not None and current.parent_frame:
+            parent_id = current.parent_frame
+            if parent_id in seen:
+                break
+            seen.add(parent_id)
+            parent = self.graph.nodes.get(parent_id)
+            if parent is None:
+                break
+            ancestors.append(parent_id)
+            current = parent
+        return ancestors
+
+    def _frame_item_rect(self, frame_id: str) -> QRectF | None:
+        item = self._nodes.get(frame_id)
+        if item is None:
+            return None
+        return QRectF(item.pos(), item.size())
+
+    def frame_at(self, scene_pos: QPointF, *, exclude: Iterable[str] = ()) -> str | None:
+        """返回场景坐标命中的最深流程框 id（支持嵌套；忽略排除项）。"""
+
+        excluded = set(exclude)
+        best: str | None = None
+        best_depth = -1
+        for node in self._frame_nodes():
+            if node.id in excluded:
+                continue
+            rect = self._frame_item_rect(node.id)
+            if rect is None or not rect.contains(scene_pos):
+                continue
+            depth = self._frame_depth(node.id)
+            if depth > best_depth:
+                best = node.id
+                best_depth = depth
+        return best
+
+    def _scope_for_port_target(self, port: PortItem, kind: str) -> str | None:
+        """库拖拽吸附到端口时，新节点应处的流程框层级。"""
+
+        role = "dst" if kind == "input" else "src"
+        level = self.graph.port_level(port.node_item.node_id, port.key, role)
+        if level is None or level == INVALID_LEVEL:
+            return None
+        return level
+
+    def _sync_frame_geometries(self) -> None:
+        """按直接子节点包围盒反推流程框位置 / 尺寸（不写入撤销栈）。"""
+
+        if self._syncing_frame_geometry:
+            return
+        self._syncing_frame_geometry = True
+        self._suppress_move_events = True
+        try:
+            frames = self._frame_nodes()
+            frames.sort(key=lambda node: self._frame_depth(node.id), reverse=True)
+            for frame_node in frames:
+                item = self._nodes.get(frame_node.id)
+                if not isinstance(item, FrameItem):
+                    continue
+                children = self.graph.direct_children(frame_node.id)
+                if not children:
+                    item.set_frame_geometry(DEFAULT_FRAME_WIDTH, DEFAULT_FRAME_HEIGHT)
+                    continue
+                content = QRectF()
+                for child in children:
+                    child_item = self._nodes.get(child.id)
+                    if child_item is None:
+                        continue
+                    child_rect = QRectF(child_item.pos(), child_item.size())
+                    content = child_rect if content.isNull() else content.united(child_rect)
+                if content.isNull():
+                    item.set_frame_geometry(DEFAULT_FRAME_WIDTH, DEFAULT_FRAME_HEIGHT)
+                    continue
+                width = content.width() + 2.0 * FRAME_PADDING_X
+                height = content.height() + FRAME_PADDING_TOP + FRAME_PADDING_BOTTOM
+                new_pos = (
+                    round(content.left() - FRAME_PADDING_X, 2),
+                    round(content.top() - FRAME_PADDING_TOP, 2),
+                )
+                if (
+                    abs(frame_node.pos[0] - new_pos[0]) > 0.01
+                    or abs(frame_node.pos[1] - new_pos[1]) > 0.01
+                ):
+                    self.graph.set_node_pos(frame_node.id, new_pos, touch=False)
+                item.sync_position(new_pos)
+                item.set_frame_geometry(width, height)
+                self._update_connections_for(frame_node.id)
+                self._position_collapse_badge(frame_node.id)
+        finally:
+            self._suppress_move_events = False
+            self._syncing_frame_geometry = False
+        self._update_scene_rect()
+
+    def _refresh_frame_geometry(self, frame_id: str | None = None) -> None:
+        self._sync_frame_geometries()
+
+    def on_frame_item_geometry_changed(self, item: FrameItem) -> None:
+        self._update_connections_for(item.node_id)
+        self._position_collapse_badge(item.node_id)
+
+    def _on_undo_stack_changed(self, _index: int = 0) -> None:
+        # 撤销 / 重做后重新按子节点反推框几何，保证模型与条目一致。
+        self._sync_frame_geometries()
+
+    # ------------------------------------------------------------ 新建流程框
+    def add_frame_at(
+        self,
+        scene_pos: QPointF | None = None,
+        *,
+        parent_frame: str | None = None,
+        title: str = "流程框",
+    ) -> str:
+        """在场景坐标中心位置新建一个流程框（可指定父框实现嵌套）。"""
+
+        if scene_pos is None:
+            scene_pos = self.mapToScene(self.viewport().rect().center())
+        scene_pos = QPointF(scene_pos)
+        if parent_frame is not None:
+            parent = self.graph.nodes.get(parent_frame)
+            if parent is None or getattr(parent, "frame", None) is None:
+                self.status_message.emit("父流程框不存在，已在顶层创建流程框")
+                parent_frame = None
+        node = NodeModel(
+            id=new_id("n"),
+            op_id=FRAME_OP_ID,
+            title=str(title or "流程框"),
+            pos=(
+                round(scene_pos.x() - DEFAULT_FRAME_WIDTH / 2.0, 2),
+                round(scene_pos.y() - DEFAULT_FRAME_HEIGHT / 2.0, 2),
+            ),
+            frame=FrameModel.create_default(),
+            parent_frame=parent_frame,
+        )
+        try:
+            self._undo_stack.push(AddNodeCommand(self.graph, node))
+        except GraphError as exc:
+            self.status_message.emit(f"添加流程框失败：{exc}")
+            return ""
+        self._sync_frame_geometries()
+        self.set_selected_node(node.id)
+        self.node_created.emit(node.id)
+        self.status_message.emit(f"已添加流程框“{node.display_title()}”")
+        return node.id
+
+    def _is_frame_operator_id(self, op_id: str) -> bool:
+        if not _ensure_frame_api() or is_frame_operator is None:
+            return False
+        candidates: list[Any] = []
+        getter = getattr(self._registry, "get", None)
+        if callable(getter):
+            try:
+                candidates.append(getter(op_id))
+            except Exception:  # noqa: BLE001
+                pass
+        entry_getter = getattr(self._registry, "entry", None)
+        if callable(entry_getter):
+            try:
+                entry = entry_getter(op_id)
+                candidates.append(getattr(entry, "operator", entry))
+            except Exception:  # noqa: BLE001
+                pass
+        candidates.append(self._registry.spec(op_id))
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                if is_frame_operator(candidate):
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    def _add_frame_operator_at(self, op_id: str, scene_pos: QPointF) -> str | None:
+        """从算子库拖入自定义流程框算子：一步撤销生成框 + 内部节点 + 连线。"""
+
+        if not _ensure_frame_api() or materialize_frame_operator is None:
+            self.status_message.emit("当前环境未提供流程框算子展开接口")
+            return None
+        parent_frame = self.frame_at(scene_pos)
+        try:
+            materialization = materialize_frame_operator(
+                self._registry,
+                op_id,
+                pos=(float(scene_pos.x()), float(scene_pos.y())),
+                parent_frame=parent_frame,
+            )
+        except Exception as exc:  # noqa: BLE001 - 定义错误需要提示给用户
+            self.status_message.emit(f"展开流程框算子失败：{exc}")
+            return None
+        nodes = list(materialization.nodes)
+        connections = list(materialization.connections)
+        by_id = {node.id: node for node in nodes}
+        nodeset = set(by_id)
+
+        def local_depth(node: NodeModel) -> int:
+            depth = 0
+            parent = node.parent_frame
+            seen = {node.id}
+            while parent in nodeset and parent not in seen:
+                seen.add(parent)
+                depth += 1
+                parent_model = by_id.get(parent)
+                if parent_model is None:
+                    break
+                parent = parent_model.parent_frame
+            return depth
+
+        ordered = sorted(nodes, key=local_depth)
+        self._undo_stack.beginMacro("添加流程框算子")
+        try:
+            for node in ordered:
+                self._undo_stack.push(AddNodeCommand(self.graph, node))
+            for connection in connections:
+                self._undo_stack.push(
+                    AddConnectionCommand(
+                        self.graph,
+                        connection.src_node,
+                        connection.src_port,
+                        connection.dst_node,
+                        connection.dst_port,
+                    )
+                )
+        finally:
+            self._undo_stack.endMacro()
+        frame_id = materialization.frame_node.id
+        self._sync_frame_geometries()
+        if frame_id in self._nodes:
+            self.set_selected_node(frame_id)
+        self.node_created.emit(frame_id)
+        self.status_message.emit(
+            f"已添加流程框算子“{materialization.frame_node.display_title()}”"
+        )
+        return frame_id
+
+    # -------------------------------------------------------- 保存为自定义算子
+    def save_frame_as_operator(self, frame_id: str) -> None:
+        """右键菜单：把流程框保存为自定义算子。"""
+
+        node = self.graph.nodes.get(frame_id)
+        if node is None or not node.is_frame or node.frame is None:
+            self.status_message.emit("只能把流程框保存为新算子")
+            return
+        sources = [
+            item
+            for item in [node, *self.graph.frame_subtree(frame_id)]
+            if getattr(item, "is_source", False)
+        ]
+        if sources:
+            self.status_message.emit(
+                "流程框内包含原始图像节点，无法保存为新算子；请先把源图像节点移出流程框"
+            )
+            return
+        if not _ensure_frame_api() or save_frame_operator is None:
+            self.status_message.emit("当前环境未提供流程框保存接口")
+            return
+        name, ok = QInputDialog.getText(
+            self,
+            "保存为新算子",
+            "算子名称：",
+            text=node.display_title(),
+        )
+        if not ok:
+            return
+        name = str(name or "").strip()
+        if not name:
+            self.status_message.emit("算子名称不能为空")
+            return
+        try:
+            saved = save_frame_operator(self.graph, frame_id, name, registry=self._registry)
+        except Exception as exc:  # noqa: BLE001 - 保存失败需要提示给用户
+            self.status_message.emit(f"保存为新算子失败：{exc}")
+            return
+        self.status_message.emit(f"已保存算子“{saved.name}”（{saved.op_id}）")
+        self.operators_changed.emit()
+
+    # ------------------------------------------------------------ 替换失效算子
+    def replace_operator(self, node_id: str, op_id: str) -> bool:
+        """把失效 / 占位节点替换成普通算子；尽量保留可复用连线，一步撤销。"""
+
+        node = self.graph.nodes.get(node_id)
+        if node is None:
+            return False
+        spec = self._registry.spec(op_id)
+        if spec is None:
+            self.status_message.emit(f"未找到算子：{op_id}")
+            return False
+        if self._is_frame_operator_id(op_id):
+            self.status_message.emit("流程框算子不能用于替换节点，请从算子库直接拖入画布")
+            return False
+
+        old_connections = [
+            connection
+            for connection in self.graph.connections.values()
+            if node_id in (connection.src_node, connection.dst_node)
+        ]
+        reusable: list[tuple[str, str, str, str]] = []
+        used_inputs: set[str] = set()
+        for connection in old_connections:
+            if connection.dst_node == node_id:
+                source_spec = self.port_spec(connection.src_node, connection.src_port, False)
+                for port in spec.inputs:
+                    if port.key in used_inputs:
+                        continue
+                    if (
+                        source_spec is None
+                        or source_spec.any_type
+                        or port.any_type
+                        or port_types_compatible(source_spec, port)
+                    ):
+                        reusable.append(
+                            (connection.src_node, connection.src_port, node_id, port.key)
+                        )
+                        used_inputs.add(port.key)
+                        break
+            elif connection.src_node == node_id:
+                target_spec = self.port_spec(connection.dst_node, connection.dst_port, True)
+                for port in spec.outputs:
+                    if (
+                        target_spec is None
+                        or target_spec.any_type
+                        or port.any_type
+                        or port_types_compatible(port, target_spec)
+                    ):
+                        reusable.append(
+                            (node_id, port.key, connection.dst_node, connection.dst_port)
+                        )
+                        break
+        command = ReplaceOperatorCommand(
+            self.graph,
+            node_id,
+            op_id=op_id,
+            title=spec.name,
+            params=param_defaults(spec),
+            reusable_connections=reusable,
+        )
+        self._undo_stack.push(command)
+        self._sync_frame_geometries()
+        self.status_message.emit(f"已将节点替换为“{spec.name}”")
+        return True
+
+    def _prompt_replace_operator(self, node_id: str) -> None:
+        node = self.graph.nodes.get(node_id)
+        if node is None:
+            return
+        dialog_cls = _ensure_replace_dialog()
+        if dialog_cls is None:
+            self.status_message.emit("替换算子对话框不可用")
+            return
+        try:
+            dialog = dialog_cls(self._registry, current_op_id=node.op_id, parent=self.window())
+        except TypeError:
+            dialog = dialog_cls(self._registry, current_op_id=node.op_id)
+        if not dialog.exec():
+            return
+        try:
+            selected = dialog.selected_op_id()
+        except Exception:  # noqa: BLE001
+            selected = None
+        if selected:
+            self.replace_operator(node_id, str(selected))
+
+    def _recreate_node_item(self, node_id: str) -> None:
+        node = self.graph.nodes.get(node_id)
+        old = self._nodes.pop(node_id, None)
+        was_selected = bool(old is not None and old.isSelected())
+        if old is not None and old.scene() is self._scene:
+            self._scene.removeItem(old)
+        self._item_signatures.pop(node_id, None)
+        if node is None:
+            return
+        item = self._create_node_item(node)
+        if was_selected:
+            self._syncing_selection = True
+            try:
+                item.setSelected(True)
+            finally:
+                self._syncing_selection = False
+        for connection in self._connections.values():
+            if node_id in (connection.src_node, connection.dst_node):
+                connection.update_path()
+        self._update_connections_for(node_id)
+
+    # ------------------------------------------------------ 流程框拖动实时联动
+    def _move_frame_descendants_live(self, item: NodeItem) -> None:
+        start = self._move_start.get(item.node_id)
+        if start is None or self._suppress_move_events:
+            return
+        last = self._frame_live_last.get(item.node_id, start)
+        delta = item.pos() - last
+        if abs(delta.x()) < 1e-9 and abs(delta.y()) < 1e-9:
+            return
+        self._frame_live_last[item.node_id] = QPointF(item.pos())
+        self._suppress_move_events = True
+        try:
+            for child in self.graph.frame_subtree(item.node_id):
+                child_item = self._nodes.get(child.id)
+                if child_item is None:
+                    continue
+                child_item.setPos(child_item.pos() + delta)
+                for connection in self._connections.values():
+                    if child.id in (connection.src_node, connection.dst_node):
+                        connection.update_path()
+                self._position_collapse_badge(child.id)
+        finally:
+            self._suppress_move_events = False
+        self._update_scene_rect()
+
+    def move_out_of_frame(self, node_id: str) -> None:
+        """把框内节点移出到顶层（保留位置与连线，一步撤销）。"""
+
+        node = self.graph.nodes.get(node_id)
+        if node is None or not node.parent_frame:
+            return
+        old_parent = node.parent_frame
+        self._undo_stack.push(SetParentFrameCommand(self.graph, node_id, old_parent, None))
+        self._sync_frame_geometries()
+        self.status_message.emit(f"已把“{node.display_title()}”移出流程框")
 
     # ------------------------------------------------------------ 折叠 / 展开
     def _branch_node_ids(self) -> set[str]:
@@ -672,6 +1261,24 @@ class GraphView(QGraphicsView):
         for node_id in selected_ids:
             if node_id in self._collapsed:
                 node_ids.update(self.graph.descendants(node_id))
+        # 删除流程框时连同全部后代一起删除（一步撤销）。
+        for node_id in selected_ids:
+            node = self.graph.nodes.get(node_id)
+            if node is not None and getattr(node, "frame", None) is not None:
+                node_ids.update(child.id for child in self.graph.frame_subtree(node_id))
+
+        def _removal_depth(nid: str) -> int:
+            depth = 0
+            current = self.graph.nodes.get(nid)
+            seen: set[str] = set()
+            while current is not None and current.parent_frame and current.parent_frame not in seen:
+                seen.add(current.parent_frame)
+                depth += 1
+                current = self.graph.nodes.get(current.parent_frame)
+            return depth
+
+        # 先删最深的后代、最后删框本身；撤销时框先恢复，子节点才能挂回去。
+        ordered_deletes = sorted(node_ids, key=_removal_depth, reverse=True)
         connections_to_remove: list[ConnectionModel] = []
         for item in connection_items:
             connection = self.graph.connections.get(item.connection_id)
@@ -683,7 +1290,7 @@ class GraphView(QGraphicsView):
 
         self._undo_stack.beginMacro("删除选中对象")
         try:
-            for node_id in node_ids:
+            for node_id in ordered_deletes:
                 if node_id in self.graph.nodes:
                     self._undo_stack.push(RemoveNodeCommand(self.graph, node_id))
             for connection in connections_to_remove:
@@ -692,12 +1299,13 @@ class GraphView(QGraphicsView):
         finally:
             self._undo_stack.endMacro()
 
+        self._sync_frame_geometries()
         hidden_extra = len(node_ids) - len(selected_ids)
         self._update_scene_rect()
         self._selection_timer.stop()
         self.selection_changed.emit(self.selected_node_id() or "")
         if hidden_extra:
-            self.status_message.emit(f"已删除选中对象（含 {hidden_extra} 个折叠的下游节点）")
+            self.status_message.emit(f"已删除选中对象（含 {hidden_extra} 个关联节点）")
         else:
             self.status_message.emit("已删除选中对象")
 
@@ -707,6 +1315,36 @@ class GraphView(QGraphicsView):
         if node_id not in self.graph.nodes:
             return
         self._clear_pending_interaction()
+        node = self.graph.nodes[node_id]
+        if getattr(node, "frame", None) is not None:
+            # 流程框：删除框本身 + 全部内部节点 + 相关连线，整次一步撤销。
+            frame_ids = [node_id] + [child.id for child in self.graph.frame_subtree(node_id)]
+
+            def _depth(nid: str) -> int:
+                depth = 0
+                current = self.graph.nodes.get(nid)
+                seen: set[str] = set()
+                while current is not None and current.parent_frame and current.parent_frame not in seen:
+                    seen.add(current.parent_frame)
+                    depth += 1
+                    current = self.graph.nodes.get(current.parent_frame)
+                return depth
+
+            ordered = sorted(frame_ids, key=_depth, reverse=True)
+            self._undo_stack.beginMacro("删除流程框及内部节点")
+            try:
+                for nid in ordered:
+                    if nid in self.graph.nodes:
+                        self._undo_stack.push(RemoveNodeCommand(self.graph, nid))
+            finally:
+                self._undo_stack.endMacro()
+            self._sync_frame_geometries()
+            self._update_scene_rect()
+            self._selection_timer.stop()
+            self.selection_changed.emit(self.selected_node_id() or "")
+            children = len(frame_ids) - 1
+            self.status_message.emit(f"已删除流程框及 {children} 个内部节点")
+            return
         command = RemoveNodeTreeCommand(self.graph, node_id)
         self._undo_stack.push(command)
         self._update_scene_rect()
@@ -726,7 +1364,13 @@ class GraphView(QGraphicsView):
         for node_id, item in self._nodes.items():
             size = item.size()
             sizes[node_id] = (float(size.width()), float(size.height()))
-        positions = compute_layout(self.graph, sizes)
+        # 自动布局只排布顶层节点；框内节点保持相对位置，跟随框整体移动。
+        top_level_ids = [
+            node_id
+            for node_id, node in self.graph.nodes.items()
+            if node.parent_frame is None
+        ]
+        positions = compute_layout(self.graph, sizes, node_ids=top_level_ids)
         changes: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
         for node_id, (x, y) in positions.items():
             node = self.graph.nodes.get(node_id)
@@ -747,6 +1391,28 @@ class GraphView(QGraphicsView):
             self._undo_stack.push(
                 MoveNodeCommand(self.graph, node_id, old_pos, new_pos, "自动布局")
             )
+            node = self.graph.nodes.get(node_id)
+            if node is None or getattr(node, "frame", None) is None:
+                continue
+            dx = new_pos[0] - old_pos[0]
+            dy = new_pos[1] - old_pos[1]
+            if abs(dx) < 0.01 and abs(dy) < 0.01:
+                continue
+            # 流程框整体移动时同步平移内部节点，保持框与内容的相对布局。
+            for child in self.graph.frame_subtree(node_id):
+                child_item = self._nodes.get(child.id)
+                if child_item is None:
+                    continue
+                child_old = (float(child.pos[0]), float(child.pos[1]))
+                self._undo_stack.push(
+                    MoveNodeCommand(
+                        self.graph,
+                        child.id,
+                        child_old,
+                        (round(child_old[0] + dx, 2), round(child_old[1] + dy, 2)),
+                        "自动布局",
+                    )
+                )
 
     def auto_layout(self) -> None:
         if not self.graph.nodes:
@@ -762,6 +1428,7 @@ class GraphView(QGraphicsView):
                 self._push_layout_commands(changes)
             finally:
                 self._undo_stack.endMacro()
+        self._sync_frame_geometries()
         self._update_scene_rect()
         self.fit_graph()
 
@@ -784,14 +1451,26 @@ class GraphView(QGraphicsView):
 
     # ------------------------------------------------------------- 模型 -> 画布
     def _create_node_item(self, node: NodeModel) -> NodeItem:
-        item = NodeItem(
-            self,
-            self.graph,
-            node,
-            self._registry.spec(node.op_id),
-            self._thumbnails_enabled,
-            self._thumbnail_box(),
-        )
+        signature = (node.op_id, getattr(node, "frame", None) is not None)
+        self._item_signatures[node.id] = signature
+        if getattr(node, "frame", None) is not None:
+            item = FrameItem(
+                self,
+                self.graph,
+                node,
+                self._registry.spec(node.op_id),
+                self._thumbnails_enabled,
+                self._thumbnail_box(),
+            )
+        else:
+            item = NodeItem(
+                self,
+                self.graph,
+                node,
+                self._registry.spec(node.op_id),
+                self._thumbnails_enabled,
+                self._thumbnail_box(),
+            )
         self._scene.addItem(item)
         self._nodes[node.id] = item
         result = self._results.get(node.id)
@@ -816,6 +1495,8 @@ class GraphView(QGraphicsView):
             return
         self._create_node_item(node)
         self._refresh_collapse_state()
+        if node.parent_frame is not None:
+            self._sync_frame_geometries()
 
     def _on_node_removed(self, node_id: str) -> None:
         if any(port.node_item.node_id == node_id for port in self._highlighted_ports):
@@ -841,19 +1522,35 @@ class GraphView(QGraphicsView):
             self._scene.removeItem(badge)
         self._results.pop(node_id, None)
         self._errors.pop(node_id, None)
+        self._item_signatures.pop(node_id, None)
+        self._frame_live_last.pop(node_id, None)
         self.node_removed.emit(node_id)
         self._refresh_collapse_state()
+        self._sync_frame_geometries()
 
     def _on_node_changed(self, node_id: str) -> None:
         node = self.graph.nodes.get(node_id)
+        if node is None:
+            return
+        expected = (node.op_id, getattr(node, "frame", None) is not None)
+        if self._highlighted_ports and any(
+            port.node_item.node_id == node_id for port in self._highlighted_ports
+        ):
+            # 流程框端口重建后旧 PortItem 会失效，先清掉高亮引用。
+            self._clear_target_highlight()
         item = self._nodes.get(node_id)
-        if node is None or item is None:
+        if item is None or self._item_signatures.get(node_id) != expected:
+            self._recreate_node_item(node_id)
+            item = self._nodes.get(node_id)
+        if item is None:
             return
         item.sync_position(node.pos)
         item.refresh_from_model()
         item.update_port_states()
         self._update_connections_for(node_id)
         self._position_collapse_badge(node_id)
+        if getattr(node, "frame", None) is not None or self._frame_ancestors(node_id):
+            self._sync_frame_geometries()
 
     def _on_connection_added(self, connection: ConnectionModel) -> None:
         if connection.id not in self._connections:
@@ -897,6 +1594,16 @@ class GraphView(QGraphicsView):
         for connection in self._connections.values():
             if item.node_id in (connection.src_node, connection.dst_node):
                 connection.update_path()
+        if self._suppress_move_events:
+            return
+        node = self.graph.nodes.get(item.node_id)
+        if node is not None and getattr(node, "frame", None) is not None:
+            # 拖动流程框本体：实时平移全部后代节点，释放时统一写入移动命令。
+            self._move_frame_descendants_live(item)
+            self._position_collapse_badge(item.node_id)
+            if not self._scene.sceneRect().contains(item.sceneBoundingRect()):
+                self._update_scene_rect()
+            return
         self._position_collapse_badge(item.node_id)
         if not self._scene.sceneRect().contains(item.sceneBoundingRect()):
             self._update_scene_rect()
@@ -962,13 +1669,15 @@ class GraphView(QGraphicsView):
                 continue
             in_center = in_port.center_scene_pos()
             for other in self._nodes.values():
-                if other is item or not other.isVisible():
+                if other is item or not other.isVisible() or isinstance(other, FrameItem):
                     continue
                 for out_port in other.output_ports.values():
                     distance = self._port_distance(out_port.center_scene_pos(), in_center)
                     if distance > SNAP_RADIUS:
                         continue
                     if self._connection_exists(other.node_id, out_port.key, moving_id, key):
+                        continue
+                    if not self.ports_compatible(other.node_id, out_port.key, moving_id, key):
                         continue
                     if self._reachable(moving_id, other.node_id):
                         reason = reason or "该连线会形成环路（当前版本不支持回环）"
@@ -988,7 +1697,7 @@ class GraphView(QGraphicsView):
         for key, out_port in item.output_ports.items():
             out_center = out_port.center_scene_pos()
             for other in self._nodes.values():
-                if other is item or not other.isVisible():
+                if other is item or not other.isVisible() or isinstance(other, FrameItem):
                     continue
                 for in_port in other.input_ports.values():
                     distance = self._port_distance(out_center, in_port.center_scene_pos())
@@ -998,6 +1707,8 @@ class GraphView(QGraphicsView):
                         reason = reason or f"输入端口“{in_port.label}”已有连线，未自动连接"
                         continue
                     if self._connection_exists(moving_id, key, other.node_id, in_port.key):
+                        continue
+                    if not self.ports_compatible(moving_id, key, other.node_id, in_port.key):
                         continue
                     if self._reachable(other.node_id, moving_id):
                         reason = reason or "该连线会形成环路（当前版本不支持回环）"
@@ -1102,6 +1813,13 @@ class GraphView(QGraphicsView):
         node = self.graph.nodes.get(node_id)
         if node is None:
             return None
+        frame = getattr(node, "frame", None)
+        if frame is not None:
+            if key in frame.input_keys():
+                return frame.port_spec(key, True)
+            if key in frame.output_keys():
+                return frame.port_spec(key, False)
+            return None
         if node.is_source:
             if not is_input and key == "image":
                 return PortSpec("image", "图像", description="原始图像输出")
@@ -1128,6 +1846,11 @@ class GraphView(QGraphicsView):
     ) -> bool:
         """输出端口能否连接到输入端口；未知算子 / 源节点保持宽松兼容。"""
 
+        allowed, _reason = self.graph.connection_allowed(
+            src_node_id, src_port, dst_node_id, dst_port
+        )
+        if not allowed:
+            return False
         output_spec = self.port_spec(src_node_id, src_port, False)
         input_spec = self.port_spec(dst_node_id, dst_port, True)
         if output_spec is None or input_spec is None:
@@ -1220,6 +1943,12 @@ class GraphView(QGraphicsView):
         if not self._port_exists(dst_node, dst_port, is_input=True):
             self.status_message.emit(f"输入端口不存在：{dst_port}")
             return
+        allowed, reason = self.graph.connection_allowed(
+            src_node_id, src_port, dst_node_id, dst_port
+        )
+        if not allowed:
+            self.status_message.emit(reason)
+            return
         output_spec = self.port_spec(src_node_id, src_port, False)
         input_spec = self.port_spec(dst_node_id, dst_port, True)
         if (
@@ -1258,6 +1987,9 @@ class GraphView(QGraphicsView):
             self.status_message.emit(str(exc))
 
     def _port_exists(self, node: NodeModel, port: str, is_input: bool) -> bool:
+        frame = getattr(node, "frame", None)
+        if frame is not None:
+            return port in (frame.input_keys() | frame.output_keys())
         spec = self._registry.spec(node.op_id)
         if spec is not None:
             keys = {item.key for item in (spec.inputs if is_input else spec.outputs)}
@@ -1403,12 +2135,14 @@ class GraphView(QGraphicsView):
             desired = QPointF(anchor.x(), anchor.y() + AUTO_CONNECT_GAP)
             done_message = f"已添加节点“{spec.name}”并接在目标节点输出之后"
 
+        parent_frame = self._scope_for_port_target(port, target.kind)
         node = NodeModel(
             id=new_id("n"),
             op_id=op_id,
             title=spec.name,
             pos=(rough.x(), rough.y()),
             params=param_defaults(spec),
+            parent_frame=parent_frame,
         )
         connected = True
         self._undo_stack.beginMacro("添加节点并连接")
@@ -1433,6 +2167,7 @@ class GraphView(QGraphicsView):
         finally:
             self._undo_stack.endMacro()
 
+        self._sync_frame_geometries()
         self.set_selected_node(node.id)
         self.node_created.emit(node.id)
         if connected:
@@ -1479,12 +2214,16 @@ class GraphView(QGraphicsView):
                 f"算子“{spec.name}”的输入 / 输出数据类型无法接续这条连线，未插入节点"
             )
             return None
+        parent_frame = self.graph.port_level(connection.src_node, connection.src_port, "src")
+        if parent_frame == INVALID_LEVEL:
+            parent_frame = self.frame_at(scene_pos)
         node = NodeModel(
             id=new_id("n"),
             op_id=op_id,
             title=spec.name,
             pos=(scene_pos.x(), scene_pos.y()),
             params=param_defaults(spec),
+            parent_frame=parent_frame,
         )
         command = InsertNodeOnEdgeCommand(
             self.graph,
@@ -1506,6 +2245,7 @@ class GraphView(QGraphicsView):
                 self._push_layout_commands(changes)
         finally:
             self._undo_stack.endMacro()
+        self._sync_frame_geometries()
         self.set_selected_node(node.id)
         self.node_created.emit(node.id)
         self.status_message.emit(f"已在连线上插入节点“{spec.name}”")
@@ -1540,6 +2280,7 @@ class GraphView(QGraphicsView):
     def begin_move_tracking(self) -> None:
         self._pending_move_target = None
         self._pending_move_reason = None
+        self._frame_live_last = {}
         self._clear_target_highlight()
         self._move_start = {
             item.node_id: QPointF(item.pos())
@@ -1558,7 +2299,7 @@ class GraphView(QGraphicsView):
         self._clear_target_highlight()
         if not starts:
             return
-        moves: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
+        moves: dict[str, tuple[str, tuple[float, float], tuple[float, float]]] = {}
         for node_id, _start in starts.items():
             item = self._nodes.get(node_id)
             node = self.graph.nodes.get(node_id)
@@ -1567,51 +2308,111 @@ class GraphView(QGraphicsView):
             new_pos = item.pos()
             if abs(node.pos[0] - new_pos.x()) < 0.01 and abs(node.pos[1] - new_pos.y()) < 0.01:
                 continue
-            moves.append(
-                (
-                    node_id,
-                    (float(node.pos[0]), float(node.pos[1])),
-                    (round(new_pos.x(), 2), round(new_pos.y(), 2)),
-                )
+            moves[node_id] = (
+                node_id,
+                (float(node.pos[0]), float(node.pos[1])),
+                (round(new_pos.x(), 2), round(new_pos.y(), 2)),
             )
         if not moves:
             return
 
         # 折叠点被拖动时，隐藏的下游节点一起平移，展开后仍保持相对布局。
-        moved_ids = {node_id for node_id, _old, _new in moves}
-        for node_id, old_pos, new_pos in list(moves):
+        for node_id, (_nid, old_pos, new_pos) in list(moves.items()):
             if node_id not in self._collapsed:
                 continue
             dx = new_pos[0] - old_pos[0]
             dy = new_pos[1] - old_pos[1]
             for descendant in self.graph.descendants(node_id):
-                if descendant in moved_ids:
+                if descendant in moves:
                     continue
                 child = self.graph.nodes.get(descendant)
                 if child is None:
                     continue
-                moved_ids.add(descendant)
-                moves.append(
-                    (
-                        descendant,
-                        (float(child.pos[0]), float(child.pos[1])),
-                        (round(child.pos[0] + dx, 2), round(child.pos[1] + dy, 2)),
-                    )
+                moves[descendant] = (
+                    descendant,
+                    (float(child.pos[0]), float(child.pos[1])),
+                    (round(child.pos[0] + dx, 2), round(child.pos[1] + dy, 2)),
                 )
+
+        # 拖动流程框本体：全部后代（含嵌套框）整体平移，释放时写成一个宏。
+        frame_deltas: dict[str, tuple[float, float]] = {}
+        for node_id, (_nid, old_pos, new_pos) in list(moves.items()):
+            node = self.graph.nodes.get(node_id)
+            if node is None or getattr(node, "frame", None) is None:
+                continue
+            frame_deltas[node_id] = (new_pos[0] - old_pos[0], new_pos[1] - old_pos[1])
+        for frame_id, (dx, dy) in frame_deltas.items():
+            if abs(dx) < 0.01 and abs(dy) < 0.01:
+                continue
+            for child in self.graph.frame_subtree(frame_id):
+                if child.id in moves:
+                    continue
+                child_item = self._nodes.get(child.id)
+                if child_item is None:
+                    continue
+                moves[child.id] = (
+                    child.id,
+                    (float(child.pos[0]), float(child.pos[1])),
+                    (round(child.pos[0] + dx, 2), round(child.pos[1] + dy, 2)),
+                )
+
+        # 按移动后的中心点更新所属流程框（取最深命中；原始图像节点始终在顶层）。
+        parent_changes: list[tuple[str, str | None, str | None]] = []
+        for node_id, (_nid, _old_pos, new_pos) in moves.items():
+            node = self.graph.nodes.get(node_id)
+            item = self._nodes.get(node_id)
+            if node is None or item is None:
+                continue
+            if node.is_source:
+                new_parent = None
+            else:
+                size = item.size()
+                center = QPointF(
+                    new_pos[0] + size.width() / 2.0,
+                    new_pos[1] + size.height() / 2.0,
+                )
+                if getattr(node, "frame", None) is not None:
+                    excluded = {node_id} | {
+                        child.id for child in self.graph.frame_subtree(node_id)
+                    }
+                else:
+                    excluded = set()
+                new_parent = self.frame_at(center, exclude=excluded)
+                if new_parent == node_id:
+                    new_parent = node.parent_frame
+                if new_parent in ("", INVALID_LEVEL):
+                    new_parent = node.parent_frame
+            if new_parent != node.parent_frame:
+                parent_changes.append((node_id, node.parent_frame, new_parent))
+
+        # 节点进入 / 移出流程框时不再自动吸附端口，避免跨层级连线。
+        if target is not None and any(change[0] in moves for change in parent_changes):
+            target = None
+            reason = reason or "已移入 / 移出流程框，未自动连接跨层级连线"
 
         connection_commands, action_message = self._build_move_connection_commands(target)
         if not connection_commands and reason is not None and target is None:
             self.status_message.emit(reason)
 
-        if len(moves) == 1 and not connection_commands:
-            node_id, old_pos, new_pos = moves[0]
+        move_items = list(moves.values())
+        if len(move_items) == 1 and not connection_commands and not parent_changes:
+            node_id, old_pos, new_pos = move_items[0]
             self._undo_stack.push(MoveNodeCommand(self.graph, node_id, old_pos, new_pos))
         else:
-            text = "移动并连接节点" if connection_commands else "移动节点"
+            if connection_commands:
+                text = "移动并连接节点"
+            elif parent_changes:
+                text = "移动节点并调整流程框"
+            else:
+                text = "移动节点"
             self._undo_stack.beginMacro(text)
             try:
-                for node_id, old_pos, new_pos in moves:
+                for node_id, old_pos, new_pos in move_items:
                     self._undo_stack.push(MoveNodeCommand(self.graph, node_id, old_pos, new_pos))
+                for node_id, old_parent, new_parent in parent_changes:
+                    self._undo_stack.push(
+                        SetParentFrameCommand(self.graph, node_id, old_parent, new_parent)
+                    )
                 for command in connection_commands:
                     self._undo_stack.push(command)
             except GraphError as exc:
@@ -1620,6 +2421,7 @@ class GraphView(QGraphicsView):
                 self._undo_stack.endMacro()
         if action_message is not None:
             self.status_message.emit(action_message)
+        self._sync_frame_geometries()
         self._update_scene_rect()
 
     def _build_move_connection_commands(
@@ -1935,6 +2737,22 @@ class GraphView(QGraphicsView):
                     label,
                     lambda nid=node_item.node_id: self.toggle_node_collapsed(nid),
                 )
+            node_model = self.graph.nodes.get(node_item.node_id)
+            if node_model is not None and getattr(node_model, "frame", None) is not None:
+                menu.addAction(
+                    "保存为新算子…",
+                    lambda nid=node_item.node_id: self.save_frame_as_operator(nid),
+                )
+            if node_model is not None and node_model.parent_frame:
+                menu.addAction(
+                    "移出流程框",
+                    lambda nid=node_item.node_id: self.move_out_of_frame(nid),
+                )
+            if getattr(node_item, "is_stale", False) or getattr(node_item, "stale", False):
+                menu.addAction(
+                    "替换算子…",
+                    lambda nid=node_item.node_id: self._prompt_replace_operator(nid),
+                )
             menu.addSeparator()
             menu.addAction("自动布局", self.auto_layout)
             menu.addAction("适应视图", self.fit_graph)
@@ -1951,6 +2769,11 @@ class GraphView(QGraphicsView):
             menu.addAction("自动布局", self.auto_layout)
             menu.addAction("适应视图", self.fit_graph)
         else:
+            scene_pos = self.mapToScene(event.pos())
+            menu.addAction(
+                "添加流程框",
+                lambda pos=scene_pos: self.add_frame_at(pos),
+            )
             menu.addAction("粘贴节点", self.paste_nodes)
             menu.addSeparator()
             menu.addAction("自动布局", self.auto_layout)
@@ -2103,6 +2926,8 @@ class GraphView(QGraphicsView):
         self._collapse_badges.clear()
         self._connections.clear()
         self._nodes.clear()
+        self._item_signatures.clear()
+        self._frame_live_last.clear()
 
     def _content_bounding_rect(self) -> QRectF:
         """可见内容的包围盒；被折叠隐藏的节点不参与适应视图 / 画布范围计算。"""

@@ -141,7 +141,11 @@ class RemoveNodeTreeCommand(QUndoCommand):
 
 
 class AddConnectionCommand(QUndoCommand):
-    """添加一条连线。"""
+    """添加一条连线。
+
+    连线落到流程框边界端口时，模型会绑定端口类型并自动追加待定端口；撤销时
+    必须把流程框端口状态一并恢复到连线之前的快照。
+    """
 
     def __init__(
         self,
@@ -160,6 +164,7 @@ class AddConnectionCommand(QUndoCommand):
         self._dst_node = dst_node
         self._dst_port = dst_port
         self._connection_id = connection_id or new_id("c")
+        self._frame_state: dict[str, dict] | None = None
 
     @property
     def connection_id(self) -> str:
@@ -168,6 +173,7 @@ class AddConnectionCommand(QUndoCommand):
     def redo(self) -> None:
         if self._connection_id in self._graph.connections:
             return
+        self._frame_state = self._graph.frame_state_snapshot()
         self._graph.add_connection(
             self._src_node,
             self._src_port,
@@ -179,6 +185,9 @@ class AddConnectionCommand(QUndoCommand):
     def undo(self) -> None:
         if self._connection_id in self._graph.connections:
             self._graph.remove_connection(self._connection_id)
+        if self._frame_state is not None:
+            self._graph.restore_frame_state(self._frame_state)
+            self._frame_state = None
 
 
 class RemoveConnectionCommand(QUndoCommand):
@@ -264,6 +273,40 @@ class MoveNodeCommand(QUndoCommand):
             self._graph.set_node_pos(self._node_id, self._old_pos)
 
 
+class SetParentFrameCommand(QUndoCommand):
+    """调整节点所属流程框（拖入 / 移出流程框、替换失效流程框时使用）。"""
+
+    def __init__(
+        self,
+        graph: GraphModel,
+        node_id: str,
+        old_parent: str | None,
+        new_parent: str | None,
+        text: str = "调整所属流程框",
+    ) -> None:
+        super().__init__(text)
+        self._graph = graph
+        self._node_id = node_id
+        self._old_parent = old_parent
+        self._new_parent = new_parent
+
+    @property
+    def node_id(self) -> str:
+        return self._node_id
+
+    def redo(self) -> None:
+        if self._node_id in self._graph.nodes:
+            self._graph.set_node_parent(self._node_id, self._new_parent)
+
+    def undo(self) -> None:
+        if self._node_id in self._graph.nodes:
+            try:
+                self._graph.set_node_parent(self._node_id, self._old_parent)
+            except GraphError:
+                # 旧父框可能已被本次操作删除；保持节点可继续撤销即可。
+                return
+
+
 class SetNodeParamsCommand(QUndoCommand):
     """修改节点参数（供参数面板 / 工作区调用）。"""
 
@@ -307,6 +350,144 @@ class RenameNodeCommand(QUndoCommand):
     def undo(self) -> None:
         if self._node_id in self._graph.nodes:
             self._graph.rename_node(self._node_id, self._old_title)
+
+
+class ReplaceOperatorCommand(QUndoCommand):
+    """把一个失效 / 占位节点原位替换成普通算子。
+
+    * 节点 id、位置、所属流程框保持不变；
+    * 旧连线在替换后按端口类型尝试重连，不能重连的自动丢弃（尽量保留）；
+    * 若旧节点是流程框，替换前先把直接子节点挂到框的父级，避免子节点被误删；
+    * 旧节点状态、子节点归属与旧连线全部快照，整次替换一步撤销。
+    """
+
+    def __init__(
+        self,
+        graph: GraphModel,
+        node_id: str,
+        *,
+        op_id: str,
+        title: str,
+        params: dict[str, Any] | None = None,
+        reusable_connections: list[tuple[str, str, str, str]] | None = None,
+        text: str = "替换算子",
+    ) -> None:
+        super().__init__(text)
+        self._graph = graph
+        self._node_id = node_id
+        node = graph.nodes.get(node_id)
+        self._old_state = node.to_dict() if node is not None else None
+        self._new_op_id = op_id
+        self._new_title = title
+        self._new_params = dict(params or {})
+        self._new_connections = list(reusable_connections or [])
+        self._new_connection_ids: list[str] = []
+        self._reparent: list[tuple[str, str | None, str | None]] = []
+        self._old_connections: list[ConnectionModel] = []
+        if node is not None:
+            new_parent = node.parent_frame
+            if node.is_frame:
+                for child in graph.direct_children(node_id):
+                    self._reparent.append((child.id, child.parent_frame, new_parent))
+            self._old_connections = [
+                _copy_connection(connection)
+                for connection in graph.connections.values()
+                if node_id in (connection.src_node, connection.dst_node)
+            ]
+        self._frame_state: dict[str, dict] | None = None
+        self._added_connections: list[str] = []
+
+    @property
+    def node_id(self) -> str:
+        return self._node_id
+
+    def _apply_node_state(self, state: dict[str, Any]) -> None:
+        node = self._graph.nodes.get(self._node_id)
+        if node is None:
+            return
+        snapshot = NodeModel.from_dict(state)
+        node.op_id = snapshot.op_id
+        node.title = snapshot.title
+        node.pos = snapshot.pos
+        node.params = dict(snapshot.params)
+        node.frame = snapshot.frame
+        node.parent_frame = snapshot.parent_frame
+        node.touch()
+        self._graph.node_changed.emit(self._node_id)
+
+    def redo(self) -> None:
+        node = self._graph.nodes.get(self._node_id)
+        if node is None:
+            return
+        self._frame_state = self._graph.frame_state_snapshot()
+        for connection in list(self._graph.connections.values()):
+            if self._node_id in (connection.src_node, connection.dst_node):
+                self._graph.remove_connection(connection.id)
+        for child_id, _old_parent, new_parent in self._reparent:
+            if child_id in self._graph.nodes:
+                try:
+                    self._graph.set_node_parent(child_id, new_parent)
+                except GraphError:
+                    continue
+        node.op_id = self._new_op_id
+        node.title = self._new_title
+        node.params = dict(self._new_params)
+        node.frame = None
+        node.touch()
+        self._graph.node_changed.emit(self._node_id)
+        self._graph.structure_changed.emit()
+
+        while len(self._new_connection_ids) < len(self._new_connections):
+            self._new_connection_ids.append(new_id("c"))
+        self._added_connections = []
+        for index, (src_node, src_port, dst_node, dst_port) in enumerate(self._new_connections):
+            connection_id = self._new_connection_ids[index]
+            if connection_id in self._graph.connections:
+                self._added_connections.append(connection_id)
+                continue
+            if src_node not in self._graph.nodes or dst_node not in self._graph.nodes:
+                continue
+            try:
+                self._graph.add_connection(
+                    src_node, src_port, dst_node, dst_port, connection_id
+                )
+                self._added_connections.append(connection_id)
+            except GraphError:
+                # 端口类型 / 层级不再兼容：丢弃这条旧连线，保持其余连线可用。
+                continue
+
+    def undo(self) -> None:
+        for connection_id in list(self._added_connections):
+            if connection_id in self._graph.connections:
+                self._graph.remove_connection(connection_id)
+        self._added_connections = []
+        if self._old_state is None or self._node_id not in self._graph.nodes:
+            return
+        self._apply_node_state(self._old_state)
+        # 先恢复流程框端口快照，再恢复子节点归属与旧连线，保证层级校验通过。
+        if self._frame_state is not None:
+            self._graph.restore_frame_state(self._frame_state)
+        for child_id, old_parent, _new_parent in reversed(self._reparent):
+            if child_id in self._graph.nodes:
+                try:
+                    self._graph.set_node_parent(child_id, old_parent)
+                except GraphError:
+                    continue
+        for connection in self._old_connections:
+            if connection.id in self._graph.connections:
+                continue
+            if connection.src_node not in self._graph.nodes or connection.dst_node not in self._graph.nodes:
+                continue
+            try:
+                self._graph.add_connection(
+                    connection.src_node,
+                    connection.src_port,
+                    connection.dst_node,
+                    connection.dst_port,
+                    connection.id,
+                )
+            except GraphError:
+                continue
 
 
 class InsertNodeOnEdgeCommand(QUndoCommand):
@@ -374,5 +555,7 @@ __all__ = [
     "RemoveNodeCommand",
     "RemoveNodeTreeCommand",
     "RenameNodeCommand",
+    "ReplaceOperatorCommand",
     "SetNodeParamsCommand",
+    "SetParentFrameCommand",
 ]

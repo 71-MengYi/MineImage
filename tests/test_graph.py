@@ -14,18 +14,27 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
-from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QRectF, Qt
 from PySide6.QtGui import QDropEvent, QUndoStack, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from app.config import AppSettings
-from app.core.constants import MIME_OPERATOR, SINGLE_CLICK_DELAY_MS, SOURCE_OP_ID
+from app.core.constants import (
+    FRAME_CATEGORY,
+    FRAME_OP_ID,
+    MIME_OPERATOR,
+    SINGLE_CLICK_DELAY_MS,
+    SOURCE_OP_ID,
+)
+from app.core.data_types import DataType
+from app.core.frame import FrameModel
 from app.core.model import GraphError, NodeModel, WorkspaceModel, new_id
 from app.core.types import ImageData
 from app.engine.engine import NodeResult
@@ -39,9 +48,16 @@ from app.graph.commands import (
     RemoveNodeTreeCommand,
     SetNodeParamsCommand,
 )
+from app.graph.frame_item import (
+    DEFAULT_FRAME_HEIGHT,
+    DEFAULT_FRAME_WIDTH,
+    INNER_OFFSET,
+    FrameItem,
+)
 from app.graph.layout import GRID, compute_layout
 from app.graph.node_item import NodeItem
 from app.graph.view import GraphView
+from app.operators.frame import FrameOperator
 from app.operators.spec import OperatorSpec, ParamSpec, PortSpec, param_defaults
 
 _APP: QApplication | None = None
@@ -99,6 +115,78 @@ class FakeRegistry:
 
 def make_registry() -> FakeRegistry:
     return FakeRegistry(BLUR_SPEC, MERGE_SPEC, SPLIT_SPEC, OUTPUT_SPEC)
+
+
+#: 测试用流程框定义：一个输入 -> 一个模糊节点 -> 一个输出。
+DEMO_FRAME_DEFINITION = {
+    "format": "mineimage-frame-definition",
+    "version": 1,
+    "name": "演示流程",
+    "inputs": [{"key": "input_1", "label": "输入 1", "data_type": "image"}],
+    "outputs": [{"key": "output_1", "label": "输出 1", "data_type": "image"}],
+    "nodes": [
+        {
+            "id": "n1",
+            "op_id": "test.blur",
+            "title": "框内模糊",
+            "pos": [60.0, 80.0],
+            "params": {"ksize": 5},
+            "parent_frame": None,
+        }
+    ],
+    "connections": [
+        {
+            "src_node": "__frame__",
+            "src_port": "input_1",
+            "dst_node": "n1",
+            "dst_port": "image",
+        },
+        {
+            "src_node": "n1",
+            "src_port": "image",
+            "dst_node": "__frame__",
+            "dst_port": "output_1",
+        },
+    ],
+}
+
+
+class FrameDemoOperator(FrameOperator):
+    """测试用流程框算子（由定义直接展开）。"""
+
+    spec = OperatorSpec(
+        id="frame.demo",
+        name="演示流程",
+        category=(FRAME_CATEGORY,),
+        inputs=(PortSpec("input_1", "输入 1"),),
+        outputs=(PortSpec("output_1", "输出 1"),),
+    )
+    frame_definition = DEMO_FRAME_DEFINITION
+
+
+class FrameRegistry(FakeRegistry):
+    """带流程框算子实例的注册表替身。"""
+
+    def __init__(self, *specs: OperatorSpec, operator=None) -> None:
+        super().__init__(*specs)
+        self._operator = operator
+
+    def get(self, op_id: str):
+        if self._operator is not None and self._operator.spec.id == op_id:
+            return self._operator
+        return None
+
+
+def make_frame_registry() -> FrameRegistry:
+    operator = FrameDemoOperator()
+    return FrameRegistry(
+        BLUR_SPEC,
+        MERGE_SPEC,
+        SPLIT_SPEC,
+        OUTPUT_SPEC,
+        operator.spec,
+        operator=operator,
+    )
 
 
 class _FakeContextMenuEvent:
@@ -207,7 +295,6 @@ class GraphViewTestCase(unittest.TestCase):
             _APP.processEvents()
         return root, left, right, leaf, connections
 
-
     # ---------------------------------------------------------------- 自动布局
     def test_auto_layout_branching_dag(self) -> None:
         source = self.add_source(pos=(600.0, 120.0))
@@ -244,7 +331,7 @@ class GraphViewTestCase(unittest.TestCase):
         self.assertAlmostEqual(items[left.id].pos().y(), items[right.id].pos().y(), places=1)
         # 兄弟节点横向分开
         self.assertGreater(abs(items[left.id].pos().x() - items[right.id].pos().x()), 100.0)
-        # 父节点尽量居中于子节点
+        # 父节点尽量居中于子节点；坐标会被吸附到网格，允许一格以内的量化误差。
         left_center = items[left.id].sceneBoundingRect().center().x()
         right_center = items[right.id].sceneBoundingRect().center().x()
         merge_center = items[merge.id].sceneBoundingRect().center().x()
@@ -1812,6 +1899,453 @@ class GraphViewTestCase(unittest.TestCase):
         QTest.qWait(SINGLE_CLICK_DELAY_MS + 150)
         self.assertEqual(activation_events, [node.id])
         self.assertEqual(selection_events, [])
+
+
+    # ------------------------------------------------------------ 流程框
+    def add_frame(
+        self,
+        pos: tuple[float, float] = (400.0, 300.0),
+        parent_frame: str | None = None,
+        title: str = "流程框",
+    ) -> str:
+        return self.view.add_frame_at(QPointF(*pos), parent_frame=parent_frame, title=title)
+
+    def add_child(
+        self,
+        frame_id: str,
+        op_id: str = "test.blur",
+        pos: tuple[float, float] = (0.0, 0.0),
+        params: dict | None = None,
+    ) -> NodeModel:
+        spec = self.registry.spec(op_id)
+        assert spec is not None
+        node = NodeModel(
+            id=new_id("n"),
+            op_id=op_id,
+            title=spec.name,
+            pos=pos,
+            params=dict(param_defaults(spec)) if params is None else dict(params),
+            parent_frame=frame_id,
+        )
+        self.graph.add_node(node)
+        return node
+
+    def add_missing_node(
+        self,
+        pos: tuple[float, float] = (0.0, 0.0),
+        title: str = "失效算子",
+    ) -> NodeModel:
+        node = NodeModel(id=new_id("n"), op_id="missing.op", title=title, pos=pos)
+        self.graph.add_node(node)
+        return node
+
+    def test_add_frame_at_creates_default_ports_and_geometry(self) -> None:
+        frame_id = self.add_frame(pos=(400.0, 300.0))
+        node = self.graph.nodes[frame_id]
+        self.assertTrue(node.is_frame)
+        self.assertIsInstance(node.frame, FrameModel)
+        self.assertEqual(len(node.frame.inputs), 1)
+        self.assertEqual(len(node.frame.outputs), 1)
+        self.assertIsNone(node.frame.inputs[0].data_type)
+        self.assertIsNone(node.frame.outputs[0].data_type)
+
+        item = self.view._nodes[frame_id]
+        self.assertIsInstance(item, FrameItem)
+        self.assertAlmostEqual(item.size().width(), DEFAULT_FRAME_WIDTH, places=1)
+        self.assertAlmostEqual(item.size().height(), DEFAULT_FRAME_HEIGHT, places=1)
+        self.assertEqual(set(item.outer_input_ports), {"input_1"})
+        self.assertEqual(set(item.outer_output_ports), {"output_1"})
+        self.assertEqual(set(item.inner_output_ports), {"input_1"})
+        self.assertEqual(set(item.inner_input_ports), {"output_1"})
+        self.assertTrue(item.outer_input_ports["input_1"].pending)
+
+        outer_in = item.port_item("input_1", True)
+        inner_out = item.port_item("input_1", False)
+        outer_out = item.port_item("output_1", False)
+        inner_in = item.port_item("output_1", True)
+        self.assertIsNotNone(outer_in)
+        self.assertIsNotNone(inner_out)
+        self.assertAlmostEqual(
+            inner_out.scenePos().y() - outer_in.scenePos().y(), INNER_OFFSET, places=1
+        )
+        self.assertAlmostEqual(
+            outer_out.scenePos().y() - inner_in.scenePos().y(), INNER_OFFSET, places=1
+        )
+
+    def test_blank_context_menu_has_add_frame_action(self) -> None:
+        with patch("app.graph.view.QMenu") as menu_cls:
+            self.view.contextMenuEvent(_FakeContextMenuEvent(QPoint(10, 10)))
+        actions = [call.args[0] for call in menu_cls.return_value.addAction.call_args_list if call.args]
+        self.assertIn("添加流程框", actions)
+        self.assertIn("粘贴节点", actions)
+
+    def test_frame_input_connection_binds_type_and_grows_pending_port(self) -> None:
+        frame_id = self.add_frame()
+        source = self.add_source("源", pos=(0.0, -400.0))
+        self.view.connect_ports(source.id, "image", frame_id, "input_1")
+
+        frame = self.graph.nodes[frame_id].frame
+        self.assertEqual(frame.inputs[0].data_type, DataType.IMAGE)
+        self.assertEqual(len(frame.inputs), 2)
+        self.assertIsNone(frame.inputs[1].data_type)
+        self.assertEqual(len(self.graph.connections), 1)
+        connection = next(iter(self.graph.connections.values()))
+        self.assertIn(connection.id, self.view._connections)
+
+        item = self.view._nodes[frame_id]
+        self.assertIn("input_2", item.outer_input_ports)
+        self.assertTrue(item.outer_input_ports["input_2"].pending)
+        self.assertFalse(item.outer_input_ports["input_1"].pending)
+
+        self.undo.undo()
+        frame = self.graph.nodes[frame_id].frame
+        self.assertEqual(len(frame.inputs), 1)
+        self.assertIsNone(frame.inputs[0].data_type)
+        self.assertFalse(self.graph.connections)
+
+        self.undo.redo()
+        frame = self.graph.nodes[frame_id].frame
+        self.assertEqual(frame.inputs[0].data_type, DataType.IMAGE)
+        self.assertEqual(len(frame.inputs), 2)
+
+    def test_frame_output_inner_connection_binds_and_grows_pending(self) -> None:
+        frame_id = self.add_frame(pos=(400.0, 300.0))
+        frame_pos = self.graph.nodes[frame_id].pos
+        child = self.add_child(frame_id, pos=(frame_pos[0] + 60.0, frame_pos[1] + 100.0))
+        self.view.connect_ports(child.id, "image", frame_id, "output_1")
+
+        frame = self.graph.nodes[frame_id].frame
+        self.assertEqual(frame.outputs[0].data_type, DataType.IMAGE)
+        self.assertEqual(len(frame.outputs), 2)
+        self.assertIsNone(frame.outputs[1].data_type)
+        item = self.view._nodes[frame_id]
+        self.assertIn("output_2", item.outer_output_ports)
+        self.assertTrue(item.outer_output_ports["output_2"].pending)
+        self.assertEqual(item.outer_output_ports["output_1"].data_type, DataType.IMAGE)
+
+        sink = self.add_node(pos=(0.0, 900.0))
+        self.view.connect_ports(frame_id, "output_1", sink.id, "image")
+        self.assertEqual(len(self.graph.connections), 2)
+        self.assertEqual(self.graph.input_connection(sink.id, "image").src_node, frame_id)
+
+    def test_library_drop_inside_frame_sets_parent_frame(self) -> None:
+        frame_id = self.add_frame(pos=(500.0, 400.0))
+        frame_item = self.view._nodes[frame_id]
+        center = frame_item.sceneBoundingRect().center()
+        before = set(self.graph.nodes)
+
+        new_id = self.view.add_operator_at("test.blur", center)
+        self.assertIsNotNone(new_id)
+        created = [node_id for node_id in self.graph.nodes if node_id not in before]
+        self.assertEqual(created, [new_id])
+        node = self.graph.nodes[new_id]
+        self.assertEqual(node.parent_frame, frame_id)
+        self.assertIn(node.id, [item.id for item in self.graph.direct_children(frame_id)])
+
+        frame_item = self.view._nodes[frame_id]
+        frame_rect = QRectF(frame_item.pos(), frame_item.size())
+        child_item = self.view._nodes[new_id]
+        self.assertTrue(frame_rect.contains(QRectF(child_item.pos(), child_item.size())))
+
+        self.undo.undo()
+        self.assertNotIn(new_id, self.graph.nodes)
+        self.assertFalse(self.graph.direct_children(frame_id))
+
+    def test_drag_node_into_frame_updates_parent_and_undo(self) -> None:
+        frame_id = self.add_frame(pos=(400.0, 300.0))
+        frame_item = self.view._nodes[frame_id]
+        node = self.add_node(pos=(1200.0, 1200.0))
+        item = self.view._nodes[node.id]
+        self.view._scene.clearSelection()
+        item.setSelected(True)
+
+        self.view.begin_move_tracking()
+        center = frame_item.sceneBoundingRect().center()
+        item.setPos(
+            center.x() - item.size().width() / 2.0,
+            center.y() - item.size().height() / 2.0,
+        )
+        self.view.finish_move_tracking()
+
+        self.assertEqual(self.graph.nodes[node.id].parent_frame, frame_id)
+        self.assertEqual(self.undo.count(), 2)
+
+        self.undo.undo()
+        self.assertIsNone(self.graph.nodes[node.id].parent_frame)
+        self.assertEqual(self.graph.nodes[node.id].pos, (1200.0, 1200.0))
+
+    def test_drag_frame_moves_all_descendants_single_undo(self) -> None:
+        frame_id = self.add_frame(pos=(400.0, 300.0))
+        frame_pos = self.graph.nodes[frame_id].pos
+        child = self.add_child(frame_id, pos=(frame_pos[0] + 40.0, frame_pos[1] + 80.0))
+        self.view._sync_frame_geometries()
+        frame_pos = self.graph.nodes[frame_id].pos
+        child_pos = self.graph.nodes[child.id].pos
+        frame_item = self.view._nodes[frame_id]
+
+        self.view._scene.clearSelection()
+        frame_item.setSelected(True)
+        self.view.begin_move_tracking()
+        delta = QPointF(140.0, 100.0)
+        frame_item.setPos(frame_item.pos() + delta)
+        self.view.finish_move_tracking()
+
+        self.assertAlmostEqual(self.graph.nodes[child.id].pos[0], child_pos[0] + 140.0, places=1)
+        self.assertAlmostEqual(self.graph.nodes[child.id].pos[1], child_pos[1] + 100.0, places=1)
+        self.assertAlmostEqual(self.graph.nodes[frame_id].pos[0], frame_pos[0] + 140.0, places=1)
+        self.assertAlmostEqual(self.graph.nodes[frame_id].pos[1], frame_pos[1] + 100.0, places=1)
+        self.assertAlmostEqual(
+            self.view._nodes[child.id].pos().x(), child_pos[0] + 140.0, places=1
+        )
+        self.assertEqual(self.undo.count(), 2)
+
+        self.undo.undo()
+        self.assertAlmostEqual(self.graph.nodes[child.id].pos[0], child_pos[0], places=1)
+        self.assertAlmostEqual(self.graph.nodes[child.id].pos[1], child_pos[1], places=1)
+        self.assertAlmostEqual(self.graph.nodes[frame_id].pos[0], frame_pos[0], places=1)
+        self.assertAlmostEqual(self.graph.nodes[frame_id].pos[1], frame_pos[1], places=1)
+
+    def test_delete_frame_subtree_is_single_undo(self) -> None:
+        frame_id = self.add_frame(pos=(400.0, 300.0))
+        frame_pos = self.graph.nodes[frame_id].pos
+        child = self.add_child(frame_id, pos=(frame_pos[0] + 40.0, frame_pos[1] + 80.0))
+        inner = self.graph.add_connection(child.id, "image", frame_id, "output_1")
+        sink = self.add_node(pos=(0.0, 1000.0))
+        outer = self.graph.add_connection(frame_id, "output_1", sink.id, "image")
+
+        self.view._nodes[frame_id].setSelected(True)
+        self.view.delete_selected()
+        self.assertNotIn(frame_id, self.graph.nodes)
+        self.assertNotIn(child.id, self.graph.nodes)
+        self.assertFalse(self.graph.connections)
+        self.assertFalse(self.view._connections)
+
+        self.undo.undo()
+        self.assertIn(frame_id, self.graph.nodes)
+        self.assertIn(child.id, self.graph.nodes)
+        self.assertEqual(set(self.graph.connections), {inner.id, outer.id})
+        self.assertIsInstance(self.view._nodes[frame_id], FrameItem)
+        self.assertIsInstance(self.view._nodes[child.id], NodeItem)
+
+    def test_copy_paste_frame_subtree_remaps_parent_frame(self) -> None:
+        frame_id = self.add_frame(pos=(400.0, 300.0))
+        frame_pos = self.graph.nodes[frame_id].pos
+        child = self.add_child(frame_id, pos=(frame_pos[0] + 40.0, frame_pos[1] + 80.0))
+        inner = self.graph.add_connection(child.id, "image", frame_id, "output_1")
+
+        self.view._nodes[frame_id].setSelected(True)
+        self.assertTrue(self.view.copy_selected())
+        new_ids = self.view.paste_nodes()
+        self.assertEqual(len(new_ids), 2)
+        new_frames = [node_id for node_id in new_ids if self.graph.nodes[node_id].is_frame]
+        self.assertEqual(len(new_frames), 1)
+        new_frame_id = new_frames[0]
+        new_children = [n for n in self.graph.direct_children(new_frame_id)]
+        self.assertEqual(len(new_children), 1)
+        self.assertEqual(new_children[0].parent_frame, new_frame_id)
+        self.assertIn(new_children[0].id, new_ids)
+
+        pasted_connections = [
+            connection for connection in self.graph.connections.values() if connection.id != inner.id
+        ]
+        self.assertEqual(len(pasted_connections), 1)
+        self.assertEqual(pasted_connections[0].src_node, new_children[0].id)
+        self.assertEqual(pasted_connections[0].dst_node, new_frame_id)
+        self.assertIn(inner.id, self.graph.connections)
+
+        self.undo.undo()
+        self.assertNotIn(new_frame_id, self.graph.nodes)
+        self.assertEqual(set(self.graph.nodes), {frame_id, child.id})
+        self.assertEqual(set(self.graph.connections), {inner.id})
+
+    def test_save_frame_menu_uses_name_and_emits_signal(self) -> None:
+        frame_id = self.add_frame()
+        frame_pos = self.graph.nodes[frame_id].pos
+        self.add_child(frame_id, pos=(frame_pos[0] + 40.0, frame_pos[1] + 80.0))
+        statuses: list[str] = []
+        changed: list[bool] = []
+        self.view.status_message.connect(statuses.append)
+        self.view.operators_changed.connect(lambda: changed.append(True))
+        saved = SimpleNamespace(name="我的流程", op_id="frame.demo")
+
+        with patch(
+            "app.graph.view.QInputDialog.getText", return_value=("我的流程", True)
+        ) as dialog, patch(
+            "app.graph.view.save_frame_operator", return_value=saved
+        ) as save:
+            self.view.save_frame_as_operator(frame_id)
+
+        dialog.assert_called_once()
+        save.assert_called_once()
+        args = save.call_args.args
+        self.assertIs(args[0], self.graph)
+        self.assertEqual(args[1], frame_id)
+        self.assertEqual(args[2], "我的流程")
+        self.assertIs(save.call_args.kwargs.get("registry"), self.registry)
+        self.assertEqual(changed, [True])
+        self.assertTrue(any("已保存算子" in message for message in statuses))
+
+    def test_save_frame_rejects_source_image_nodes(self) -> None:
+        frame_id = self.add_frame()
+        frame_pos = self.graph.nodes[frame_id].pos
+        source = NodeModel(
+            id=new_id("n"),
+            op_id=SOURCE_OP_ID,
+            title="框内源图像",
+            pos=(frame_pos[0] + 30.0, frame_pos[1] + 80.0),
+            parent_frame=frame_id,
+        )
+        self.graph.add_node(source)
+        statuses: list[str] = []
+        self.view.status_message.connect(statuses.append)
+
+        with patch("app.graph.view.QInputDialog.getText") as dialog, patch(
+            "app.graph.view.save_frame_operator"
+        ) as save:
+            self.view.save_frame_as_operator(frame_id)
+
+        dialog.assert_not_called()
+        save.assert_not_called()
+        self.assertTrue(any("原始图像" in message for message in statuses))
+
+    def test_replace_stale_node_via_dialog_keeps_connection_and_undo(self) -> None:
+        source = self.add_source("源", pos=(0.0, 0.0))
+        stale = self.add_missing_node(pos=(0.0, 300.0))
+        connection = self.graph.add_connection(source.id, "image", stale.id, "image")
+        old_item = self.view._nodes[stale.id]
+        self.assertTrue(old_item.is_stale)
+
+        class _FakeReplaceDialog:
+            def __init__(self, registry, *, current_op_id=None, parent=None) -> None:
+                self.current_op_id = current_op_id
+
+            def exec(self) -> int:
+                return 1
+
+            def selected_op_id(self) -> str:
+                return "test.blur"
+
+        with patch("app.graph.view.ReplaceOperatorDialog", _FakeReplaceDialog):
+            self.view._prompt_replace_operator(stale.id)
+
+        node = self.graph.nodes[stale.id]
+        self.assertEqual(node.op_id, "test.blur")
+        self.assertEqual(node.title, "模糊")
+        self.assertEqual(node.params.get("ksize"), 5)
+        self.assertIsNot(old_item, self.view._nodes[stale.id])
+        self.assertFalse(self.view._nodes[stale.id].is_stale)
+        upstream = self.graph.input_connection(stale.id, "image")
+        self.assertIsNotNone(upstream)
+        self.assertEqual(upstream.src_node, source.id)
+
+        self.undo.undo()
+        self.assertEqual(self.graph.nodes[stale.id].op_id, "missing.op")
+        self.assertTrue(self.view._nodes[stale.id].is_stale)
+        self.assertIn(connection.id, self.graph.connections)
+
+    def test_frame_ports_compatible_respects_scope(self) -> None:
+        frame_id = self.add_frame()
+        frame_pos = self.graph.nodes[frame_id].pos
+        child = self.add_child(frame_id, pos=(frame_pos[0] + 40.0, frame_pos[1] + 80.0))
+        top = self.add_node(pos=(1000.0, 1000.0))
+
+        self.assertFalse(self.view.ports_compatible(top.id, "image", child.id, "image"))
+        self.assertFalse(self.view.ports_compatible(child.id, "image", top.id, "image"))
+        self.assertTrue(
+            self.view.ports_compatible(child.id, "image", frame_id, "output_1")
+        )
+        self.assertTrue(
+            self.view.ports_compatible(frame_id, "input_1", child.id, "image")
+        )
+
+        messages: list[str] = []
+        self.view.status_message.connect(messages.append)
+        self.view.connect_ports(top.id, "image", child.id, "image")
+        self.assertFalse(self.graph.connections)
+        self.assertTrue(any("层级" in message or "流程框" in message for message in messages))
+
+        scene = self.view._scene
+        top_output = self.view._nodes[top.id].output_ports["image"]
+        child_input = self.view._nodes[child.id].input_ports["image"]
+        scene._drag_source = top_output
+        try:
+            self.assertIsNone(scene._target_input_at(child_input.center_scene_pos()))
+        finally:
+            scene._drag_source = None
+
+    def test_drop_frame_operator_materializes_with_single_undo(self) -> None:
+        self.view.set_registry(make_frame_registry())
+        frame_id = self.view.add_operator_at("frame.demo", QPointF(500.0, 400.0))
+        self.assertIsNotNone(frame_id)
+        node = self.graph.nodes[frame_id]
+        self.assertTrue(node.is_frame)
+        self.assertEqual(node.frame.operator_id, "frame.demo")
+        children = self.graph.direct_children(frame_id)
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0].op_id, "test.blur")
+        self.assertEqual(children[0].params.get("ksize"), 5)
+        self.assertEqual(len(self.graph.connections), 2)
+        self.assertEqual(len(self.view._nodes), 2)
+        self.assertEqual(len(self.view._connections), 2)
+        self.assertEqual(self.undo.count(), 1)
+
+        self.undo.undo()
+        self.assertFalse(self.graph.nodes)
+        self.assertFalse(self.graph.connections)
+        self.assertFalse(self.view._nodes)
+
+        self.undo.redo()
+        self.assertEqual(len(self.graph.nodes), 2)
+        self.assertEqual(len(self.graph.connections), 2)
+
+    def test_auto_layout_only_lays_out_top_level_nodes(self) -> None:
+        frame_id = self.add_frame(pos=(400.0, 300.0))
+        frame_pos = self.graph.nodes[frame_id].pos
+        child = self.add_child(frame_id, pos=(frame_pos[0] + 30.0, frame_pos[1] + 90.0))
+        top = self.add_node(pos=(-900.0, 700.0))
+        self.view._sync_frame_geometries()
+        frame_pos = self.graph.nodes[frame_id].pos
+        child_pos = self.graph.nodes[child.id].pos
+        relative = (child_pos[0] - frame_pos[0], child_pos[1] - frame_pos[1])
+
+        changes = self.view._layout_changes()
+        changed_ids = {change[0] for change in changes}
+        self.assertNotIn(child.id, changed_ids)
+        self.assertTrue(changed_ids.issubset({frame_id, top.id}))
+
+        self.view.auto_layout()
+        new_frame = self.graph.nodes[frame_id].pos
+        new_child = self.graph.nodes[child.id].pos
+        self.assertAlmostEqual(new_child[0] - new_frame[0], relative[0], places=1)
+        self.assertAlmostEqual(new_child[1] - new_frame[1], relative[1], places=1)
+
+    def test_frame_context_menu_has_save_and_replace_actions(self) -> None:
+        frame_id = self.add_frame()
+        frame_node = self.graph.nodes[frame_id]
+        point = self._show_and_focus_node(frame_node)
+        with patch("app.graph.view.QMenu") as menu_cls:
+            self.view.contextMenuEvent(_FakeContextMenuEvent(point))
+        actions = [call.args[0] for call in menu_cls.return_value.addAction.call_args_list if call.args]
+        self.assertIn("保存为新算子…", actions)
+
+        missing = self.add_missing_node(pos=(1500.0, 1500.0))
+        point = self._show_and_focus_node(missing)
+        with patch("app.graph.view.QMenu") as menu_cls:
+            self.view.contextMenuEvent(_FakeContextMenuEvent(point))
+        actions = [call.args[0] for call in menu_cls.return_value.addAction.call_args_list if call.args]
+        self.assertIn("替换算子…", actions)
+
+    def test_move_out_of_frame_command_and_undo(self) -> None:
+        frame_id = self.add_frame()
+        frame_pos = self.graph.nodes[frame_id].pos
+        child = self.add_child(frame_id, pos=(frame_pos[0] + 30.0, frame_pos[1] + 80.0))
+        self.view.move_out_of_frame(child.id)
+        self.assertIsNone(self.graph.nodes[child.id].parent_frame)
+        # add_frame_at 占一条撤销记录；移出流程框本身是一步。
+        self.assertEqual(self.undo.count(), 2)
+
+        self.undo.undo()
+        self.assertEqual(self.graph.nodes[child.id].parent_frame, frame_id)
 
 
 if __name__ == "__main__":

@@ -942,7 +942,204 @@ print(output["mask"].shape, output["mask"].dtype)
 
 ---
 
-## 12. 参考：内置算子清单
+## 12. 流程框算子（FrameOperator）
+
+流程框算子是把画布上的流程框保存成自定义算子后得到的一类特殊算子。它不实现图像处理
+`process()`，而是携带一份可展开的内部图定义（`frame_definition`）；从算子库拖入画布时，
+画布会把它展开成「流程框 + 内部节点 + 连线」。用户操作见 [user_guide.md](user_guide.md)
+第 8 节，模型与引擎实现见 [frame_node.md](frame_node.md)。
+
+### 12.1 生成方式与限制
+
+* 在画布上右键流程框 → **保存为新算子…**，输入名称；
+* 默认写入用户算子目录的 `operators/custom/`；算子 id 为 `frame.<slug>`，
+  文件名形如 `frame_<slug>.py`；重名时自动追加 `_2`、`_3`；
+* 生成文件的 `OperatorSpec.category` 固定为 `("用户自定义算子",)`，显示在算子库最顶部；
+* 名称不能为空，最多 64 个字符；框内**不能包含原始图像节点**；
+* 生成文件**只保存数据**：内部节点的 `op_id` / 参数 / 连线，以及被引用自定义流程框的
+  `frame_ref`；不复制其它算子的实现，也不 `import` 它们。
+
+`FrameOperator.process()` 固定抛出 `OperatorError`：
+
+> 流程框算子不能作为普通算子直接执行；请把它从算子库拖入画布，内部节点会展开成流程框。
+
+因此不要把流程框算子当成普通图像算子接入参数面板或直接调用 `process()`。
+
+### 12.2 生成文件结构
+
+生成文件是一个普通 Python 模块，模块级定义 `OPERATOR`：
+
+```python
+"""由流程框“我的预处理”保存的自定义算子，内部包含 3 个节点。
+
+本文件由 MineImage「流程框 → 保存为新算子」自动生成。
+内部节点以 operator id 的形式引用，不重复其它算子的实现代码；依赖的算子缺失时
+本文件仍可正常加载，展开后的流程框内对应节点会显示为失效，可右键替换。
+"""
+
+import json
+
+from app.core.data_types import DataType          # 只有端口类型不是待定时才会导入
+from app.operators.frame import FrameOperator
+from app.operators.spec import OperatorSpec, PortSpec
+
+# 实际文件中是一行紧凑 JSON；这里展开便于阅读
+FRAME_DEFINITION = json.loads(r"""
+{
+  "format": "mineimage-frame-definition",
+  "version": 1,
+  "name": "我的预处理",
+  "inputs":  [{"key": "input_1", "label": "输入 1", "data_type": null}],
+  "outputs": [{"key": "output_1", "label": "输出 1", "data_type": "image"}],
+  "nodes": [
+    {"id": "n1", "op_id": "filter.gaussian_blur", "title": "高斯模糊",
+     "pos": [40.0, 80.0], "params": {"ksize": 5}, "parent_frame": null}
+  ],
+  "connections": [
+    {"src_node": "__frame__", "src_port": "input_1", "dst_node": "n1", "dst_port": "image"},
+    {"src_node": "n1", "src_port": "image", "dst_node": "__frame__", "dst_port": "output_1"}
+  ]
+}
+""")
+
+
+class MyFrame(FrameOperator):
+    spec = OperatorSpec(
+        id='frame.my_frame',
+        name='我的预处理',
+        category=('用户自定义算子',),
+        description='由流程框“我的预处理”保存的自定义算子，内部包含 3 个节点。',
+        version='1.0.0',
+        inputs=(
+            PortSpec('input_1', '输入 1', any_type=True),
+        ),
+        outputs=(
+            PortSpec('output_1', '输出 1', data_type=DataType.IMAGE),
+        ),
+    )
+    frame_definition = FRAME_DEFINITION
+
+
+OPERATOR = MyFrame
+```
+
+要点：
+
+* 文件里的端口声明来自保存时框的端口快照：待定端口用 `any_type=True`，已定类型用对应
+  `data_type`；
+* `frame_definition` 是唯一的数据来源；不要同时在 `spec` 和定义里维护两套不同的端口；
+* 生成文件只依赖 `app.operators.frame` / `app.operators.spec`（以及需要时的
+  `app.core.data_types`），因此被引用的算子缺失时仍能被扫描；
+* 想复制生成文件当模板时，记得同时修改 `spec.id`、类名与 `FRAME_DEFINITION.name`，
+  避免 id 冲突。
+
+### 12.3 `frame_definition` 结构
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `format` | `str` | 固定 `mineimage-frame-definition`；缺省视为兼容 |
+| `version` | `int` | 当前为 `1`；更高版本会拒绝加载 |
+| `name` | `str` | 流程框显示名 |
+| `inputs` / `outputs` | `list[dict]` | 边界端口：`key / label / data_type`；`data_type: null` 表示待定 |
+| `nodes` | `list[dict]` | 内部节点，见下表 |
+| `connections` | `list[dict]` | 连线：`src_node / src_port / dst_node / dst_port` |
+
+`nodes` 条目：
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 本次定义内唯一的节点 id |
+| `op_id` | 普通算子 id；嵌套手工流程框为 `__frame__` |
+| `title` | 节点标题 |
+| `pos` | 相对流程框左上角的 `[x, y]` |
+| `params` | 节点参数（JSON 友好结构） |
+| `parent_frame` | 所属定义节点 id；`null` 表示框的直接子节点 |
+| `frame` | 嵌套**手工流程框**的端口定义（`op_id = "__frame__"` 时） |
+| `frame_ref` | 引用另一个自定义流程框算子；含 `operator_id / name / inputs / outputs` |
+
+约定：
+
+* 根流程框自身用哨兵 `__frame__` 表示：作为 `src_node` 表示从框输入端口取数，
+  作为 `dst_node` 表示写入框输出端口；
+* `frame_ref` 只保存引用与端口，不内联被引用算子的内部节点。加载时如果注册表里有该算子，
+  会递归展开成嵌套框；没有则生成带相同端口的占位框；
+* 节点位置是相对坐标；从算子库拖入时会整体平移到落点；
+* 定义至少需要一个输出端口；单个节点 / 连线不合法时会被跳过，格式、版本或缺少输出等
+  致命问题会报错并拒绝加载；
+* 流程框内不允许保存原始图像节点；保存时会报错。
+
+### 12.4 依赖缺失行为
+
+生成文件不 import 依赖，因此 **依赖缺失不影响加载**：
+
+1. 算子库照常出现该流程框算子；
+2. 拖入画布后，缺失的普通算子节点显示「失效」徽标；
+3. 缺失的 `frame_ref` 引用会变成占位流程框，标题栏显示「依赖缺失」，端口按
+   `frame_ref` 中的快照保留；
+4. 右键失效节点 / 占位框 → 「替换算子…」可选择其它普通算子；替换保留位置与所属框，
+   尽量按端口类型重连旧连线，整次替换可撤销；
+5. 替换列表排除流程框算子；已经展开的占位框不会因为后来补回依赖文件而自动升级，
+   需要重新拖入或替换。
+
+### 12.5 手工编写与调试
+
+推荐流程：**先在界面里搭好流程框 → 保存为新算子 → 再按需复制 / 修改生成文件**。
+手工编写时至少保证：
+
+1. 模块级 `OPERATOR` 指向 `FrameOperator` 子类（或其实例）；
+2. 类上有合法的 `spec`（id / name / 至少一个输出端口）与非空 `frame_definition`；
+3. `frame_definition.nodes[].op_id` 与当前注册表中的算子 id 完全一致；
+4. 框输出的内侧来源（`dst_node = "__frame__"` 的连线）存在，否则框输出为空；
+5. 数据类型与连线两端一致；不确定时先用 `FramePort` 的待定端口。
+
+无界面检查：
+
+```python
+from app.core.frame import normalize_frame_definition
+from app.operators.loader import OperatorRegistry
+from app.operators.frame import materialize_frame_operator
+
+registry = OperatorRegistry.build(["operators/custom"])
+print(registry.issues)
+
+entry = registry.entry("frame.my_frame")
+assert entry is not None
+definition = normalize_frame_definition(entry.operator.frame_definition)
+print(definition["nodes"], definition["connections"])
+
+# 展开成节点 / 连线（不会写入图模型，可用于检查端口与依赖）
+materialization = materialize_frame_operator(registry, "frame.my_frame", pos=(0.0, 0.0))
+print(materialization.frame_node.frame.inputs)
+print([node.op_id for node in materialization.nodes])
+```
+
+常见问题：
+
+| 现象 | 原因 / 处理 |
+| --- | --- |
+| 算子库中没有生成文件 | 文件名以 `_` 开头、模块没有 `OPERATOR`、语法错误或目录未被扫描；按 F5 并查看「算子 → 查看加载日志…」 |
+| 拖入时报“找不到流程框算子” / “不是流程框算子” | 注册表条目缺失，或 `frame_definition` 为空 / 不是字典 |
+| 拖入后节点「失效」 | `frame_definition.nodes[].op_id` 在当前注册表里不存在；安装依赖或右键替换 |
+| 拖入后出现「依赖缺失」占位框 | `frame_ref.operator_id` 指向的流程框算子不存在；补回文件后重新拖入，或替换 |
+| 框输出为空 | 定义中没有 `dst_node = "__frame__"` 的连线，或内部来源节点缺失 |
+| 定义被跳过 / 端口异常 | 检查 `data_type` 是否为合法类型；非法类型会回退为待定 |
+| 提示版本过高 | 用更新版本的 MineImage 打开，或把 `version` 降到当前支持的 `1` |
+| 直接调用 `process()` 报错 | 流程框算子只能拖入画布展开，不能直接执行 |
+
+### 12.6 分发与维护
+
+* 分发流程框算子时，生成文件之外还需要它所引用的普通算子 / 自定义流程框算子文件；
+  缺依赖时能加载，但功能不完整；
+* 修改被引用的自定义算子的内部实现后，已经展开到画布的实例不会自动更新；重新从算子库
+  拖入外层算子会按最新定义展开；
+* 生成文件是普通用户算子文件，删除后算子库中的条目会消失；已经展开到画布的流程框
+  不受影响，可以继续编辑；
+* 建议给算子 id 与文件名保持稳定，工程文件记录的是节点引用的 op_id，改名会破坏旧工程；
+* 生成文件的内容由「保存为新算子」维护，手工改动后请用 12.5 的方法自测。
+
+---
+
+## 13. 参考：内置算子清单
 
 阅读内置源码是学习写法的最快途径（`app/operators/builtin/`，目录算子见
 `app/operators/builtin/catalog/`）：

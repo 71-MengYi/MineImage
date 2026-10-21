@@ -65,6 +65,8 @@ class WorkspaceWidget(QWidget):
     status_message = Signal(str)
     title_changed = Signal(str)
     modified_changed = Signal(bool)
+    #: 画布保存了新的自定义算子 / 需要重新扫描算子目录
+    operator_refresh_requested = Signal()
 
     def __init__(
         self,
@@ -196,6 +198,9 @@ class WorkspaceWidget(QWidget):
         self.graph_view.connection_changed.connect(self._on_connection_changed)
         self.graph_view.images_dropped.connect(self._on_images_dropped)
         self.graph_view.status_message.connect(self.status_message.emit)
+        operators_changed = getattr(self.graph_view, "operators_changed", None)
+        if operators_changed is not None:
+            operators_changed.connect(self.operator_refresh_requested.emit)
 
         self.param_panel.preview_requested.connect(self._on_param_preview)
         self.param_panel.save_requested.connect(self._on_param_save)
@@ -324,20 +329,29 @@ class WorkspaceWidget(QWidget):
     def _find_source_ancestor(self, node: NodeModel) -> NodeModel | None:
         if node.is_source:
             return node
-        queue = list(self.workspace.graph.predecessors(node.id))
+        graph = self.workspace.graph
+        queue: list[str] = []
+        # 框内节点的直接上游可能是流程框边界端口：先解析成真实上游节点。
+        for connection in graph.incoming(node.id):
+            resolved = graph.resolve_source(connection.src_node, connection.src_port)
+            if resolved is not None:
+                queue.append(resolved[0])
+        queue.extend(graph.predecessors(node.id))
         visited: set[str] = set()
         while queue:
             current = queue.pop(0)
             if current in visited:
                 continue
             visited.add(current)
-            candidate = self.workspace.graph.nodes.get(current)
+            candidate = graph.nodes.get(current)
             if candidate is None:
                 continue
             if candidate.is_source:
                 return candidate
-            queue.extend(self.workspace.graph.predecessors(current))
-        sources = self.workspace.graph.source_nodes()
+            if candidate.is_frame:
+                continue  # 框本身不是源图像，继续找它外部的上游
+            queue.extend(graph.predecessors(current))
+        sources = graph.source_nodes()
         return sources[0] if sources else None
 
     # ------------------------------------------------------------------ 算子
@@ -398,6 +412,9 @@ class WorkspaceWidget(QWidget):
         node = self.workspace.graph.nodes.get(node_id)
         if node is None or node.is_source:
             self.status_message.emit("源图像节点没有可调参数")
+            return
+        if node.is_frame:
+            self.status_message.emit("流程框本身没有参数；双击框内节点可编辑算子参数")
             return
         entry = self.registry.entry(node.op_id)
         if entry is None:

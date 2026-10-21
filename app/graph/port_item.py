@@ -33,6 +33,7 @@ class PortItem(QGraphicsItem):
         is_input: bool,
         index: int,
         port_spec: PortSpec | None = None,
+        pending: bool = False,
     ) -> None:
         super().__init__(node_item)
         self.node_item = node_item
@@ -43,6 +44,8 @@ class PortItem(QGraphicsItem):
         self.port_spec = port_spec
         self.data_type = port_spec.data_type if port_spec is not None else DataType.IMAGE
         self.any_type = bool(port_spec.any_type) if port_spec is not None else False
+        #: 流程框的待定端口：类型未知，使用灰色虚线绘制。
+        self.pending = bool(pending)
         self._connected = False
         self._hover = False
         self._highlight = False
@@ -53,11 +56,12 @@ class PortItem(QGraphicsItem):
 
     def _tooltip_text(self) -> str:
         role = "输入" if self.is_input else "输出"
-        type_text = (
-            "任意数据（图像 / 数值 / 边缘特征 / 轮廓特征 / 连通域）"
-            if self.any_type
-            else self.data_type.label
-        )
+        if self.pending:
+            type_text = "待定（连接后自动确定类型）"
+        elif self.any_type:
+            type_text = "任意数据（图像 / 数值 / 边缘特征 / 轮廓特征 / 连通域）"
+        else:
+            type_text = self.data_type.label
         lines = [f"{role}端口：{self.label}", f"数据类型：{type_text}"]
         spec = self.port_spec
         if spec is not None:
@@ -129,7 +133,12 @@ class PortItem(QGraphicsItem):
                 brush.setAlpha(52)
             pen_color = color.darker(115)
         painter.setBrush(brush)
-        painter.setPen(QPen(pen_color, 1.7))
+        port_pen = QPen(pen_color, 1.7)
+        if self.pending:
+            # 待定端口：灰色虚线圆，提示类型尚未确定。
+            port_pen.setStyle(Qt.PenStyle.DashLine)
+            port_pen.setDashPattern([2.0, 2.0])
+        painter.setPen(port_pen)
         painter.drawEllipse(QPointF(0.0, 0.0), self.RADIUS, self.RADIUS)
         if self._connected:
             # 已连接端口画一个小白点，和未连接端口区分更明显。
