@@ -156,7 +156,7 @@ class NodeItem(QGraphicsItem):
         return (
             self.spec is None
             and not self.node.is_source
-            and getattr(self.node, "frame", None) is None
+            and getattr(self.node, "group", None) is None
         )
 
     @property

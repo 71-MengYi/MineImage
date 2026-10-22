@@ -27,6 +27,7 @@ class GraphScene(QGraphicsScene):
         self._temp_connection: QGraphicsPathItem | None = None
         self._drag_source: PortItem | None = None
         self._highlighted: PortItem | None = None
+        self._drag_moved = False
 
     # --------------------------------------------------------------- 背景绘制
     def drawBackground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802 - Qt 接口
@@ -55,6 +56,7 @@ class GraphScene(QGraphicsScene):
         if not port.is_input:
             self.cancel_connection_drag()
             self._drag_source = port
+            self._drag_moved = False
             self._temp_connection = QGraphicsPathItem()
             pen = QPen(QColor("#3b82f6"), 2.0, Qt.PenStyle.DashLine)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -72,6 +74,7 @@ class GraphScene(QGraphicsScene):
             self._highlighted.set_highlight(False)
             self._highlighted = None
         self._drag_source = None
+        self._drag_moved = False
 
     @property
     def dragging_connection(self) -> bool:
@@ -82,6 +85,8 @@ class GraphScene(QGraphicsScene):
             return
         # 与正式连线共用 curve.connection_path，保证拖拽中的纵向曲线与落定后一致。
         start = self._drag_source.center_scene_pos()
+        if QLineF(start, scene_pos).length() >= 3.0:
+            self._drag_moved = True
         self._temp_connection.setPath(connection_path(start, scene_pos))
 
     def _update_highlight(self, scene_pos: QPointF) -> None:
@@ -95,6 +100,10 @@ class GraphScene(QGraphicsScene):
             target.set_highlight(True)
 
     def _target_input_at(self, scene_pos: QPointF) -> PortItem | None:
+        """拖拽高亮用：最近的、类型与层级都兼容的输入端口。"""
+        return self._input_port_at(scene_pos, compatible_only=True)
+
+    def _input_port_at(self, scene_pos: QPointF, *, compatible_only: bool) -> PortItem | None:
         source = self._drag_source
         if source is None:
             return None
@@ -105,7 +114,7 @@ class GraphScene(QGraphicsScene):
                 continue
             if port.node_item.node_id == source.node_item.node_id:
                 continue
-            if not self._view.ports_compatible(
+            if compatible_only and not self._view.ports_compatible(
                 source.node_item.node_id,
                 source.key,
                 port.node_item.node_id,
@@ -134,6 +143,11 @@ class GraphScene(QGraphicsScene):
     def mousePressEvent(self, event: QGraphicsSceneMouseEvent) -> None:  # noqa: N802 - Qt 接口
         if event.button() == Qt.MouseButton.LeftButton:
             source = self._port_at(event.scenePos(), is_input=False)
+            if source is None:
+                hit = self._port_at(event.scenePos(), is_input=True)
+                if hit is not None:
+                    # 算子组输入端口的外侧圆点：改从同 key 的内侧输出端口开始拖拽。
+                    source = self._view.connection_drag_source(hit)
             if source is not None:
                 self.begin_connection_drag(source)
                 event.accept()
@@ -162,8 +176,15 @@ class GraphScene(QGraphicsScene):
     def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent) -> None:  # noqa: N802 - Qt 接口
         if self._drag_source is not None and event.button() == Qt.MouseButton.LeftButton:
             source = self._drag_source
+            moved = self._drag_moved
             target = self._target_input_at(event.scenePos())
+            if target is None and moved:
+                # 落在不兼容的输入端口附近：仍走 connect_ports，让状态栏说明原因。
+                target = self._input_port_at(event.scenePos(), compatible_only=False)
             self.cancel_connection_drag()
+            if not moved:
+                event.accept()
+                return
             if target is not None and source is not None:
                 self._view.connect_ports(
                     source.node_item.node_id,

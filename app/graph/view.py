@@ -32,35 +32,37 @@ from PySide6.QtWidgets import QApplication, QFrame, QGraphicsItem, QGraphicsView
 
 from app.config import AppSettings
 from app.core.constants import (
-    FRAME_OP_ID,
+    GROUP_OP_ID,
     MIME_IMAGE_PATHS,
     MIME_OPERATOR,
     SINGLE_CLICK_DELAY_MS,
 )
 from app.core.data_types import DataType
-from app.core.frame import INVALID_LEVEL, FrameModel
+from app.core.group import INVALID_LEVEL, GroupModel
 from app.core.model import ConnectionModel, GraphError, GraphModel, NodeModel, WorkspaceModel, new_id
 from app.graph.collapse_item import CollapseBadgeItem
 from app.graph.commands import (
     AddConnectionCommand,
     AddNodeCommand,
+    DissolveGroupCommand,
     InsertNodeOnEdgeCommand,
     MoveNodeCommand,
+    ReconnectGroupMoveCommand,
     RemoveConnectionCommand,
     RemoveNodeCommand,
     RemoveNodeTreeCommand,
     RenameNodeCommand,
     ReplaceOperatorCommand,
-    SetParentFrameCommand,
+    SetParentGroupCommand,
 )
 from app.graph.connection_item import ConnectionItem
-from app.graph.frame_item import (
-    DEFAULT_FRAME_HEIGHT,
-    DEFAULT_FRAME_WIDTH,
-    FRAME_PADDING_BOTTOM,
-    FRAME_PADDING_TOP,
-    FRAME_PADDING_X,
-    FrameItem,
+from app.graph.group_item import (
+    DEFAULT_GROUP_HEIGHT,
+    DEFAULT_GROUP_WIDTH,
+    GROUP_PADDING_BOTTOM,
+    GROUP_PADDING_TOP,
+    GROUP_PADDING_X,
+    GroupItem,
 )
 from app.graph.layout import compute_layout
 from app.graph.node_item import NodeItem
@@ -69,19 +71,19 @@ from app.graph.scene import GraphScene
 from app.operators.loader import OperatorRegistry
 from app.operators.spec import OperatorSpec, PortSpec, connection_error, param_defaults, port_types_compatible
 
-# 流程框算子模块 / 替换对话框由其它协作方实现；延迟导入保证画布可独立加载。
+# 算子组模块 / 替换对话框由其它协作方实现；延迟导入保证画布可独立加载。
 try:  # pragma: no cover - 集成后始终可用
-    from app.operators.frame import (
-        FrameOperator,
-        is_frame_operator,
-        materialize_frame_operator,
-        save_frame_operator,
+    from app.operators.group import (
+        GroupOperator,
+        is_group_operator,
+        materialize_group_operator,
+        save_group_operator,
     )
 except Exception:  # noqa: BLE001
-    FrameOperator = None  # type: ignore[assignment]
-    is_frame_operator = None  # type: ignore[assignment]
-    materialize_frame_operator = None  # type: ignore[assignment]
-    save_frame_operator = None  # type: ignore[assignment]
+    GroupOperator = None  # type: ignore[assignment]
+    is_group_operator = None  # type: ignore[assignment]
+    materialize_group_operator = None  # type: ignore[assignment]
+    save_group_operator = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - shell-ui 尚未完成时保持可导入
     from app.ui.replace_operator import ReplaceOperatorDialog
@@ -89,32 +91,32 @@ except Exception:  # noqa: BLE001
     ReplaceOperatorDialog = None  # type: ignore[assignment]
 
 
-def _ensure_frame_api() -> bool:
-    """按需加载流程框算子接口（测试环境可提前 patch 模块级函数）。"""
+def _ensure_group_api() -> bool:
+    """按需加载算子组接口（测试环境可提前 patch 模块级函数）。"""
 
-    global FrameOperator, is_frame_operator, materialize_frame_operator, save_frame_operator
+    global GroupOperator, is_group_operator, materialize_group_operator, save_group_operator
     if all(
         item is not None
-        for item in (is_frame_operator, materialize_frame_operator, save_frame_operator)
+        for item in (is_group_operator, materialize_group_operator, save_group_operator)
     ):
         return True
     try:
-        from app.operators.frame import (
-            FrameOperator as _FrameOperator,
-            is_frame_operator as _is_frame_operator,
-            materialize_frame_operator as _materialize_frame_operator,
-            save_frame_operator as _save_frame_operator,
+        from app.operators.group import (
+            GroupOperator as _GroupOperator,
+            is_group_operator as _is_group_operator,
+            materialize_group_operator as _materialize_group_operator,
+            save_group_operator as _save_group_operator,
         )
     except Exception:  # noqa: BLE001
         return False
-    if FrameOperator is None:
-        FrameOperator = _FrameOperator
-    if is_frame_operator is None:
-        is_frame_operator = _is_frame_operator
-    if materialize_frame_operator is None:
-        materialize_frame_operator = _materialize_frame_operator
-    if save_frame_operator is None:
-        save_frame_operator = _save_frame_operator
+    if GroupOperator is None:
+        GroupOperator = _GroupOperator
+    if is_group_operator is None:
+        is_group_operator = _is_group_operator
+    if materialize_group_operator is None:
+        materialize_group_operator = _materialize_group_operator
+    if save_group_operator is None:
+        save_group_operator = _save_group_operator
     return True
 
 
@@ -195,7 +197,7 @@ class GraphView(QGraphicsView):
     node_removed = Signal(str)
     images_dropped = Signal(list)  # list[str]，拖入的图像路径
     status_message = Signal(str)
-    operators_changed = Signal()  # 保存新的自定义流程框算子后通知主窗口刷新算子库
+    operators_changed = Signal()  # 保存新的算子组自定义算子后通知主窗口刷新算子库
 
     def __init__(
         self,
@@ -232,12 +234,12 @@ class GraphView(QGraphicsView):
         self._paste_count = 0
         self._zoom_min = 0.15
         self._zoom_max = 3.0
-        #: 节点条目创建时的 (op_id, 是否流程框) 签名，用于替换算子后重建条目。
+        #: 节点条目创建时的 (op_id, 是否算子组) 签名，用于替换算子后重建条目。
         self._item_signatures: dict[str, tuple[str, bool]] = {}
-        #: 拖动流程框时，本帧上一次的条目位置（用于实时平移子节点）。
-        self._frame_live_last: dict[str, QPointF] = {}
+        #: 拖动算子组时，本帧上一次的条目位置（用于实时平移子节点）。
+        self._group_live_last: dict[str, QPointF] = {}
         self._suppress_move_events = False
-        self._syncing_frame_geometry = False
+        self._syncing_group_geometry = False
 
         self._scene = GraphScene(self)
         self.setScene(self._scene)
@@ -324,11 +326,11 @@ class GraphView(QGraphicsView):
         for node_id in list(selected):
             if node_id in self._collapsed:
                 selected.update(self.graph.descendants(node_id))
-        # 复制流程框时连同全部后代一起复制（parent_frame 在粘贴时重映射）。
+        # 复制算子组时连同全部后代一起复制（parent_group 在粘贴时重映射）。
         for node_id in list(selected):
             node = self.graph.nodes.get(node_id)
-            if node is not None and getattr(node, "frame", None) is not None:
-                selected.update(child.id for child in self.graph.frame_subtree(node_id))
+            if node is not None and getattr(node, "group", None) is not None:
+                selected.update(child.id for child in self.graph.group_subtree(node_id))
         node_ids = [node.id for node in self.graph.nodes.values() if node.id in selected]
         payload = {
             "kind": NODE_CLIPBOARD_KIND,
@@ -388,20 +390,20 @@ class GraphView(QGraphicsView):
             clone = NodeModel.from_dict(node.to_dict())
             clone.id = id_map[node.id]
             clone.pos = (round(node.pos[0] + dx, 2), round(node.pos[1] + dy, 2))
-            old_parent = node.parent_frame
+            old_parent = node.parent_group
             if node.is_source:
-                clone.parent_frame = None
+                clone.parent_group = None
             elif old_parent is not None and old_parent in id_map:
-                clone.parent_frame = id_map[old_parent]
+                clone.parent_group = id_map[old_parent]
             else:
-                # 父流程框没有一起复制：粘贴为顶层，避免错误挂到原框。
-                clone.parent_frame = None
+                # 父算子组没有一起复制：粘贴为顶层，避免错误挂到原算子组。
+                clone.parent_group = None
             clones.append(clone)
         cloned_by_id = {clone.id: clone for clone in clones}
 
         def _clone_depth(clone: NodeModel) -> int:
             depth = 0
-            parent = clone.parent_frame
+            parent = clone.parent_group
             seen = {clone.id}
             while parent is not None and parent not in seen:
                 seen.add(parent)
@@ -409,7 +411,7 @@ class GraphView(QGraphicsView):
                 parent_model = cloned_by_id.get(parent)
                 if parent_model is None:
                     break
-                parent = parent_model.parent_frame
+                parent = parent_model.parent_group
             return depth
 
         clones.sort(key=_clone_depth)
@@ -439,7 +441,7 @@ class GraphView(QGraphicsView):
         finally:
             self._undo_stack.endMacro()
 
-        self._sync_frame_geometries()
+        self._sync_group_geometries()
         self._select_nodes(new_ids, new_ids[-1])
         self.node_created.emit(new_ids[-1])
         message = f"已粘贴 {len(new_ids)} 个节点"
@@ -528,9 +530,9 @@ class GraphView(QGraphicsView):
         if scene_pos is None:
             scene_pos = self.mapToScene(self.viewport().rect().center())
         scene_pos = QPointF(scene_pos)
-        # 自定义流程框算子：展开成框 + 内部节点 + 连线，整次一步撤销。
-        if self._is_frame_operator_id(op_id):
-            return self._add_frame_operator_at(op_id, scene_pos)
+        # 自定义算子组：展开成算子组 + 内部节点 + 连线，整次一步撤销。
+        if self._is_group_operator_id(op_id):
+            return self._add_group_operator_at(op_id, scene_pos)
         spec = self._registry.spec(op_id)
         if spec is None:
             self.status_message.emit(f"未找到算子：{op_id}")
@@ -560,19 +562,19 @@ class GraphView(QGraphicsView):
             target_rect = QRectF(target_item.pos(), target_item.size())
             fallback_pos = QPointF(target_rect.right() + 32.0, target_rect.top())
         if target is not None and target.port is not None:
-            parent_frame = self._scope_for_port_target(target.port, target.kind)
+            parent_group = self._scope_for_port_target(target.port, target.kind)
         else:
-            parent_frame = self.frame_at(fallback_pos)
+            parent_group = self.group_at(fallback_pos)
         node = NodeModel(
             id=new_id("n"),
             op_id=op_id,
             title=spec.name,
             pos=(fallback_pos.x(), fallback_pos.y()),
             params=param_defaults(spec),
-            parent_frame=parent_frame,
+            parent_group=parent_group,
         )
         self._undo_stack.push(AddNodeCommand(self.graph, node))
-        self._sync_frame_geometries()
+        self._sync_group_geometries()
         self.set_selected_node(node.id)
         self.node_created.emit(node.id)
         self.status_message.emit(f"已添加节点“{spec.name}”")
@@ -584,6 +586,9 @@ class GraphView(QGraphicsView):
         if not self.viewport().rect().contains(self.mapFromScene(scene_pos)):
             return None
         if self.item_at_scene(scene_pos) is not None:
+            self.status_message.emit(
+                "未找到可连接的输入端口：请拖到目标节点的输入端口上，或拖到空白处自动创建输出节点"
+            )
             return None
         return self.add_output_node_at(source.node_item.node_id, source.key, scene_pos)
 
@@ -613,11 +618,11 @@ class GraphView(QGraphicsView):
             return None
 
         scene_pos = QPointF(scene_pos)
-        parent_frame = self.frame_at(scene_pos)
+        parent_group = self.group_at(scene_pos)
         source_level = self.graph.port_level(src_node_id, src_port, "src")
-        if source_level != INVALID_LEVEL and source_level != parent_frame:
+        if source_level != INVALID_LEVEL and source_level != parent_group:
             self.status_message.emit(
-                "只能在同一流程框层级内连接；请通过流程框的输入 / 输出端口连接跨框数据"
+                "只能在同一算子组层级内连接；请通过算子组的输入 / 输出端口连接跨组数据"
             )
             return None
         node = NodeModel(
@@ -627,7 +632,7 @@ class GraphView(QGraphicsView):
             # 输入端口在节点上边缘且单端口居中：让落点正好落在输入端口上。
             pos=(scene_pos.x() - NodeItem.WIDTH / 2.0, scene_pos.y()),
             params=param_defaults(spec),
-            parent_frame=parent_frame,
+            parent_group=parent_group,
         )
         self._undo_stack.beginMacro("添加输出节点并连接")
         try:
@@ -641,7 +646,7 @@ class GraphView(QGraphicsView):
             return None
         self._undo_stack.endMacro()
 
-        self._sync_frame_geometries()
+        self._sync_group_geometries()
         self._update_scene_rect()
         self._select_nodes([node.id], node.id)
         self.status_message.emit(
@@ -656,12 +661,12 @@ class GraphView(QGraphicsView):
             self._create_node_item(node)
         for connection in list(self.graph.connections.values()):
             self._create_connection_item(connection)
-        self._sync_frame_geometries()
+        self._sync_group_geometries()
         self._refresh_collapse_state()
         if selected and selected in self._nodes and self._nodes[selected].isVisible():
             self.set_selected_node(selected)
 
-    # ------------------------------------------------------------ 流程框基础设施
+    # ------------------------------------------------------------ 算子组基础设施
     def is_operator_registered(self, op_id: str | None) -> bool:
         """算子 id 是否已注册（失效节点 / 缺失依赖判断用）。"""
 
@@ -673,37 +678,37 @@ class GraphView(QGraphicsView):
             return False
 
     def _resolve_port_type(self, node_id: str, port_key: str, is_input: bool) -> DataType | None:
-        """注入 GraphModel 的端口类型解析器：由注册表 + 流程框端口决定类型。"""
+        """注入 GraphModel 的端口类型解析器：由注册表 + 算子组端口决定类型。"""
 
         spec = self.port_spec(node_id, port_key, is_input)
         if spec is None or spec.any_type or spec.data_type is None:
             return None
         return spec.data_type
 
-    def _frame_nodes(self) -> list[NodeModel]:
-        return [node for node in self.graph.nodes.values() if getattr(node, "frame", None) is not None]
+    def _group_nodes(self) -> list[NodeModel]:
+        return [node for node in self.graph.nodes.values() if getattr(node, "group", None) is not None]
 
-    def _frame_depth(self, frame_id: str) -> int:
+    def _group_depth(self, group_id: str) -> int:
         depth = 0
-        current = self.graph.nodes.get(frame_id)
+        current = self.graph.nodes.get(group_id)
         seen: set[str] = set()
-        while current is not None and current.parent_frame:
-            if current.parent_frame in seen:
+        while current is not None and current.parent_group:
+            if current.parent_group in seen:
                 break
-            seen.add(current.parent_frame)
-            parent = self.graph.nodes.get(current.parent_frame)
-            if parent is None or getattr(parent, "frame", None) is None:
+            seen.add(current.parent_group)
+            parent = self.graph.nodes.get(current.parent_group)
+            if parent is None or getattr(parent, "group", None) is None:
                 break
             depth += 1
             current = parent
         return depth
 
-    def _frame_ancestors(self, node_id: str) -> list[str]:
+    def _group_ancestors(self, node_id: str) -> list[str]:
         ancestors: list[str] = []
         current = self.graph.nodes.get(node_id)
         seen: set[str] = set()
-        while current is not None and current.parent_frame:
-            parent_id = current.parent_frame
+        while current is not None and current.parent_group:
+            parent_id = current.parent_group
             if parent_id in seen:
                 break
             seen.add(parent_id)
@@ -714,32 +719,32 @@ class GraphView(QGraphicsView):
             current = parent
         return ancestors
 
-    def _frame_item_rect(self, frame_id: str) -> QRectF | None:
-        item = self._nodes.get(frame_id)
+    def _group_item_rect(self, group_id: str) -> QRectF | None:
+        item = self._nodes.get(group_id)
         if item is None:
             return None
         return QRectF(item.pos(), item.size())
 
-    def frame_at(self, scene_pos: QPointF, *, exclude: Iterable[str] = ()) -> str | None:
-        """返回场景坐标命中的最深流程框 id（支持嵌套；忽略排除项）。"""
+    def group_at(self, scene_pos: QPointF, *, exclude: Iterable[str] = ()) -> str | None:
+        """返回场景坐标命中的最深算子组 id（支持嵌套；忽略排除项）。"""
 
         excluded = set(exclude)
         best: str | None = None
         best_depth = -1
-        for node in self._frame_nodes():
+        for node in self._group_nodes():
             if node.id in excluded:
                 continue
-            rect = self._frame_item_rect(node.id)
+            rect = self._group_item_rect(node.id)
             if rect is None or not rect.contains(scene_pos):
                 continue
-            depth = self._frame_depth(node.id)
+            depth = self._group_depth(node.id)
             if depth > best_depth:
                 best = node.id
                 best_depth = depth
         return best
 
     def _scope_for_port_target(self, port: PortItem, kind: str) -> str | None:
-        """库拖拽吸附到端口时，新节点应处的流程框层级。"""
+        """库拖拽吸附到端口时，新节点应处的算子组层级。"""
 
         role = "dst" if kind == "input" else "src"
         level = self.graph.port_level(port.node_item.node_id, port.key, role)
@@ -747,23 +752,23 @@ class GraphView(QGraphicsView):
             return None
         return level
 
-    def _sync_frame_geometries(self) -> None:
-        """按直接子节点包围盒反推流程框位置 / 尺寸（不写入撤销栈）。"""
+    def _sync_group_geometries(self) -> None:
+        """按直接子节点包围盒反推算子组位置 / 尺寸（不写入撤销栈）。"""
 
-        if self._syncing_frame_geometry:
+        if self._syncing_group_geometry:
             return
-        self._syncing_frame_geometry = True
+        self._syncing_group_geometry = True
         self._suppress_move_events = True
         try:
-            frames = self._frame_nodes()
-            frames.sort(key=lambda node: self._frame_depth(node.id), reverse=True)
-            for frame_node in frames:
-                item = self._nodes.get(frame_node.id)
-                if not isinstance(item, FrameItem):
+            groups = self._group_nodes()
+            groups.sort(key=lambda node: self._group_depth(node.id), reverse=True)
+            for group_node in groups:
+                item = self._nodes.get(group_node.id)
+                if not isinstance(item, GroupItem):
                     continue
-                children = self.graph.direct_children(frame_node.id)
+                children = self.graph.direct_children(group_node.id)
                 if not children:
-                    item.set_frame_geometry(DEFAULT_FRAME_WIDTH, DEFAULT_FRAME_HEIGHT)
+                    item.set_group_geometry(DEFAULT_GROUP_WIDTH, DEFAULT_GROUP_HEIGHT)
                     continue
                 content = QRectF()
                 for child in children:
@@ -773,81 +778,81 @@ class GraphView(QGraphicsView):
                     child_rect = QRectF(child_item.pos(), child_item.size())
                     content = child_rect if content.isNull() else content.united(child_rect)
                 if content.isNull():
-                    item.set_frame_geometry(DEFAULT_FRAME_WIDTH, DEFAULT_FRAME_HEIGHT)
+                    item.set_group_geometry(DEFAULT_GROUP_WIDTH, DEFAULT_GROUP_HEIGHT)
                     continue
-                width = content.width() + 2.0 * FRAME_PADDING_X
-                height = content.height() + FRAME_PADDING_TOP + FRAME_PADDING_BOTTOM
+                width = content.width() + 2.0 * GROUP_PADDING_X
+                height = content.height() + GROUP_PADDING_TOP + GROUP_PADDING_BOTTOM
                 new_pos = (
-                    round(content.left() - FRAME_PADDING_X, 2),
-                    round(content.top() - FRAME_PADDING_TOP, 2),
+                    round(content.left() - GROUP_PADDING_X, 2),
+                    round(content.top() - GROUP_PADDING_TOP, 2),
                 )
                 if (
-                    abs(frame_node.pos[0] - new_pos[0]) > 0.01
-                    or abs(frame_node.pos[1] - new_pos[1]) > 0.01
+                    abs(group_node.pos[0] - new_pos[0]) > 0.01
+                    or abs(group_node.pos[1] - new_pos[1]) > 0.01
                 ):
-                    self.graph.set_node_pos(frame_node.id, new_pos, touch=False)
+                    self.graph.set_node_pos(group_node.id, new_pos, touch=False)
                 item.sync_position(new_pos)
-                item.set_frame_geometry(width, height)
-                self._update_connections_for(frame_node.id)
-                self._position_collapse_badge(frame_node.id)
+                item.set_group_geometry(width, height)
+                self._update_connections_for(group_node.id)
+                self._position_collapse_badge(group_node.id)
         finally:
             self._suppress_move_events = False
-            self._syncing_frame_geometry = False
+            self._syncing_group_geometry = False
         self._update_scene_rect()
 
-    def _refresh_frame_geometry(self, frame_id: str | None = None) -> None:
-        self._sync_frame_geometries()
+    def _refresh_group_geometry(self, group_id: str | None = None) -> None:
+        self._sync_group_geometries()
 
-    def on_frame_item_geometry_changed(self, item: FrameItem) -> None:
+    def on_group_item_geometry_changed(self, item: GroupItem) -> None:
         self._update_connections_for(item.node_id)
         self._position_collapse_badge(item.node_id)
 
     def _on_undo_stack_changed(self, _index: int = 0) -> None:
-        # 撤销 / 重做后重新按子节点反推框几何，保证模型与条目一致。
-        self._sync_frame_geometries()
+        # 撤销 / 重做后重新按子节点反推算子组几何，保证模型与条目一致。
+        self._sync_group_geometries()
 
-    # ------------------------------------------------------------ 新建流程框
-    def add_frame_at(
+    # ------------------------------------------------------------ 新建算子组
+    def add_group_at(
         self,
         scene_pos: QPointF | None = None,
         *,
-        parent_frame: str | None = None,
-        title: str = "流程框",
+        parent_group: str | None = None,
+        title: str = "算子组",
     ) -> str:
-        """在场景坐标中心位置新建一个流程框（可指定父框实现嵌套）。"""
+        """在场景坐标中心位置新建一个算子组（可指定父算子组实现嵌套）。"""
 
         if scene_pos is None:
             scene_pos = self.mapToScene(self.viewport().rect().center())
         scene_pos = QPointF(scene_pos)
-        if parent_frame is not None:
-            parent = self.graph.nodes.get(parent_frame)
-            if parent is None or getattr(parent, "frame", None) is None:
-                self.status_message.emit("父流程框不存在，已在顶层创建流程框")
-                parent_frame = None
+        if parent_group is not None:
+            parent = self.graph.nodes.get(parent_group)
+            if parent is None or getattr(parent, "group", None) is None:
+                self.status_message.emit("父算子组不存在，已在顶层创建算子组")
+                parent_group = None
         node = NodeModel(
             id=new_id("n"),
-            op_id=FRAME_OP_ID,
-            title=str(title or "流程框"),
+            op_id=GROUP_OP_ID,
+            title=str(title or "算子组"),
             pos=(
-                round(scene_pos.x() - DEFAULT_FRAME_WIDTH / 2.0, 2),
-                round(scene_pos.y() - DEFAULT_FRAME_HEIGHT / 2.0, 2),
+                round(scene_pos.x() - DEFAULT_GROUP_WIDTH / 2.0, 2),
+                round(scene_pos.y() - DEFAULT_GROUP_HEIGHT / 2.0, 2),
             ),
-            frame=FrameModel.create_default(),
-            parent_frame=parent_frame,
+            group=GroupModel.create_default(),
+            parent_group=parent_group,
         )
         try:
             self._undo_stack.push(AddNodeCommand(self.graph, node))
         except GraphError as exc:
-            self.status_message.emit(f"添加流程框失败：{exc}")
+            self.status_message.emit(f"添加算子组失败：{exc}")
             return ""
-        self._sync_frame_geometries()
+        self._sync_group_geometries()
         self.set_selected_node(node.id)
         self.node_created.emit(node.id)
-        self.status_message.emit(f"已添加流程框“{node.display_title()}”")
+        self.status_message.emit(f"已添加算子组“{node.display_title()}”")
         return node.id
 
-    def _is_frame_operator_id(self, op_id: str) -> bool:
-        if not _ensure_frame_api() or is_frame_operator is None:
+    def _is_group_operator_id(self, op_id: str) -> bool:
+        if not _ensure_group_api() or is_group_operator is None:
             return False
         candidates: list[Any] = []
         getter = getattr(self._registry, "get", None)
@@ -868,28 +873,28 @@ class GraphView(QGraphicsView):
             if candidate is None:
                 continue
             try:
-                if is_frame_operator(candidate):
+                if is_group_operator(candidate):
                     return True
             except Exception:  # noqa: BLE001
                 continue
         return False
 
-    def _add_frame_operator_at(self, op_id: str, scene_pos: QPointF) -> str | None:
-        """从算子库拖入自定义流程框算子：一步撤销生成框 + 内部节点 + 连线。"""
+    def _add_group_operator_at(self, op_id: str, scene_pos: QPointF) -> str | None:
+        """从算子库拖入算子组自定义算子：一步撤销生成算子组 + 内部节点 + 连线。"""
 
-        if not _ensure_frame_api() or materialize_frame_operator is None:
-            self.status_message.emit("当前环境未提供流程框算子展开接口")
+        if not _ensure_group_api() or materialize_group_operator is None:
+            self.status_message.emit("当前环境未提供算子组展开接口")
             return None
-        parent_frame = self.frame_at(scene_pos)
+        parent_group = self.group_at(scene_pos)
         try:
-            materialization = materialize_frame_operator(
+            materialization = materialize_group_operator(
                 self._registry,
                 op_id,
                 pos=(float(scene_pos.x()), float(scene_pos.y())),
-                parent_frame=parent_frame,
+                parent_group=parent_group,
             )
         except Exception as exc:  # noqa: BLE001 - 定义错误需要提示给用户
-            self.status_message.emit(f"展开流程框算子失败：{exc}")
+            self.status_message.emit(f"展开算子组失败：{exc}")
             return None
         nodes = list(materialization.nodes)
         connections = list(materialization.connections)
@@ -898,7 +903,7 @@ class GraphView(QGraphicsView):
 
         def local_depth(node: NodeModel) -> int:
             depth = 0
-            parent = node.parent_frame
+            parent = node.parent_group
             seen = {node.id}
             while parent in nodeset and parent not in seen:
                 seen.add(parent)
@@ -906,11 +911,11 @@ class GraphView(QGraphicsView):
                 parent_model = by_id.get(parent)
                 if parent_model is None:
                     break
-                parent = parent_model.parent_frame
+                parent = parent_model.parent_group
             return depth
 
         ordered = sorted(nodes, key=local_depth)
-        self._undo_stack.beginMacro("添加流程框算子")
+        self._undo_stack.beginMacro("添加算子组")
         try:
             for node in ordered:
                 self._undo_stack.push(AddNodeCommand(self.graph, node))
@@ -926,36 +931,36 @@ class GraphView(QGraphicsView):
                 )
         finally:
             self._undo_stack.endMacro()
-        frame_id = materialization.frame_node.id
-        self._sync_frame_geometries()
-        if frame_id in self._nodes:
-            self.set_selected_node(frame_id)
-        self.node_created.emit(frame_id)
+        group_id = materialization.group_node.id
+        self._sync_group_geometries()
+        if group_id in self._nodes:
+            self.set_selected_node(group_id)
+        self.node_created.emit(group_id)
         self.status_message.emit(
-            f"已添加流程框算子“{materialization.frame_node.display_title()}”"
+            f"已添加算子组“{materialization.group_node.display_title()}”"
         )
-        return frame_id
+        return group_id
 
     # -------------------------------------------------------- 保存为自定义算子
-    def save_frame_as_operator(self, frame_id: str) -> None:
-        """右键菜单：把流程框保存为自定义算子。"""
+    def save_group_as_operator(self, group_id: str) -> None:
+        """右键菜单：把算子组保存为自定义算子。"""
 
-        node = self.graph.nodes.get(frame_id)
-        if node is None or not node.is_frame or node.frame is None:
-            self.status_message.emit("只能把流程框保存为新算子")
+        node = self.graph.nodes.get(group_id)
+        if node is None or not node.is_group or node.group is None:
+            self.status_message.emit("只能把算子组保存为新算子")
             return
         sources = [
             item
-            for item in [node, *self.graph.frame_subtree(frame_id)]
+            for item in [node, *self.graph.group_subtree(group_id)]
             if getattr(item, "is_source", False)
         ]
         if sources:
             self.status_message.emit(
-                "流程框内包含原始图像节点，无法保存为新算子；请先把源图像节点移出流程框"
+                "算子组内包含原始图像节点，无法保存为新算子；请先把源图像节点移出算子组"
             )
             return
-        if not _ensure_frame_api() or save_frame_operator is None:
-            self.status_message.emit("当前环境未提供流程框保存接口")
+        if not _ensure_group_api() or save_group_operator is None:
+            self.status_message.emit("当前环境未提供算子组保存接口")
             return
         name, ok = QInputDialog.getText(
             self,
@@ -970,7 +975,7 @@ class GraphView(QGraphicsView):
             self.status_message.emit("算子名称不能为空")
             return
         try:
-            saved = save_frame_operator(self.graph, frame_id, name, registry=self._registry)
+            saved = save_group_operator(self.graph, group_id, name, registry=self._registry)
         except Exception as exc:  # noqa: BLE001 - 保存失败需要提示给用户
             self.status_message.emit(f"保存为新算子失败：{exc}")
             return
@@ -988,8 +993,8 @@ class GraphView(QGraphicsView):
         if spec is None:
             self.status_message.emit(f"未找到算子：{op_id}")
             return False
-        if self._is_frame_operator_id(op_id):
-            self.status_message.emit("流程框算子不能用于替换节点，请从算子库直接拖入画布")
+        if self._is_group_operator_id(op_id):
+            self.status_message.emit("算子组不能用于替换节点，请从算子库直接拖入画布")
             return False
 
         old_connections = [
@@ -1038,7 +1043,7 @@ class GraphView(QGraphicsView):
             reusable_connections=reusable,
         )
         self._undo_stack.push(command)
-        self._sync_frame_geometries()
+        self._sync_group_geometries()
         self.status_message.emit(f"已将节点替换为“{spec.name}”")
         return True
 
@@ -1084,19 +1089,19 @@ class GraphView(QGraphicsView):
                 connection.update_path()
         self._update_connections_for(node_id)
 
-    # ------------------------------------------------------ 流程框拖动实时联动
-    def _move_frame_descendants_live(self, item: NodeItem) -> None:
+    # ------------------------------------------------------ 算子组拖动实时联动
+    def _move_group_descendants_live(self, item: NodeItem) -> None:
         start = self._move_start.get(item.node_id)
         if start is None or self._suppress_move_events:
             return
-        last = self._frame_live_last.get(item.node_id, start)
+        last = self._group_live_last.get(item.node_id, start)
         delta = item.pos() - last
         if abs(delta.x()) < 1e-9 and abs(delta.y()) < 1e-9:
             return
-        self._frame_live_last[item.node_id] = QPointF(item.pos())
+        self._group_live_last[item.node_id] = QPointF(item.pos())
         self._suppress_move_events = True
         try:
-            for child in self.graph.frame_subtree(item.node_id):
+            for child in self.graph.group_subtree(item.node_id):
                 child_item = self._nodes.get(child.id)
                 if child_item is None:
                     continue
@@ -1109,16 +1114,375 @@ class GraphView(QGraphicsView):
             self._suppress_move_events = False
         self._update_scene_rect()
 
-    def move_out_of_frame(self, node_id: str) -> None:
-        """把框内节点移出到顶层（保留位置与连线，一步撤销）。"""
+    def move_out_of_group(self, node_id: str) -> None:
+        """把组内节点移出到顶层（经组端口的连线改接为直连，一步撤销）。"""
 
         node = self.graph.nodes.get(node_id)
-        if node is None or not node.parent_frame:
+        if node is None or not node.parent_group:
             return
-        old_parent = node.parent_frame
-        self._undo_stack.push(SetParentFrameCommand(self.graph, node_id, old_parent, None))
-        self._sync_frame_geometries()
-        self.status_message.emit(f"已把“{node.display_title()}”移出流程框")
+        command = self._reparent_command(node_id, None, "移出算子组")
+        if command is not None:
+            self._undo_stack.push(command)
+        self._sync_group_geometries()
+        self.status_message.emit(f"已把“{node.display_title()}”移出算子组")
+
+    # ------------------------------------------------- 拖动 / 移出时自动重连
+    def _reparent_command(
+        self, node_id: str, new_parent: str | None, text: str
+    ) -> QUndoCommand | None:
+        """返回调整所属算子组的命令；能经组端口重连时返回组合命令。"""
+
+        node = self.graph.nodes.get(node_id)
+        if node is None or node.parent_group == new_parent:
+            return None
+        changes = [(node_id, node.parent_group, new_parent)]
+        command = self._build_reconnect_command(changes, text)
+        if command is not None:
+            return command
+        return SetParentGroupCommand(self.graph, node_id, node.parent_group, new_parent, text)
+
+    def _build_reconnect_command(
+        self,
+        changes: list[tuple[str, str | None, str | None]],
+        text: str = "移动节点并调整算子组",
+    ) -> QUndoCommand | None:
+        """规划一次所属算子组变化带来的连线改接；无需改接时返回 None。
+
+        * 节点原来的直连若在新位置跨层，则在公共祖先与目标层之间的各级算子组
+          上补端口，把连线引到组边界的内 / 外侧；
+        * 从旧父组端口接出来的连线先“展开”为真实的外部来源 / 目标，再按新层级
+          重新走线；
+        * 任何一步无法规划时返回 None，由调用方退回只调整所属关系。
+        """
+
+        parent_map = {node_id: new_parent for node_id, _old, new_parent in changes}
+        old_parent_map = {node_id: old_parent for node_id, old_parent, _new in changes}
+        removed: dict[str, ConnectionModel] = {}
+        edges: list[tuple[str, str, str, str]] = []
+        seen_edges: set[tuple[str, str, str, str]] = set()
+        processed: set[str] = set()
+
+        def add_edge(edge: tuple[str, str, str, str]) -> None:
+            if edge in seen_edges:
+                return
+            seen_edges.add(edge)
+            edges.append(edge)
+
+        for connection in list(self.graph.connections.values()):
+            if connection.id in processed:
+                continue
+            src_changed = connection.src_node in parent_map
+            dst_changed = connection.dst_node in parent_map
+            if not src_changed and not dst_changed:
+                continue
+            processed.add(connection.id)
+            if dst_changed and not src_changed:
+                for edge in self._logical_incoming_edges(
+                    connection, connection.dst_node, old_parent_map[connection.dst_node], removed
+                ):
+                    add_edge(edge)
+            elif src_changed and not dst_changed:
+                for edge in self._logical_outgoing_edges(
+                    connection, connection.src_node, old_parent_map[connection.src_node], removed
+                ):
+                    add_edge(edge)
+            else:
+                removed[connection.id] = connection
+                add_edge(
+                    (connection.src_node, connection.src_port, connection.dst_node, connection.dst_port)
+                )
+
+        plan: dict[str, list] = {"removed": [], "added": [], "ports": []}
+        for edge in edges:
+            if not self._route_logical_edge(edge, parent_map, plan):
+                return None
+        for connection in removed.values():
+            plan["removed"].append(connection)
+        if not plan["removed"] and not plan["added"] and not plan["ports"]:
+            return None
+        added = [(new_id("c"), *edge) for edge in plan["added"]]
+        return ReconnectGroupMoveCommand(
+            self.graph,
+            changes,
+            removed=plan["removed"],
+            added=added,
+            ports=plan["ports"],
+            text=text,
+        )
+
+    def _logical_incoming_edges(
+        self,
+        connection: ConnectionModel,
+        node_id: str,
+        old_parent: str | None,
+        removed: dict[str, ConnectionModel],
+    ) -> list[tuple[str, str, str, str]]:
+        """把一条入边还原到真实来源；旧父组输入端口的内侧连线会被展开。"""
+
+        removed[connection.id] = connection
+        if old_parent and connection.src_node == old_parent:
+            group_node = self.graph.nodes.get(old_parent)
+            group = group_node.group if group_node is not None and group_node.is_group else None
+            if group is not None and connection.src_port in group.input_keys():
+                outer = self.graph.input_connection(old_parent, connection.src_port)
+                other_inner = [
+                    item
+                    for item in self.graph.outgoing(old_parent)
+                    if item.src_port == connection.src_port and item.id != connection.id
+                ]
+                if outer is not None and not other_inner:
+                    removed[outer.id] = outer
+                if outer is None:
+                    return []
+                return [(outer.src_node, outer.src_port, node_id, connection.dst_port)]
+        return [(connection.src_node, connection.src_port, node_id, connection.dst_port)]
+
+    def _logical_outgoing_edges(
+        self,
+        connection: ConnectionModel,
+        node_id: str,
+        old_parent: str | None,
+        removed: dict[str, ConnectionModel],
+    ) -> list[tuple[str, str, str, str]]:
+        """把一条出边还原到真实目标；旧父组输出端口的外侧连线会被展开。"""
+
+        removed[connection.id] = connection
+        if old_parent and connection.dst_node == old_parent:
+            group_node = self.graph.nodes.get(old_parent)
+            group = group_node.group if group_node is not None and group_node.is_group else None
+            if group is not None and connection.dst_port in group.output_keys():
+                outer_edges = [
+                    item
+                    for item in self.graph.outgoing(old_parent)
+                    if item.src_port == connection.dst_port
+                ]
+                results: list[tuple[str, str, str, str]] = []
+                for outer in outer_edges:
+                    removed[outer.id] = outer
+                    results.append(
+                        (node_id, connection.src_port, outer.dst_node, outer.dst_port)
+                    )
+                return results
+        return [(node_id, connection.src_port, connection.dst_node, connection.dst_port)]
+
+    def _route_logical_edge(
+        self,
+        edge: tuple[str, str, str, str],
+        parent_map: dict[str, str | None],
+        plan: dict[str, list],
+    ) -> bool:
+        """把一条逻辑连线接到两端所在层级；跨层时在各级算子组上补端口。"""
+
+        src_node, src_port, dst_node, dst_port = edge
+        src_level = self._final_port_level(src_node, src_port, "src", parent_map)
+        dst_level = self._final_port_level(dst_node, dst_port, "dst", parent_map)
+        if src_level == INVALID_LEVEL or dst_level == INVALID_LEVEL:
+            return False
+        data_type = self._edge_data_type(src_node, src_port, dst_node, dst_port)
+        common = self._common_level(src_level, dst_level, parent_map)
+        current_node, current_port = src_node, src_port
+        current_level = src_level
+        guard = 0
+        while current_level != common:
+            guard += 1
+            if guard > 64 or current_level is None:
+                return False
+            group_node = self.graph.nodes.get(current_level)
+            if group_node is None or not group_node.is_group:
+                return False
+            key = self._plan_group_port(plan, current_level, False, data_type)
+            if key is None:
+                return False
+            plan["added"].append((current_node, current_port, current_level, key))
+            current_node, current_port = current_level, key
+            current_level = self._final_level(current_level, parent_map)
+        chain: list[str] = []
+        level = dst_level
+        guard = 0
+        while level != common:
+            guard += 1
+            if guard > 64 or level is None:
+                return False
+            group_node = self.graph.nodes.get(level)
+            if group_node is None or not group_node.is_group:
+                return False
+            chain.append(level)
+            level = self._final_level(level, parent_map)
+        for group_id in reversed(chain):
+            key = self._plan_group_port(plan, group_id, True, data_type)
+            if key is None:
+                return False
+            plan["added"].append((current_node, current_port, group_id, key))
+            current_node, current_port = group_id, key
+        plan["added"].append((current_node, current_port, dst_node, dst_port))
+        return True
+
+    def _plan_group_port(
+        self, plan: dict[str, list], group_id: str, is_input: bool, data_type
+    ) -> str | None:
+        """在计划里给算子组分配一个新端口 key（不直接修改图模型）。"""
+
+        node = self.graph.nodes.get(group_id)
+        group = node.group if node is not None and node.is_group else None
+        if group is None:
+            return None
+        keys = set(group.input_keys() if is_input else group.output_keys())
+        keys.update(
+            key
+            for planned_group, planned_input, key, _label, _dtype in plan["ports"]
+            if planned_group == group_id and planned_input == is_input
+        )
+        index = 1
+        while f"{'input' if is_input else 'output'}_{index}" in keys:
+            index += 1
+        key = f"{'input' if is_input else 'output'}_{index}"
+        label = f"{'输入' if is_input else '输出'} {index}"
+        plan["ports"].append((group_id, is_input, key, label, data_type))
+        return key
+
+    def _edge_data_type(self, src_node: str, src_port: str, dst_node: str, dst_port: str):
+        for node_id, key, is_input in (
+            (src_node, src_port, False),
+            (dst_node, dst_port, True),
+        ):
+            spec = self.port_spec(node_id, key, is_input)
+            if spec is not None and not spec.any_type and spec.data_type is not None:
+                return spec.data_type
+        return None
+
+    def _final_level(self, node_id: str, parent_map: dict[str, str | None]) -> str | None:
+        if node_id in parent_map:
+            return parent_map[node_id]
+        node = self.graph.nodes.get(node_id)
+        return node.parent_group if node is not None else None
+
+    def _level_chain(
+        self, level: str | None, parent_map: dict[str, str | None]
+    ) -> list[str | None]:
+        chain: list[str | None] = []
+        current = level
+        seen: set[str | None] = set()
+        while True:
+            chain.append(current)
+            if current is None:
+                break
+            node = self.graph.nodes.get(current)
+            if node is None:
+                break
+            current = parent_map.get(current, node.parent_group)
+            if current in seen:
+                break
+            seen.add(current)
+        return chain
+
+    def _common_level(
+        self,
+        first: str | None,
+        second: str | None,
+        parent_map: dict[str, str | None],
+    ) -> str | None:
+        second_chain = set(self._level_chain(second, parent_map))
+        for level in self._level_chain(first, parent_map):
+            if level in second_chain:
+                return level
+        return None
+
+    def _final_port_level(
+        self,
+        node_id: str,
+        port_key: str,
+        role: str,
+        parent_map: dict[str, str | None],
+    ) -> str | None:
+        node = self.graph.nodes.get(node_id)
+        if node is None:
+            return INVALID_LEVEL
+        if node.is_group and node.group is not None:
+            if port_key in node.group.input_keys():
+                return node.id if role == "src" else self._final_level(node_id, parent_map)
+            if port_key in node.group.output_keys():
+                return self._final_level(node_id, parent_map) if role == "src" else node.id
+            return INVALID_LEVEL
+        return self._final_level(node_id, parent_map)
+
+    def dissolve_group(self, node_id: str) -> None:
+        """解散算子组：内部节点留在画布，边界连线改成内外直连（一步撤销）。"""
+
+        node = self.graph.nodes.get(node_id)
+        if node is None or not node.is_group:
+            self.status_message.emit("只能解散算子组")
+            return
+        children = len(self.graph.direct_children(node_id))
+        direct = self._dissolve_direct_connections(node_id)
+        command = DissolveGroupCommand(self.graph, node_id, direct)
+        self._undo_stack.push(command)
+        self._sync_group_geometries()
+        self._update_scene_rect()
+        self._selection_timer.stop()
+        self.selection_changed.emit(self.selected_node_id() or "")
+        message = f"已解散算子组，{children} 个内部节点已放回画布"
+        if command.failed_connections:
+            message += f"；{command.failed_connections} 条边界连线无法直连，已丢弃"
+        self.status_message.emit(message)
+
+    def _dissolve_direct_connections(
+        self, group_id: str
+    ) -> list[tuple[str, str, str, str]]:
+        """把算子组边界上的连线两两配对成内部 / 外部直连。"""
+
+        node = self.graph.nodes.get(group_id)
+        group = node.group if node is not None else None
+        if group is None:
+            return []
+        pairs: list[tuple[str, str, str, str]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+
+        def add(pair: tuple[str, str, str, str]) -> None:
+            if pair in seen:
+                return
+            seen.add(pair)
+            pairs.append(pair)
+
+        output_keys = group.output_keys()
+        for key in group.input_keys():
+            outer = self.graph.input_connection(group_id, key)
+            if outer is None:
+                continue
+            for inner in self.graph.outgoing(group_id):
+                if inner.src_port != key:
+                    continue
+                if inner.dst_node == group_id and inner.dst_port in output_keys:
+                    # 组输入直接接到组输出：继续展开到该输出端口的外部下游。
+                    for outer_edge in self.graph.outgoing(group_id):
+                        if outer_edge.src_port == inner.dst_port:
+                            add(
+                                (
+                                    outer.src_node,
+                                    outer.src_port,
+                                    outer_edge.dst_node,
+                                    outer_edge.dst_port,
+                                )
+                            )
+                    continue
+                if inner.dst_node == group_id:
+                    continue
+                add((outer.src_node, outer.src_port, inner.dst_node, inner.dst_port))
+        for key in output_keys:
+            inner = self.graph.input_connection(group_id, key)
+            if inner is None or inner.src_node == group_id:
+                continue
+            for outer_edge in self.graph.outgoing(group_id):
+                if outer_edge.src_port != key:
+                    continue
+                add(
+                    (
+                        inner.src_node,
+                        inner.src_port,
+                        outer_edge.dst_node,
+                        outer_edge.dst_port,
+                    )
+                )
+        return pairs
 
     # ------------------------------------------------------------ 折叠 / 展开
     def _branch_node_ids(self) -> set[str]:
@@ -1261,23 +1625,23 @@ class GraphView(QGraphicsView):
         for node_id in selected_ids:
             if node_id in self._collapsed:
                 node_ids.update(self.graph.descendants(node_id))
-        # 删除流程框时连同全部后代一起删除（一步撤销）。
+        # 删除算子组时连同全部后代一起删除（一步撤销）。
         for node_id in selected_ids:
             node = self.graph.nodes.get(node_id)
-            if node is not None and getattr(node, "frame", None) is not None:
-                node_ids.update(child.id for child in self.graph.frame_subtree(node_id))
+            if node is not None and getattr(node, "group", None) is not None:
+                node_ids.update(child.id for child in self.graph.group_subtree(node_id))
 
         def _removal_depth(nid: str) -> int:
             depth = 0
             current = self.graph.nodes.get(nid)
             seen: set[str] = set()
-            while current is not None and current.parent_frame and current.parent_frame not in seen:
-                seen.add(current.parent_frame)
+            while current is not None and current.parent_group and current.parent_group not in seen:
+                seen.add(current.parent_group)
                 depth += 1
-                current = self.graph.nodes.get(current.parent_frame)
+                current = self.graph.nodes.get(current.parent_group)
             return depth
 
-        # 先删最深的后代、最后删框本身；撤销时框先恢复，子节点才能挂回去。
+        # 先删最深的后代、最后删算子组本身；撤销时算子组先恢复，子节点才能挂回去。
         ordered_deletes = sorted(node_ids, key=_removal_depth, reverse=True)
         connections_to_remove: list[ConnectionModel] = []
         for item in connection_items:
@@ -1299,7 +1663,7 @@ class GraphView(QGraphicsView):
         finally:
             self._undo_stack.endMacro()
 
-        self._sync_frame_geometries()
+        self._sync_group_geometries()
         hidden_extra = len(node_ids) - len(selected_ids)
         self._update_scene_rect()
         self._selection_timer.stop()
@@ -1316,34 +1680,34 @@ class GraphView(QGraphicsView):
             return
         self._clear_pending_interaction()
         node = self.graph.nodes[node_id]
-        if getattr(node, "frame", None) is not None:
-            # 流程框：删除框本身 + 全部内部节点 + 相关连线，整次一步撤销。
-            frame_ids = [node_id] + [child.id for child in self.graph.frame_subtree(node_id)]
+        if getattr(node, "group", None) is not None:
+            # 算子组：删除算子组本身 + 全部内部节点 + 相关连线，整次一步撤销。
+            group_ids = [node_id] + [child.id for child in self.graph.group_subtree(node_id)]
 
             def _depth(nid: str) -> int:
                 depth = 0
                 current = self.graph.nodes.get(nid)
                 seen: set[str] = set()
-                while current is not None and current.parent_frame and current.parent_frame not in seen:
-                    seen.add(current.parent_frame)
+                while current is not None and current.parent_group and current.parent_group not in seen:
+                    seen.add(current.parent_group)
                     depth += 1
-                    current = self.graph.nodes.get(current.parent_frame)
+                    current = self.graph.nodes.get(current.parent_group)
                 return depth
 
-            ordered = sorted(frame_ids, key=_depth, reverse=True)
-            self._undo_stack.beginMacro("删除流程框及内部节点")
+            ordered = sorted(group_ids, key=_depth, reverse=True)
+            self._undo_stack.beginMacro("删除算子组及内部节点")
             try:
                 for nid in ordered:
                     if nid in self.graph.nodes:
                         self._undo_stack.push(RemoveNodeCommand(self.graph, nid))
             finally:
                 self._undo_stack.endMacro()
-            self._sync_frame_geometries()
+            self._sync_group_geometries()
             self._update_scene_rect()
             self._selection_timer.stop()
             self.selection_changed.emit(self.selected_node_id() or "")
-            children = len(frame_ids) - 1
-            self.status_message.emit(f"已删除流程框及 {children} 个内部节点")
+            children = len(group_ids) - 1
+            self.status_message.emit(f"已删除算子组及 {children} 个内部节点")
             return
         command = RemoveNodeTreeCommand(self.graph, node_id)
         self._undo_stack.push(command)
@@ -1358,21 +1722,50 @@ class GraphView(QGraphicsView):
 
     # --------------------------------------------------------------- 自动布局
     def _layout_changes(self) -> list[tuple[str, tuple[float, float], tuple[float, float]]]:
-        """计算自动布局带来的节点位置变化；图中有环时抛出 :class:`GraphError`。"""
+        """计算自动布局带来的节点位置变化；图中有环时抛出 :class:`GraphError`。
+
+        先布局顶层节点，再按深度从外到内布局每个算子组的直接子节点。组内节点
+        与普通节点使用同一套布局规则（只考虑同一层内部的连线），并以算子组
+        内容区左上角作为布局锚点。
+        """
 
         sizes: dict[str, tuple[float, float]] = {}
         for node_id, item in self._nodes.items():
             size = item.size()
             sizes[node_id] = (float(size.width()), float(size.height()))
-        # 自动布局只排布顶层节点；框内节点保持相对位置，跟随框整体移动。
         top_level_ids = [
             node_id
             for node_id, node in self.graph.nodes.items()
-            if node.parent_frame is None
+            if node.parent_group is None
         ]
-        positions = compute_layout(self.graph, sizes, node_ids=top_level_ids)
+        targets: dict[str, tuple[float, float]] = dict(
+            compute_layout(self.graph, sizes, node_ids=top_level_ids)
+        )
+        groups = sorted(
+            (node_id for node_id, node in self.graph.nodes.items() if node.is_group),
+            key=self._group_depth,
+        )
+        for group_id in groups:
+            child_ids = [child.id for child in self.graph.direct_children(group_id)]
+            if not child_ids:
+                continue
+            anchor = targets.get(group_id)
+            if anchor is None:
+                group_node = self.graph.nodes.get(group_id)
+                if group_node is None:
+                    continue
+                anchor = (float(group_node.pos[0]), float(group_node.pos[1]))
+            positions = compute_layout(self.graph, sizes, node_ids=child_ids)
+            if not positions:
+                continue
+            anchor_x = anchor[0] + GROUP_PADDING_X
+            anchor_y = anchor[1] + GROUP_PADDING_TOP
+            min_x = min(x for x, _y in positions.values())
+            min_y = min(y for _x, y in positions.values())
+            for child_id, (x, y) in positions.items():
+                targets[child_id] = (anchor_x + (x - min_x), anchor_y + (y - min_y))
         changes: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
-        for node_id, (x, y) in positions.items():
+        for node_id, (x, y) in targets.items():
             node = self.graph.nodes.get(node_id)
             if node is None:
                 continue
@@ -1385,34 +1778,16 @@ class GraphView(QGraphicsView):
         self,
         changes: list[tuple[str, tuple[float, float], tuple[float, float]]],
     ) -> None:
-        """把布局变化写入当前 undo 宏；不做 begin/endMacro，便于与插入命令合并。"""
+        """把布局变化写入当前 undo 宏；不做 begin/endMacro，便于与插入命令合并。
+
+        ``_layout_changes()`` 已包含算子组内部节点的目标位置，因此这里不再额外
+        平移算子组的后代，避免同一次布局出现两套坐标。
+        """
 
         for node_id, old_pos, new_pos in changes:
             self._undo_stack.push(
                 MoveNodeCommand(self.graph, node_id, old_pos, new_pos, "自动布局")
             )
-            node = self.graph.nodes.get(node_id)
-            if node is None or getattr(node, "frame", None) is None:
-                continue
-            dx = new_pos[0] - old_pos[0]
-            dy = new_pos[1] - old_pos[1]
-            if abs(dx) < 0.01 and abs(dy) < 0.01:
-                continue
-            # 流程框整体移动时同步平移内部节点，保持框与内容的相对布局。
-            for child in self.graph.frame_subtree(node_id):
-                child_item = self._nodes.get(child.id)
-                if child_item is None:
-                    continue
-                child_old = (float(child.pos[0]), float(child.pos[1]))
-                self._undo_stack.push(
-                    MoveNodeCommand(
-                        self.graph,
-                        child.id,
-                        child_old,
-                        (round(child_old[0] + dx, 2), round(child_old[1] + dy, 2)),
-                        "自动布局",
-                    )
-                )
 
     def auto_layout(self) -> None:
         if not self.graph.nodes:
@@ -1428,7 +1803,7 @@ class GraphView(QGraphicsView):
                 self._push_layout_commands(changes)
             finally:
                 self._undo_stack.endMacro()
-        self._sync_frame_geometries()
+        self._sync_group_geometries()
         self._update_scene_rect()
         self.fit_graph()
 
@@ -1451,10 +1826,10 @@ class GraphView(QGraphicsView):
 
     # ------------------------------------------------------------- 模型 -> 画布
     def _create_node_item(self, node: NodeModel) -> NodeItem:
-        signature = (node.op_id, getattr(node, "frame", None) is not None)
+        signature = (node.op_id, getattr(node, "group", None) is not None)
         self._item_signatures[node.id] = signature
-        if getattr(node, "frame", None) is not None:
-            item = FrameItem(
+        if getattr(node, "group", None) is not None:
+            item = GroupItem(
                 self,
                 self.graph,
                 node,
@@ -1495,8 +1870,8 @@ class GraphView(QGraphicsView):
             return
         self._create_node_item(node)
         self._refresh_collapse_state()
-        if node.parent_frame is not None:
-            self._sync_frame_geometries()
+        if node.parent_group is not None:
+            self._sync_group_geometries()
 
     def _on_node_removed(self, node_id: str) -> None:
         if any(port.node_item.node_id == node_id for port in self._highlighted_ports):
@@ -1523,20 +1898,20 @@ class GraphView(QGraphicsView):
         self._results.pop(node_id, None)
         self._errors.pop(node_id, None)
         self._item_signatures.pop(node_id, None)
-        self._frame_live_last.pop(node_id, None)
+        self._group_live_last.pop(node_id, None)
         self.node_removed.emit(node_id)
         self._refresh_collapse_state()
-        self._sync_frame_geometries()
+        self._sync_group_geometries()
 
     def _on_node_changed(self, node_id: str) -> None:
         node = self.graph.nodes.get(node_id)
         if node is None:
             return
-        expected = (node.op_id, getattr(node, "frame", None) is not None)
+        expected = (node.op_id, getattr(node, "group", None) is not None)
         if self._highlighted_ports and any(
             port.node_item.node_id == node_id for port in self._highlighted_ports
         ):
-            # 流程框端口重建后旧 PortItem 会失效，先清掉高亮引用。
+            # 算子组端口重建后旧 PortItem 会失效，先清掉高亮引用。
             self._clear_target_highlight()
         item = self._nodes.get(node_id)
         if item is None or self._item_signatures.get(node_id) != expected:
@@ -1549,8 +1924,8 @@ class GraphView(QGraphicsView):
         item.update_port_states()
         self._update_connections_for(node_id)
         self._position_collapse_badge(node_id)
-        if getattr(node, "frame", None) is not None or self._frame_ancestors(node_id):
-            self._sync_frame_geometries()
+        if getattr(node, "group", None) is not None or self._group_ancestors(node_id):
+            self._sync_group_geometries()
 
     def _on_connection_added(self, connection: ConnectionModel) -> None:
         if connection.id not in self._connections:
@@ -1597,9 +1972,9 @@ class GraphView(QGraphicsView):
         if self._suppress_move_events:
             return
         node = self.graph.nodes.get(item.node_id)
-        if node is not None and getattr(node, "frame", None) is not None:
-            # 拖动流程框本体：实时平移全部后代节点，释放时统一写入移动命令。
-            self._move_frame_descendants_live(item)
+        if node is not None and getattr(node, "group", None) is not None:
+            # 拖动算子组本体：实时平移全部后代节点，释放时统一写入移动命令。
+            self._move_group_descendants_live(item)
             self._position_collapse_badge(item.node_id)
             if not self._scene.sceneRect().contains(item.sceneBoundingRect()):
                 self._update_scene_rect()
@@ -1669,7 +2044,7 @@ class GraphView(QGraphicsView):
                 continue
             in_center = in_port.center_scene_pos()
             for other in self._nodes.values():
-                if other is item or not other.isVisible() or isinstance(other, FrameItem):
+                if other is item or not other.isVisible() or isinstance(other, GroupItem):
                     continue
                 for out_port in other.output_ports.values():
                     distance = self._port_distance(out_port.center_scene_pos(), in_center)
@@ -1697,7 +2072,7 @@ class GraphView(QGraphicsView):
         for key, out_port in item.output_ports.items():
             out_center = out_port.center_scene_pos()
             for other in self._nodes.values():
-                if other is item or not other.isVisible() or isinstance(other, FrameItem):
+                if other is item or not other.isVisible() or isinstance(other, GroupItem):
                     continue
                 for in_port in other.input_ports.values():
                     distance = self._port_distance(out_center, in_port.center_scene_pos())
@@ -1807,18 +2182,37 @@ class GraphView(QGraphicsView):
             return None
         return node_item.port_item(key, is_input)
 
+    def connection_drag_source(self, port: PortItem) -> PortItem | None:
+        """返回按下端口时应拖拽的实际输出端口。
+
+        算子组输入端口的外侧圆点与内侧输出圆点共用同一个连接点：从外侧输入端口
+        按下时改用同 key 的内侧输出端口作为拖拽起点，方便把组输入接到组内节点。
+        普通输入端口不是拖拽起点，返回 None。
+        """
+
+        if not port.is_input:
+            return port
+        node_item = port.node_item
+        inner_ports = getattr(node_item, "inner_output_ports", None)
+        outer_ports = getattr(node_item, "outer_input_ports", None)
+        if not isinstance(inner_ports, dict) or not isinstance(outer_ports, dict):
+            return None
+        if outer_ports.get(port.key) is not port:
+            return None
+        return inner_ports.get(port.key)
+
     def port_spec(self, node_id: str, key: str, is_input: bool) -> PortSpec | None:
         """查询端口声明；源节点动态生成图像输出端口，未注册算子返回 ``None``。"""
 
         node = self.graph.nodes.get(node_id)
         if node is None:
             return None
-        frame = getattr(node, "frame", None)
-        if frame is not None:
-            if key in frame.input_keys():
-                return frame.port_spec(key, True)
-            if key in frame.output_keys():
-                return frame.port_spec(key, False)
+        group = getattr(node, "group", None)
+        if group is not None:
+            if key in group.input_keys():
+                return group.port_spec(key, True)
+            if key in group.output_keys():
+                return group.port_spec(key, False)
             return None
         if node.is_source:
             if not is_input and key == "image":
@@ -1987,9 +2381,9 @@ class GraphView(QGraphicsView):
             self.status_message.emit(str(exc))
 
     def _port_exists(self, node: NodeModel, port: str, is_input: bool) -> bool:
-        frame = getattr(node, "frame", None)
-        if frame is not None:
-            return port in (frame.input_keys() | frame.output_keys())
+        group = getattr(node, "group", None)
+        if group is not None:
+            return port in (group.input_keys() | group.output_keys())
         spec = self._registry.spec(node.op_id)
         if spec is not None:
             keys = {item.key for item in (spec.inputs if is_input else spec.outputs)}
@@ -2135,14 +2529,14 @@ class GraphView(QGraphicsView):
             desired = QPointF(anchor.x(), anchor.y() + AUTO_CONNECT_GAP)
             done_message = f"已添加节点“{spec.name}”并接在目标节点输出之后"
 
-        parent_frame = self._scope_for_port_target(port, target.kind)
+        parent_group = self._scope_for_port_target(port, target.kind)
         node = NodeModel(
             id=new_id("n"),
             op_id=op_id,
             title=spec.name,
             pos=(rough.x(), rough.y()),
             params=param_defaults(spec),
-            parent_frame=parent_frame,
+            parent_group=parent_group,
         )
         connected = True
         self._undo_stack.beginMacro("添加节点并连接")
@@ -2167,7 +2561,7 @@ class GraphView(QGraphicsView):
         finally:
             self._undo_stack.endMacro()
 
-        self._sync_frame_geometries()
+        self._sync_group_geometries()
         self.set_selected_node(node.id)
         self.node_created.emit(node.id)
         if connected:
@@ -2214,16 +2608,16 @@ class GraphView(QGraphicsView):
                 f"算子“{spec.name}”的输入 / 输出数据类型无法接续这条连线，未插入节点"
             )
             return None
-        parent_frame = self.graph.port_level(connection.src_node, connection.src_port, "src")
-        if parent_frame == INVALID_LEVEL:
-            parent_frame = self.frame_at(scene_pos)
+        parent_group = self.graph.port_level(connection.src_node, connection.src_port, "src")
+        if parent_group == INVALID_LEVEL:
+            parent_group = self.group_at(scene_pos)
         node = NodeModel(
             id=new_id("n"),
             op_id=op_id,
             title=spec.name,
             pos=(scene_pos.x(), scene_pos.y()),
             params=param_defaults(spec),
-            parent_frame=parent_frame,
+            parent_group=parent_group,
         )
         command = InsertNodeOnEdgeCommand(
             self.graph,
@@ -2245,7 +2639,7 @@ class GraphView(QGraphicsView):
                 self._push_layout_commands(changes)
         finally:
             self._undo_stack.endMacro()
-        self._sync_frame_geometries()
+        self._sync_group_geometries()
         self.set_selected_node(node.id)
         self.node_created.emit(node.id)
         self.status_message.emit(f"已在连线上插入节点“{spec.name}”")
@@ -2280,7 +2674,7 @@ class GraphView(QGraphicsView):
     def begin_move_tracking(self) -> None:
         self._pending_move_target = None
         self._pending_move_reason = None
-        self._frame_live_last = {}
+        self._group_live_last = {}
         self._clear_target_highlight()
         self._move_start = {
             item.node_id: QPointF(item.pos())
@@ -2334,17 +2728,17 @@ class GraphView(QGraphicsView):
                     (round(child.pos[0] + dx, 2), round(child.pos[1] + dy, 2)),
                 )
 
-        # 拖动流程框本体：全部后代（含嵌套框）整体平移，释放时写成一个宏。
-        frame_deltas: dict[str, tuple[float, float]] = {}
+        # 拖动算子组本体：全部后代（含嵌套算子组）整体平移，释放时写成一个宏。
+        group_deltas: dict[str, tuple[float, float]] = {}
         for node_id, (_nid, old_pos, new_pos) in list(moves.items()):
             node = self.graph.nodes.get(node_id)
-            if node is None or getattr(node, "frame", None) is None:
+            if node is None or getattr(node, "group", None) is None:
                 continue
-            frame_deltas[node_id] = (new_pos[0] - old_pos[0], new_pos[1] - old_pos[1])
-        for frame_id, (dx, dy) in frame_deltas.items():
+            group_deltas[node_id] = (new_pos[0] - old_pos[0], new_pos[1] - old_pos[1])
+        for group_id, (dx, dy) in group_deltas.items():
             if abs(dx) < 0.01 and abs(dy) < 0.01:
                 continue
-            for child in self.graph.frame_subtree(frame_id):
+            for child in self.graph.group_subtree(group_id):
                 if child.id in moves:
                     continue
                 child_item = self._nodes.get(child.id)
@@ -2356,7 +2750,7 @@ class GraphView(QGraphicsView):
                     (round(child.pos[0] + dx, 2), round(child.pos[1] + dy, 2)),
                 )
 
-        # 按移动后的中心点更新所属流程框（取最深命中；原始图像节点始终在顶层）。
+        # 按移动后的中心点更新所属算子组（取最深命中；原始图像节点始终在顶层）。
         parent_changes: list[tuple[str, str | None, str | None]] = []
         for node_id, (_nid, _old_pos, new_pos) in moves.items():
             node = self.graph.nodes.get(node_id)
@@ -2371,24 +2765,27 @@ class GraphView(QGraphicsView):
                     new_pos[0] + size.width() / 2.0,
                     new_pos[1] + size.height() / 2.0,
                 )
-                if getattr(node, "frame", None) is not None:
+                if getattr(node, "group", None) is not None:
                     excluded = {node_id} | {
-                        child.id for child in self.graph.frame_subtree(node_id)
+                        child.id for child in self.graph.group_subtree(node_id)
                     }
                 else:
                     excluded = set()
-                new_parent = self.frame_at(center, exclude=excluded)
+                new_parent = self.group_at(center, exclude=excluded)
                 if new_parent == node_id:
-                    new_parent = node.parent_frame
+                    new_parent = node.parent_group
                 if new_parent in ("", INVALID_LEVEL):
-                    new_parent = node.parent_frame
-            if new_parent != node.parent_frame:
-                parent_changes.append((node_id, node.parent_frame, new_parent))
+                    new_parent = node.parent_group
+            if new_parent != node.parent_group:
+                parent_changes.append((node_id, node.parent_group, new_parent))
 
-        # 节点进入 / 移出流程框时不再自动吸附端口，避免跨层级连线。
-        if target is not None and any(change[0] in moves for change in parent_changes):
+        # 节点进入 / 移出算子组时不再自动吸附端口，避免跨层级连线。
+        reconnect_command: QUndoCommand | None = None
+        if parent_changes:
+            # 进入 / 移出算子组：自动经组端口重连，不再吸附其它端口。
+            reconnect_command = self._build_reconnect_command(parent_changes)
             target = None
-            reason = reason or "已移入 / 移出流程框，未自动连接跨层级连线"
+            reason = None
 
         connection_commands, action_message = self._build_move_connection_commands(target)
         if not connection_commands and reason is not None and target is None:
@@ -2402,26 +2799,34 @@ class GraphView(QGraphicsView):
             if connection_commands:
                 text = "移动并连接节点"
             elif parent_changes:
-                text = "移动节点并调整流程框"
+                text = "移动节点并调整算子组"
             else:
                 text = "移动节点"
             self._undo_stack.beginMacro(text)
             try:
                 for node_id, old_pos, new_pos in move_items:
                     self._undo_stack.push(MoveNodeCommand(self.graph, node_id, old_pos, new_pos))
-                for node_id, old_parent, new_parent in parent_changes:
-                    self._undo_stack.push(
-                        SetParentFrameCommand(self.graph, node_id, old_parent, new_parent)
-                    )
+                if reconnect_command is not None:
+                    self._undo_stack.push(reconnect_command)
+                else:
+                    for node_id, old_parent, new_parent in parent_changes:
+                        self._undo_stack.push(
+                            SetParentGroupCommand(self.graph, node_id, old_parent, new_parent)
+                        )
                 for command in connection_commands:
                     self._undo_stack.push(command)
             except GraphError as exc:
                 self.status_message.emit(f"自动连接失败：{exc}")
             finally:
                 self._undo_stack.endMacro()
+            if parent_changes and reconnect_command is not None:
+                action_message = "已调整所属算子组，并把跨层连线改接到组端口"
+                failed = getattr(reconnect_command, "failed_connections", 0)
+                if failed:
+                    action_message += f"；{failed} 条连线无法重连，已丢弃"
         if action_message is not None:
             self.status_message.emit(action_message)
-        self._sync_frame_geometries()
+        self._sync_group_geometries()
         self._update_scene_rect()
 
     def _build_move_connection_commands(
@@ -2738,15 +3143,19 @@ class GraphView(QGraphicsView):
                     lambda nid=node_item.node_id: self.toggle_node_collapsed(nid),
                 )
             node_model = self.graph.nodes.get(node_item.node_id)
-            if node_model is not None and getattr(node_model, "frame", None) is not None:
+            if node_model is not None and getattr(node_model, "group", None) is not None:
                 menu.addAction(
                     "保存为新算子…",
-                    lambda nid=node_item.node_id: self.save_frame_as_operator(nid),
+                    lambda nid=node_item.node_id: self.save_group_as_operator(nid),
                 )
-            if node_model is not None and node_model.parent_frame:
                 menu.addAction(
-                    "移出流程框",
-                    lambda nid=node_item.node_id: self.move_out_of_frame(nid),
+                    "解散算子组",
+                    lambda nid=node_item.node_id: self.dissolve_group(nid),
+                )
+            if node_model is not None and node_model.parent_group:
+                menu.addAction(
+                    "移出算子组",
+                    lambda nid=node_item.node_id: self.move_out_of_group(nid),
                 )
             if getattr(node_item, "is_stale", False) or getattr(node_item, "stale", False):
                 menu.addAction(
@@ -2771,8 +3180,8 @@ class GraphView(QGraphicsView):
         else:
             scene_pos = self.mapToScene(event.pos())
             menu.addAction(
-                "添加流程框",
-                lambda pos=scene_pos: self.add_frame_at(pos),
+                "添加算子组",
+                lambda pos=scene_pos: self.add_group_at(pos),
             )
             menu.addAction("粘贴节点", self.paste_nodes)
             menu.addSeparator()
@@ -2927,7 +3336,7 @@ class GraphView(QGraphicsView):
         self._connections.clear()
         self._nodes.clear()
         self._item_signatures.clear()
-        self._frame_live_last.clear()
+        self._group_live_last.clear()
 
     def _content_bounding_rect(self) -> QRectF:
         """可见内容的包围盒；被折叠隐藏的节点不参与适应视图 / 画布范围计算。"""

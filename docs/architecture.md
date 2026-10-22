@@ -101,96 +101,100 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   生成可视化输出。`summarize_value()` / `summarize_outputs()` 生成状态栏与节点摘要，
   数组详情在参数面板的「输出数据」区以文本展示。
 
-## 流程框节点与自定义算子
+## 算子组节点与自定义算子
 
-流程框（Frame Node）是画布上的容器节点：自身带动态数量的输入 / 输出端口，内部可以放普通
-算子节点，也可以继续嵌套流程框；整个框可保存成「用户自定义算子」，再从算子库拖回画布复用。
-实现说明见 [frame_node.md](frame_node.md)，用户操作见 [user_guide.md](user_guide.md) 第 8 节，
+算子组（Group Node）是画布上的容器节点：自身带动态数量的输入 / 输出端口，内部可以放普通
+算子节点，也可以继续嵌套算子组；整个算子组可保存成「用户自定义算子」，再从算子库拖回画布复用。
+实现说明见 [group_node.md](group_node.md)，用户操作见 [user_guide.md](user_guide.md) 第 8 节，
 算子文件写法见 [operator_guide.md](operator_guide.md) 第 12 节。
 
 ### 数据模型
 
-* **扁平图 + parent_frame 链**：框内节点仍在同一个 `GraphModel.nodes` 里，通过
-  `NodeModel.parent_frame` 指向所属框；嵌套框也只是多一级链。`GraphModel` 提供
-  `direct_children / frame_subtree / is_inside / node_container` 查询，不引入第二套图结构。
-* **NodeModel.frame**：只有流程框节点（`op_id == FRAME_OP_ID`，即 `"__frame__"`）使用，
-  `is_frame` 为 `op_id == FRAME_OP_ID and frame is not None`。
-* **FrameModel / FramePort**（`app/core/frame.py`）：框的输入、输出端口列表与来源
+* **扁平图 + parent_group 链**：组内节点仍在同一个 `GraphModel.nodes` 里，通过
+  `NodeModel.parent_group` 指向所属算子组；嵌套算子组也只是多一级链。`GraphModel` 提供
+  `direct_children / group_subtree / is_inside / node_container` 查询，不引入第二套图结构。
+* **NodeModel.group**：只有算子组节点（`op_id == GROUP_OP_ID`，即 `"__group__"`）使用，
+  `is_group` 为 `op_id == GROUP_OP_ID and group is not None`。
+* **GroupModel / GroupPort**（`app/core/group.py`）：组的输入、输出端口列表与来源
   `operator_id`。每侧始终保留一个待定端口（`data_type=None`，对应
-  `PortSpec(any_type=True)`）；连线确定类型后 `FrameModel.bind()` 把待定端口定类型并
+  `PortSpec(any_type=True)`）；连线确定类型后 `GroupModel.bind()` 把待定端口定类型并
   `ensure_pending()` 追加新的待定端口。
-* **工程序列化**：`NodeModel.to_dict()` 写出 `parent_frame`（非空时）与 `frame`；
-  `GraphModel.from_dict()` 加载后修复悬空父框（父节点不存在 / 不是流程框时回退顶层）。
+* **工程序列化**：`NodeModel.to_dict()` 写出 `parent_group`（非空时）与 `group`；
+  `GraphModel.from_dict()` 加载后修复悬空父算子组（父节点不存在 / 不是算子组时回退顶层）。
 
 ### 端口层级与内外侧
 
-流程框的每个端口在画布上同时有外侧与内侧两个圆形连接点（内侧向内偏移 14px，图形相同）。
+算子组的每个端口在画布上同时有外侧与内侧两个圆形连接点（内侧向内偏移 14px，图形相同）。
 模型用 `GraphModel.port_level(node_id, port_key, role)` 定义层级，只有层级相同才允许连线：
 
 | 端口 | 作为源（`src`） | 作为目标（`dst`） |
 | --- | --- | --- |
-| 普通节点端口 | 节点的 `parent_frame` | 节点的 `parent_frame` |
-| 流程框输入端口 | 框 id（内侧，框内数据源） | 框的 `parent_frame`（外侧，接收框外数据） |
-| 流程框输出端口 | 框的 `parent_frame`（外侧，向框外供数） | 框 id（内侧，接收框内数据） |
+| 普通节点端口 | 节点的 `parent_group` | 节点的 `parent_group` |
+| 算子组输入端口 | 算子组 id（内侧，组内数据源） | 组的 `parent_group`（外侧，接收组外数据） |
+| 算子组输出端口 | 组的 `parent_group`（外侧，向组外供数） | 算子组 id（内侧，接收组内数据） |
 
-* `connection_role()` 把连线归类为 `normal / frame_input_inner / frame_output_inner /
-  frame_input_outer / frame_output_outer / invalid`；
+* `connection_role()` 把连线归类为 `normal / group_input_inner / group_output_inner /
+  group_input_outer / group_output_outer / invalid`；
 * `connection_allowed()` 在节点、端口存在性之外做层级校验，失败时返回中文原因；
-* 回环检测 `effective_successors()` 忽略 `frame_input_inner` 边界边，避免把
-  「框输入 → 框内节点 → 框输出」误判为环；
-* `resolve_source(src_node, src_port)` 递归跨过框边界，解析出真正的普通节点端口：
-  框输入端口沿外侧入边解析，框输出端口沿内侧入边解析，断开时返回 `None`；
-  `frame_output_sources(frame_id)` 返回每个输出端口的真实来源，供引擎使用。
+* 回环检测 `effective_successors()` 忽略 `group_input_inner` 边界边，避免把
+  「组输入 → 组内节点 → 组输出」误判为环；
+* `resolve_source(src_node, src_port)` 递归跨过组边界，解析出真正的普通节点端口：
+  组输入端口沿外侧入边解析，组输出端口沿内侧入边解析，断开时返回 `None`；
+  `group_output_sources(group_id)` 返回每个输出端口的真实来源，供引擎使用。
 
 ### 画布与交互
 
-* `app/graph/frame_item.py` 的 `FrameItem` 绘制圆角容器、标题栏与「待定 / 依赖缺失」徽标；
-  外框输入端口在顶边、输出端口在底边，内侧端口在框内 14px 处。
-* 框几何不单独保存：`GraphView._sync_frame_geometries()` 按**直接子节点**包围盒 + padding
-  反推框的位置与尺寸（无子节点默认 420×220）；嵌套框按深度由内向外同步。
-* 空白处右键「添加流程框」；从算子库拖入框区域时取最深命中的嵌套框作为 `parent_frame`；
-  拖动普通节点按中心命中的框更新所属关系；拖动框体整体平移全部后代。
-* 删除框会连同全部后代与相关连线一步撤销；复制 / 粘贴框会带上后代与内部连线并重映射
-  `parent_frame`；自动布局只排布顶层节点。
-* 右键框可「保存为新算子…」；右键框内节点可「移出流程框」；未注册算子 / 缺失依赖的节点或
-  占位框可「替换算子…」。保存成功后 `GraphView.operators_changed` 通知主窗口刷新算子库。
-* 已连线节点被拖入 / 拖出框时不会自动断开旧连线；新建跨层连线会被层级规则拒绝。
+* `app/graph/group_item.py` 的 `GroupItem` 绘制圆角容器、标题栏与「失效 / 依赖缺失」徽标；
+  外框输入端口在顶边、输出端口在底边，内侧端口在组内 14px 处。
+* 算子组几何不单独保存：`GraphView._sync_group_geometries()` 按**直接子节点**包围盒 + padding
+  反推算子组的位置与尺寸（无子节点默认 420×220）；嵌套算子组按深度由内向外同步。
+* 空白处右键「添加算子组」；从算子库拖入算子组区域时取最深命中的嵌套算子组作为 `parent_group`；
+  拖动普通节点按中心命中的算子组更新所属关系；拖动算子组整体平移全部后代。
+* 拖动已连线节点进入 / 移出算子组时，`ReconnectGroupMoveCommand` 会把跨层连线改接到
+  组边界端口上（按公共祖先补齐多层边界），并把不需要的旧连线与端口一并回滚；整次拖动一步撤销。
+* 删除算子组会连同全部后代与相关连线一步撤销；复制 / 粘贴算子组会带上后代与内部连线并重映射
+  `parent_group`。自动布局先排布顶层，再按深度从外到内排布每个算子组的直接子节点。
+* 右键算子组可「保存为新算子…」或「解散算子组」；`DissolveGroupCommand` 会把边界端口的
+  内外连线两两改接成直连，保留内部节点与位置，整次操作一步撤销。右键算子组内节点可
+  「移出算子组」；未注册算子 / 缺失依赖的节点或占位算子组可「替换算子…」。
+  保存成功后 `GraphView.operators_changed` 通知主窗口刷新算子库。
+* 已连线节点被拖入 / 拖出算子组时不再保留跨层直连；新建跨层连线仍会被层级规则拒绝。
 
 ### 自定义算子文件与依赖缺失
 
-* 保存入口：`app/operators/frame.py` 的 `save_frame_operator()`，默认写入
-  `operators/custom/`，id 形如 `frame.<slug>`，文件名形如 `frame_<slug>.py`。
-* 生成文件继承 `FrameOperator`，模块级定义 `OPERATOR`；`frame_definition` 保存完整内部图。
-  `FrameOperator.process()` 固定报错，流程框不能直接当普通算子执行。
-* `frame_definition` 的结构为 `format / version / name / inputs / outputs / nodes /
+* 保存入口：`app/operators/group.py` 的 `save_group_operator()`，默认写入
+  `operators/custom/`，id 形如 `group.<slug>`，文件名形如 `group_<slug>.py`。
+* 生成文件继承 `GroupOperator`，模块级定义 `OPERATOR`；`group_definition` 保存完整内部图。
+  `GroupOperator.process()` 固定报错，算子组不能直接当普通算子执行。
+* `group_definition` 的结构为 `format / version / name / inputs / outputs / nodes /
   connections`：
-  * 根流程框在定义里用哨兵 `"__frame__"` 表示，边界连线的 `src_node / dst_node`
+  * 根算子组在定义里用哨兵 `"__group__"` 表示，边界连线的 `src_node / dst_node`
     写这个 id；
-  * 普通节点只保存 `op_id / title / 相对位置 / params / parent_frame`，不内联算子实现；
-  * 嵌套手工框保存 `frame`；被引用的其它自定义流程框保存成 `frame_ref`
+  * 普通节点只保存 `op_id / title / 相对位置 / params / parent_group`，不内联算子实现；
+  * 嵌套手工算子组保存 `group`；被引用的其它自定义算子组保存成 `group_ref`
     （operator_id / name / 端口），避免重复代码；
-  * 框内包含原始图像节点时禁止保存。
-* 生成文件只导入 `json`、`FrameOperator`、`OperatorSpec / PortSpec`（需要时加
+  * 组内包含原始图像节点时禁止保存。
+* 生成文件只导入 `json`、`GroupOperator`、`OperatorSpec / PortSpec`（需要时加
   `DataType`），**不 import 被引用的算子**，因此依赖缺失时仍能被 `OperatorRegistry` 正常加载。
-* 拖入画布时 `materialize_frame_operator()` 展开成普通节点 + 流程框 + 连线；缺少普通算子
-  的节点显示「失效」，缺少被引用自定义流程框时生成带相同端口的占位框并显示「依赖缺失」，
-  用户可通过「替换算子…」换成其它普通算子（可撤销）。替换对话框会排除流程框算子。
+* 拖入画布时 `materialize_group_operator()` 展开成普通节点 + 算子组 + 连线；缺少普通算子
+  的节点显示「失效」，缺少被引用自定义算子组时生成带相同端口的占位算子组并显示「依赖缺失」，
+  用户可通过「替换算子…」换成其它普通算子（可撤销）。替换对话框会排除算子组。
 
 ### 引擎快照
 
 `ExecutionEngine._capture_graph()` 在快照阶段把每条线解析成真实普通节点端口：普通连线用
-`GraphModel.resolve_source()`，流程框的每个输出端口额外记录成
-`inputs[(frame_id, "@out:<port_key>")]` 伪输入。这样邻接表、拓扑排序、并行调度与缓存键都只
-使用真实节点 id；`_compute_frame()` 只等待各输出端口的真实上游、按 `FramePort` 类型
-`coerce_output_value()` 后组装 `NodeResult`。框内普通节点仍作为独立节点执行并回传结果，
-错误按分支隔离。详见 [frame_node.md](frame_node.md) 第 5 节。
+`GraphModel.resolve_source()`，算子组的每个输出端口额外记录成
+`inputs[(group_id, "@out:<port_key>")]` 伪输入。这样邻接表、拓扑排序、并行调度与缓存键都只
+使用真实节点 id；`_compute_group()` 只等待各输出端口的真实上游、按 `GroupPort` 类型
+`coerce_output_value()` 后组装 `NodeResult`。组内普通节点仍作为独立节点执行并回传结果，
+错误按分支隔离。详见 [group_node.md](group_node.md) 第 5 节。
 
 ### 用户自定义算子分类
 
-`app/core/constants.py` 的 `CATEGORY_ORDER` 第一项是 `FRAME_CATEGORY`（「用户自定义算子」），
-`OperatorRegistry.tabs()` 按该顺序排序，所以流程框保存生成的算子固定显示在算子库最顶部；
+`app/core/constants.py` 的 `CATEGORY_ORDER` 第一项是 `CUSTOM_OPERATOR_CATEGORY`（「用户自定义算子」），
+`OperatorRegistry.tabs()` 按该顺序排序，所以算子组保存生成的算子固定显示在算子库最顶部；
 生成文件里的 `OperatorSpec.category` 也固定为 `("用户自定义算子",)`。算子库说明浮层会标注
-「流程框算子」，提示拖入画布后会展开为流程框与内部节点。
+「算子组」，提示拖入画布后会展开为算子组与内部节点。
 
 ## 颜色 / dtype 约定
 
@@ -207,9 +211,9 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 | 保存 | `engine.commit_node(id)`：强制使该节点与下游失效，并重算整棵下游子树（用于确认最终结果） |
 | 切换节点 | 与单击节点一致：有有效快照直接显示，否则 `preview_node(id)` 重算该节点与全部下游 |
 | 修改连线 / 删除节点 | 连线新增 / 删除 / 替换后立即失效目标节点及全部下游；工作区在 30ms 内合并同一次操作的多条事件，再调用 `engine.update_nodes([...])` 重算，不需要先选中节点。删除节点还会清空引擎快照并取消当前任务 |
-| 移动节点 / 自动布局 | 只更新位置，不清空结果快照、不重算；移动流程框时全部后代跟随平移 |
-| 连接流程框端口 | 目标框端口按源端口类型绑定并追加新的待定端口；撤销“添加连线”会恢复端口快照 |
-| 断开流程框端口 | 只删除连线，不回收已确定的端口类型，也不减少待定端口 |
+| 移动节点 / 自动布局 | 只更新位置，不清空结果快照、不重算；移动算子组时全部后代跟随平移 |
+| 连接算子组端口 | 目标算子组端口按源端口类型绑定并追加新的待定端口；撤销“添加连线”会恢复端口快照 |
+| 断开算子组端口 | 只删除连线，不回收已确定的端口类型，也不减少待定端口 |
 | 复制粘贴节点 | 新节点与副本间连线一步入栈；连线事件按 30ms 合并后重算新节点及相关下游 |
 | 打开工程 | 重新创建引擎并清空缓存 |
 | 并行 worker 配置 | `execution/workers`（设置 → 常规 → 后台计算 → 并行线程数）：默认 `min(4, CPU 核数)`，范围 1–16；只影响后续请求，不打断正在运行的任务 |
@@ -254,24 +258,25 @@ connection_changed = Signal(str)      # 目标节点 id；工作区失效其下�
 node_removed = Signal(str)
 images_dropped = Signal(list)         # list[str]，拖入的图像路径
 status_message = Signal(str)
-operators_changed = Signal()          # 保存流程框为新算子后，请求主窗口刷新算子库
+operators_changed = Signal()          # 保存算子组为新算子后，请求主窗口刷新算子库
 
 set_registry(registry) -> None
 notify_result(node_id: str, result: NodeResult) -> None
 notify_error(node_id: str, message: str | None) -> None
 selected_node_id() -> str | None
 set_selected_node(node_id: str) -> None
-copy_selected() -> bool              # Ctrl+C：复制选中节点及副本间连线；框会自动带上全部后代
+copy_selected() -> bool              # Ctrl+C：复制选中节点及副本间连线；算子组会自动带上全部后代
 paste_nodes() -> list[str]           # Ctrl+V：粘贴并返回新节点 id，整次一步撤销
-auto_layout() -> None                # 只排布顶层节点
+auto_layout() -> None                # 顶层 + 各层算子组内部节点一起布局
 fit_graph() -> None
 set_thumbnails_enabled(enabled: bool) -> None
 add_operator_at(op_id: str, scene_pos: QPointF | None = None) -> str | None
-add_frame_at(scene_pos: QPointF | None = None, *, parent_frame: str | None = None,
-             title: str = "流程框") -> str
-frame_at(scene_pos: QPointF, *, exclude: Iterable[str] = ()) -> str | None
-save_frame_as_operator(frame_id: str) -> None
-move_out_of_frame(node_id: str) -> None
+add_group_at(scene_pos: QPointF | None = None, *, parent_group: str | None = None,
+             title: str = "算子组") -> str
+group_at(scene_pos: QPointF, *, exclude: Iterable[str] = ()) -> str | None
+save_group_as_operator(group_id: str) -> None
+dissolve_group(group_id: str) -> None
+move_out_of_group(node_id: str) -> None
 replace_operator(node_id: str, op_id: str) -> bool
 is_operator_registered(op_id: str | None) -> bool
 refresh_all() -> None
@@ -283,7 +288,7 @@ delete_selected() -> None
 
 连线校验：GraphView 在创建连线时调用
 `app.operators.spec.port_types_compatible(output_port, input_port)`，只允许
-`data_type` 相同的端口相连；图像端口还会比较双方 `accepts` 是否有交集。对流程框端口还会
+`data_type` 相同的端口相连；图像端口还会比较双方 `accepts` 是否有交集。对算子组端口还会
 调用 `GraphModel.connection_allowed()` 做层级校验。失败时通过 `status_message` 显示
 `connection_error()` 或层级校验生成的中文提示。
 
@@ -313,10 +318,10 @@ busy_changed = Signal(bool)
 `min(4, CPU 核数)`，范围 1–16）。同一次请求内多个 worker 并发调用
 `Operator.process()`，算子必须线程安全。
 
-流程框节点在抓取快照时被展开成真实上游依赖：框的每个输出端口记录一条
-`"@out:<port>"` 伪输入，普通连线用 `GraphModel.resolve_source()` 跨过框边界，
-`_compute_frame()` 只等待这些真实来源并按端口类型组装输出。详见
-[frame_node.md](frame_node.md) 第 5 节。
+算子组节点在抓取快照时被展开成真实上游依赖：组的每个输出端口记录一条
+`"@out:<port>"` 伪输入，普通连线用 `GraphModel.resolve_source()` 跨过组边界，
+`_compute_group()` 只等待这些真实来源并按端口类型组装输出。详见
+[group_node.md](group_node.md) 第 5 节。
 
 ### OperatorLibrary（`app/ui/library.py`）
 
@@ -327,7 +332,7 @@ refresh_requested = Signal()
 ```
 
 一级分类顺序来自 `OperatorRegistry.tabs()`（`CATEGORY_ORDER` 决定），
-「用户自定义算子」固定第一；流程框算子在说明浮层中标注「流程框算子」。
+「用户自定义算子」固定第一；算子组在说明浮层中标注「算子组」。
 
 ### ReplaceOperatorDialog（`app/ui/replace_operator.py`）
 
@@ -337,10 +342,10 @@ ReplaceOperatorDialog(registry: OperatorRegistry | None, *,
 
 exec() -> bool                     # 是否确认替换
 selected_op_id() -> str | None     # 目标算子 id；取消时为 None
-operator_ids() -> list[str]        # 列表中的算子 id（已排除流程框算子）
+operator_ids() -> list[str]        # 列表中的算子 id（已排除算子组）
 ```
 
-用于画布上失效节点 / 依赖缺失占位框的「替换算子…」。列表排除流程框算子，但保留
+用于画布上失效节点 / 依赖缺失占位算子组的「替换算子…」。列表排除算子组，但保留
 `current_op_id` 对应的当前项；搜索覆盖名称 / id / 描述 / 分类 / 关键字。
 
 ### PreviewWidget（`app/ui/preview.py`）
@@ -403,9 +408,9 @@ apply_theme(app: QApplication) -> None
 
 | 范围 | 负责人 |
 | --- | --- |
-| `app/core/**`（含 `app/core/frame.py`）, `app/operators/spec.py`, `app/operators/loader.py`, `app/operators/frame.py`, `app/config.py`, `app/ui/main_window.py`, `app/ui/workspace.py`, `app/main.py`, `pyproject.toml`, `tests/test_frame.py`, `tests/test_frame_integration.py` | Lead |
-| `app/engine/**`, `app/operators/builtin/**`, `tests/test_engine.py`, `tests/test_operators.py`, `tests/test_frame_engine.py` | engine-ops |
-| `app/graph/**`（含 `app/graph/frame_item.py`）, `tests/test_graph.py` | graph-ui |
+| `app/core/**`（含 `app/core/group.py`）, `app/operators/spec.py`, `app/operators/loader.py`, `app/operators/group.py`, `app/config.py`, `app/ui/main_window.py`, `app/ui/workspace.py`, `app/main.py`, `pyproject.toml`, `tests/test_group.py`, `tests/test_group_integration.py` | Lead |
+| `app/engine/**`, `app/operators/builtin/**`, `tests/test_engine.py`, `tests/test_operators.py`, `tests/test_group_engine.py` | engine-ops |
+| `app/graph/**`（含 `app/graph/group_item.py`）, `tests/test_graph.py` | graph-ui |
 | `app/ui/preview.py`, `app/ui/library.py`, `app/ui/replace_operator.py`, `app/ui/params.py`, `app/ui/settings_dialog.py`, `app/ui/theme.py`, `tests/test_widgets.py` | shell-ui |
 | `docs/**`, `README.md`, `packaging/**`, `examples/**` | qa-docs |
 

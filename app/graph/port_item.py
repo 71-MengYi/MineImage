@@ -44,7 +44,7 @@ class PortItem(QGraphicsItem):
         self.port_spec = port_spec
         self.data_type = port_spec.data_type if port_spec is not None else DataType.IMAGE
         self.any_type = bool(port_spec.any_type) if port_spec is not None else False
-        #: 流程框的待定端口：类型未知，使用灰色虚线绘制。
+        #: 算子组的待定端口：类型未知，使用灰色虚线绘制。
         self.pending = bool(pending)
         self._connected = False
         self._hover = False

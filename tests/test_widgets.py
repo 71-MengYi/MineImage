@@ -22,7 +22,7 @@ from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QDialog, QListWidgetItem, QWidget
 
 from app.config import AppSettings
-from app.core.constants import FRAME_CATEGORY, MIME_OPERATOR
+from app.core.constants import CUSTOM_OPERATOR_CATEGORY, MIME_OPERATOR
 from app.core.model import NodeModel
 from app.core.types import ImageData
 from app.operators.loader import OperatorRegistry
@@ -836,23 +836,23 @@ class OperatorLibraryTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# OperatorLibrary：用户自定义算子置顶 / 流程框算子标识
+# OperatorLibrary：用户自定义算子置顶 / 算子组算子标识
 # ---------------------------------------------------------------------------
-_FRAME_OPERATOR_TEMPLATE = '''import json
+_GROUP_OPERATOR_TEMPLATE = '''import json
 
-from app.operators.frame import FrameOperator
+from app.operators.group import GroupOperator
 from app.operators.spec import OperatorSpec, PortSpec
 
-FRAME_DEFINITION = json.loads({definition!r})
+GROUP_DEFINITION = json.loads({definition!r})
 
 
-class _TestFrameOperator(FrameOperator):
+class _TestGroupOperator(GroupOperator):
     spec = OperatorSpec(
         id="{op_id}",
         name="{name}",
         category=("{category}",),
         description="{description}",
-        keywords=("流程框", "自定义算子"),
+        keywords=("算子组", "自定义算子"),
         inputs=(
             PortSpec("input_1", "输入 1", any_type=True),
         ),
@@ -860,16 +860,16 @@ class _TestFrameOperator(FrameOperator):
             PortSpec("output_1", "输出 1", any_type=True),
         ),
     )
-    frame_definition = FRAME_DEFINITION
+    group_definition = GROUP_DEFINITION
 
 
-OPERATOR = _TestFrameOperator
+OPERATOR = _TestGroupOperator
 '''
 
-_FRAME_DEFINITION = {
-    "format": "mineimage-frame-definition",
+_GROUP_DEFINITION = {
+    "format": "mineimage-group-definition",
     "version": 1,
-    "name": "演示流程框",
+    "name": "演示算子组",
     "inputs": [{"key": "input_1", "label": "输入 1", "data_type": None}],
     "outputs": [{"key": "output_1", "label": "输出 1", "data_type": "image"}],
     "nodes": [],
@@ -877,8 +877,8 @@ _FRAME_DEFINITION = {
 }
 
 
-def _build_frame_fixture(root: Path) -> None:
-    """写入普通算子与流程框算子，构造含「用户自定义算子」分类的临时注册表。"""
+def _build_group_fixture(root: Path) -> None:
+    """写入普通算子与算子组算子，构造含「用户自定义算子」分类的临时注册表。"""
 
     files = {
         "brightness.py": (
@@ -898,7 +898,7 @@ def _build_frame_fixture(root: Path) -> None:
         "user_op.py": (
             "test.user",
             "我的亮度",
-            (FRAME_CATEGORY, "我的算子"),
+            (CUSTOM_OPERATOR_CATEGORY, "我的算子"),
             "用户保存的普通算子",
             "自定义",
         ),
@@ -914,24 +914,24 @@ def _build_frame_fixture(root: Path) -> None:
             ),
             encoding="utf-8",
         )
-    (root / "frame_op.py").write_text(
-        _FRAME_OPERATOR_TEMPLATE.format(
-            definition=json.dumps(_FRAME_DEFINITION, ensure_ascii=False),
-            op_id="frame.demo",
-            name="演示流程框",
-            category=FRAME_CATEGORY,
-            description="由流程框保存生成的演示算子。",
+    (root / "group_op.py").write_text(
+        _GROUP_OPERATOR_TEMPLATE.format(
+            definition=json.dumps(_GROUP_DEFINITION, ensure_ascii=False),
+            op_id="group.demo",
+            name="演示算子组",
+            category=CUSTOM_OPERATOR_CATEGORY,
+            description="由算子组保存生成的演示算子。",
         ),
         encoding="utf-8",
     )
 
 
-class FrameOperatorLibraryTests(unittest.TestCase):
+class GroupOperatorLibraryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.root = _workspace_tempdir()
         cls.addClassCleanup(_cleanup_tempdir, cls.root)
-        _build_frame_fixture(cls.root)
+        _build_group_fixture(cls.root)
         cls.registry = OperatorRegistry.build([cls.root], include_builtin=False)
 
     def setUp(self) -> None:
@@ -946,34 +946,34 @@ class FrameOperatorLibraryTests(unittest.TestCase):
 
     def test_custom_category_is_first(self) -> None:
         names = self.library.category_names()
-        self.assertEqual(names, [FRAME_CATEGORY, "基础调整", "滤波与平滑"])
+        self.assertEqual(names, [CUSTOM_OPERATOR_CATEGORY, "基础调整", "滤波与平滑"])
         first = self.library.category_items()[0]
-        self.assertEqual(first.text(0), FRAME_CATEGORY)
+        self.assertEqual(first.text(0), CUSTOM_OPERATOR_CATEGORY)
         self.assertEqual(first.text(1), "2")
         self.assertEqual(self.library.operator_count(), 4)
 
-    def test_frame_operator_info_panel_badge_ports_and_no_param_table(self) -> None:
-        self.assertTrue(self.library.show_operator_info("frame.demo"))
-        self.assertIn("流程框算子", self.library.info_meta.text())
-        self.assertIn("演示流程框", self.library.info_name.text())
-        self.assertIn("由流程框保存生成", self.library.info_desc.text())
+    def test_group_operator_info_panel_badge_ports_and_no_param_table(self) -> None:
+        self.assertTrue(self.library.show_operator_info("group.demo"))
+        self.assertIn("· 算子组", self.library.info_meta.text())
+        self.assertIn("演示算子组", self.library.info_name.text())
+        self.assertIn("由算子组保存生成", self.library.info_desc.text())
         self.assertIn("输入端口", self.library.info_ports.text())
         self.assertIn("输出端口", self.library.info_ports.text())
         self.assertFalse(self.library.info_table.isVisible())
         self.assertTrue(self.library.info_no_params.isVisible())
         self.assertIn("没有可配置参数", self.library.info_no_params.text())
 
-    def test_tree_tooltip_marks_frame_operator(self) -> None:
-        self.assertTrue(self.library.select_category(FRAME_CATEGORY))
+    def test_tree_tooltip_marks_group_operator(self) -> None:
+        self.assertTrue(self.library.select_category(CUSTOM_OPERATOR_CATEGORY))
         tree = self.library.current_tree()
         self.assertIsNotNone(tree)
         assert tree is not None
-        item = self.library._entry_items["frame.demo"]  # noqa: SLF001 - 测试内部定位
-        self.assertIn("流程框算子", item.toolTip(0))
+        item = self.library._entry_items["group.demo"]  # noqa: SLF001 - 测试内部定位
+        self.assertIn("类型：算子组", item.toolTip(0))
 
-    def test_regular_operator_has_no_frame_badge(self) -> None:
+    def test_regular_operator_has_no_group_badge(self) -> None:
         self.assertTrue(self.library.show_operator_info("test.brightness"))
-        self.assertNotIn("流程框算子", self.library.info_meta.text())
+        self.assertNotIn("· 算子组", self.library.info_meta.text())
         self.assertIn("参数", self.library.info_params_title.text())
 
 
@@ -985,7 +985,7 @@ class ReplaceOperatorDialogTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.root = _workspace_tempdir()
         cls.addClassCleanup(_cleanup_tempdir, cls.root)
-        _build_frame_fixture(cls.root)
+        _build_group_fixture(cls.root)
         cls.registry = OperatorRegistry.build([cls.root], include_builtin=False)
 
     def setUp(self) -> None:
@@ -994,18 +994,18 @@ class ReplaceOperatorDialogTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.dialog.deleteLater()
 
-    def test_lists_non_frame_operators_by_category(self) -> None:
+    def test_lists_non_group_operators_by_category(self) -> None:
         self.assertEqual(
             self.dialog.category_names(),
-            [FRAME_CATEGORY, "基础调整", "滤波与平滑"],
+            [CUSTOM_OPERATOR_CATEGORY, "基础调整", "滤波与平滑"],
         )
         self.assertEqual(
             self.dialog.operator_ids(),
             ["test.user", "test.brightness", "test.blur"],
         )
-        self.assertNotIn("frame.demo", self.dialog.operator_ids())
-        self.assertIsNone(self.dialog.item_for("frame.demo"))
-        self.assertEqual(self.dialog.category_names()[0], FRAME_CATEGORY)
+        self.assertNotIn("group.demo", self.dialog.operator_ids())
+        self.assertIsNone(self.dialog.item_for("group.demo"))
+        self.assertEqual(self.dialog.category_names()[0], CUSTOM_OPERATOR_CATEGORY)
 
     def test_search_filter_and_refresh(self) -> None:
         self.dialog.show()
@@ -1034,7 +1034,7 @@ class ReplaceOperatorDialogTests(unittest.TestCase):
     def test_selected_operator_id_on_accept_and_reject(self) -> None:
         self.assertIsNone(self.dialog.selected_op_id())
         self.assertFalse(self.dialog.ok_button.isEnabled())
-        self.assertFalse(self.dialog.select_operator("frame.demo"))
+        self.assertFalse(self.dialog.select_operator("group.demo"))
 
         self.assertTrue(self.dialog.select_operator("test.blur"))
         self.assertEqual(self.dialog.selected_op_id(), "test.blur")
@@ -1058,12 +1058,12 @@ class ReplaceOperatorDialogTests(unittest.TestCase):
         self.assertEqual(self.dialog.result(), QDialog.DialogCode.Accepted)
         self.assertEqual(self.dialog.selected_op_id(), "test.blur")
 
-    def test_current_frame_operator_allowed_in_list(self) -> None:
-        dialog = ReplaceOperatorDialog(self.registry, current_op_id="frame.demo")
+    def test_current_group_operator_allowed_in_list(self) -> None:
+        dialog = ReplaceOperatorDialog(self.registry, current_op_id="group.demo")
         self.addCleanup(dialog.deleteLater)
-        self.assertIn("frame.demo", dialog.operator_ids())
+        self.assertIn("group.demo", dialog.operator_ids())
         self.assertIn("当前算子", dialog.current_label.text())
-        current_item = dialog.item_for("frame.demo")
+        current_item = dialog.item_for("group.demo")
         self.assertIsNotNone(current_item)
         assert current_item is not None
         self.assertEqual(current_item.text(1), "当前")

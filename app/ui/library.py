@@ -122,15 +122,15 @@ def _port_text(ports, label: str) -> str:
     return f"{label}：" + "；".join(items)
 
 
-def _is_frame_operator(operator: object) -> bool:
-    """判断算子是否为流程框算子（FrameOperator）。
+def _is_group_operator(operator: object) -> bool:
+    """判断算子是否为算子组（GroupOperator）。
 
-    优先使用 app.operators.frame.is_frame_operator；该模块异常或尚未就绪时
-    按 frame_definition 属性兜底，避免说明浮层因导入问题崩溃。
+    优先使用 app.operators.group.is_group_operator；该模块异常或尚未就绪时
+    按 group_definition 属性兜底，避免说明浮层因导入问题崩溃。
     """
 
     try:
-        from app.operators.frame import is_frame_operator as checker
+        from app.operators.group import is_group_operator as checker
     except Exception:  # noqa: BLE001 - 延迟导入，帧模块可能尚未就绪
         checker = None
     if checker is not None:
@@ -138,7 +138,7 @@ def _is_frame_operator(operator: object) -> bool:
             return bool(checker(operator))
         except Exception:  # noqa: BLE001 - 判定失败时退回属性检查
             pass
-    return getattr(operator, "frame_definition", None) is not None
+    return getattr(operator, "group_definition", None) is not None
 
 
 class _OperatorTree(QTreeWidget):
@@ -758,8 +758,8 @@ class OperatorLibrary(QWidget):
             item.setData(0, Qt.ItemDataRole.UserRole, entry.id)
             item.setData(0, Qt.ItemDataRole.UserRole + 1, haystack)
             tooltip_lines = [entry.name, f"分类：{category_text}"]
-            if _is_frame_operator(entry.operator):
-                tooltip_lines.append("类型：流程框算子")
+            if _is_group_operator(entry.operator):
+                tooltip_lines.append("类型：算子组")
             tooltip_lines.append(entry.spec.description or "暂无描述")
             item.setToolTip(0, "\n".join(tooltip_lines))
             item.setFlags(
@@ -895,27 +895,27 @@ class OperatorLibrary(QWidget):
 
     def _populate_info(self, entry: OperatorEntry) -> None:
         spec = entry.spec
-        frame_operator = _is_frame_operator(entry.operator)
+        group_operator = _is_group_operator(entry.operator)
         category = " / ".join(spec.category) or "未分类"
         source = "内置" if entry.builtin else "用户"
         meta = f"{category} · {source}"
-        if frame_operator:
-            # 流程框算子与普通算子在库中的操作不同，说明浮层需要明确标识。
-            meta = f"{meta} · 流程框算子"
+        if group_operator:
+            # 算子组与普通算子在库中的操作不同，说明浮层需要明确标识。
+            meta = f"{meta} · 算子组"
         self.info_name.setText(entry.name)
         self.info_meta.setText(meta)
         tooltip = f"算子 id：{entry.id}\n文件：{entry.path}"
-        if frame_operator:
+        if group_operator:
             tooltip = (
-                "流程框算子：由流程框保存生成，拖入画布后展开为流程框与内部节点。\n"
+                "算子组节点：由算子组保存生成，拖入画布后展开为算子组与内部节点。\n"
                 + tooltip
             )
         self.info_meta.setToolTip(tooltip)
         description = spec.description
         if not description:
             description = (
-                "由流程框保存生成的自定义算子；拖入画布后会展开为流程框与内部节点。"
-                if frame_operator
+                "由算子组保存生成的自定义算子；拖入画布后会展开为算子组与内部节点。"
+                if group_operator
                 else "暂无描述"
             )
         if spec.notes:
@@ -951,11 +951,11 @@ class OperatorLibrary(QWidget):
             self.info_table.setMinimumHeight(height)
             self.info_table.setMaximumHeight(height)
         else:
-            # 流程框算子的端口由框定义决定，没有可配置参数；不要显示空参数表。
+            # 算子组的端口由算子组定义决定，没有可配置参数；不要显示空参数表。
             self.info_table.setVisible(False)
             self.info_no_params.setText(
-                "流程框算子没有可配置参数；端口由框定义决定。"
-                if frame_operator
+                "算子组没有可配置参数；端口由算子组定义决定。"
+                if group_operator
                 else "该算子没有可配置参数。"
             )
             self.info_no_params.setVisible(True)

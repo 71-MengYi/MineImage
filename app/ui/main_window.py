@@ -172,7 +172,7 @@ class MainWindow(QMainWindow):
             "重做", self.redo, "Ctrl+Y", QStyle.StandardPixmap.SP_ArrowForward
         )
         self.act_delete = self._action("删除选中", self.delete_selected, "Delete")
-        self.act_add_frame = self._action("添加流程框", self.add_frame, "Ctrl+Shift+F")
+        self.act_add_group = self._action("添加算子组", self.add_group, "Ctrl+Shift+F")
 
         self.act_compare_single = self._action("单视图", lambda: self._set_compare_mode("single"), "Ctrl+1", checkable=True)
         self.act_compare_side = self._action(
@@ -310,7 +310,7 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addAction(self.act_delete)
         edit_menu.addSeparator()
-        edit_menu.addAction(self.act_add_frame)
+        edit_menu.addAction(self.act_add_group)
 
         view_menu = menu.addMenu("视图(&V)")
         view_menu.addAction(self.act_compare_single)
@@ -708,11 +708,11 @@ class MainWindow(QMainWindow):
         if widget is not None:
             widget.graph_view.delete_selected()
 
-    def add_frame(self) -> None:
-        """在当前画布视口中心添加一个流程框。"""
+    def add_group(self) -> None:
+        """在当前画布视口中心添加一个算子组。"""
         widget = self._active_workspace()
         if widget is not None:
-            widget.graph_view.add_frame_at()
+            widget.graph_view.add_group_at()
 
     def auto_layout(self) -> None:
         widget = self._active_workspace()

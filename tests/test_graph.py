@@ -27,14 +27,14 @@ from PySide6.QtWidgets import QApplication
 
 from app.config import AppSettings
 from app.core.constants import (
-    FRAME_CATEGORY,
-    FRAME_OP_ID,
+    CUSTOM_OPERATOR_CATEGORY,
+    GROUP_OP_ID,
     MIME_OPERATOR,
     SINGLE_CLICK_DELAY_MS,
     SOURCE_OP_ID,
 )
 from app.core.data_types import DataType
-from app.core.frame import FrameModel
+from app.core.group import GroupModel
 from app.core.model import GraphError, NodeModel, WorkspaceModel, new_id
 from app.core.types import ImageData
 from app.engine.engine import NodeResult
@@ -48,16 +48,17 @@ from app.graph.commands import (
     RemoveNodeTreeCommand,
     SetNodeParamsCommand,
 )
-from app.graph.frame_item import (
-    DEFAULT_FRAME_HEIGHT,
-    DEFAULT_FRAME_WIDTH,
+from app.graph.group_item import (
+    DEFAULT_GROUP_HEIGHT,
+    DEFAULT_GROUP_WIDTH,
+    GROUP_PADDING_X,
     INNER_OFFSET,
-    FrameItem,
+    GroupItem,
 )
 from app.graph.layout import GRID, compute_layout
 from app.graph.node_item import NodeItem
 from app.graph.view import GraphView
-from app.operators.frame import FrameOperator
+from app.operators.group import GroupOperator
 from app.operators.spec import OperatorSpec, ParamSpec, PortSpec, param_defaults
 
 _APP: QApplication | None = None
@@ -117,9 +118,9 @@ def make_registry() -> FakeRegistry:
     return FakeRegistry(BLUR_SPEC, MERGE_SPEC, SPLIT_SPEC, OUTPUT_SPEC)
 
 
-#: 测试用流程框定义：一个输入 -> 一个模糊节点 -> 一个输出。
-DEMO_FRAME_DEFINITION = {
-    "format": "mineimage-frame-definition",
+#: 测试用算子组定义：一个输入 -> 一个模糊节点 -> 一个输出。
+DEMO_GROUP_DEFINITION = {
+    "format": "mineimage-group-definition",
     "version": 1,
     "name": "演示流程",
     "inputs": [{"key": "input_1", "label": "输入 1", "data_type": "image"}],
@@ -128,15 +129,15 @@ DEMO_FRAME_DEFINITION = {
         {
             "id": "n1",
             "op_id": "test.blur",
-            "title": "框内模糊",
+            "title": "组内模糊",
             "pos": [60.0, 80.0],
             "params": {"ksize": 5},
-            "parent_frame": None,
+            "parent_group": None,
         }
     ],
     "connections": [
         {
-            "src_node": "__frame__",
+            "src_node": "__group__",
             "src_port": "input_1",
             "dst_node": "n1",
             "dst_port": "image",
@@ -144,28 +145,28 @@ DEMO_FRAME_DEFINITION = {
         {
             "src_node": "n1",
             "src_port": "image",
-            "dst_node": "__frame__",
+            "dst_node": "__group__",
             "dst_port": "output_1",
         },
     ],
 }
 
 
-class FrameDemoOperator(FrameOperator):
-    """测试用流程框算子（由定义直接展开）。"""
+class GroupDemoOperator(GroupOperator):
+    """测试用算子组算子（由定义直接展开）。"""
 
     spec = OperatorSpec(
-        id="frame.demo",
+        id="group.demo",
         name="演示流程",
-        category=(FRAME_CATEGORY,),
+        category=(CUSTOM_OPERATOR_CATEGORY,),
         inputs=(PortSpec("input_1", "输入 1"),),
         outputs=(PortSpec("output_1", "输出 1"),),
     )
-    frame_definition = DEMO_FRAME_DEFINITION
+    group_definition = DEMO_GROUP_DEFINITION
 
 
-class FrameRegistry(FakeRegistry):
-    """带流程框算子实例的注册表替身。"""
+class GroupRegistry(FakeRegistry):
+    """带算子组算子实例的注册表替身。"""
 
     def __init__(self, *specs: OperatorSpec, operator=None) -> None:
         super().__init__(*specs)
@@ -177,9 +178,9 @@ class FrameRegistry(FakeRegistry):
         return None
 
 
-def make_frame_registry() -> FrameRegistry:
-    operator = FrameDemoOperator()
-    return FrameRegistry(
+def make_group_registry() -> GroupRegistry:
+    operator = GroupDemoOperator()
+    return GroupRegistry(
         BLUR_SPEC,
         MERGE_SPEC,
         SPLIT_SPEC,
@@ -1901,18 +1902,18 @@ class GraphViewTestCase(unittest.TestCase):
         self.assertEqual(selection_events, [])
 
 
-    # ------------------------------------------------------------ 流程框
-    def add_frame(
+    # ------------------------------------------------------------ 算子组
+    def add_group(
         self,
         pos: tuple[float, float] = (400.0, 300.0),
-        parent_frame: str | None = None,
-        title: str = "流程框",
+        parent_group: str | None = None,
+        title: str = "算子组",
     ) -> str:
-        return self.view.add_frame_at(QPointF(*pos), parent_frame=parent_frame, title=title)
+        return self.view.add_group_at(QPointF(*pos), parent_group=parent_group, title=title)
 
     def add_child(
         self,
-        frame_id: str,
+        group_id: str,
         op_id: str = "test.blur",
         pos: tuple[float, float] = (0.0, 0.0),
         params: dict | None = None,
@@ -1925,7 +1926,7 @@ class GraphViewTestCase(unittest.TestCase):
             title=spec.name,
             pos=pos,
             params=dict(param_defaults(spec)) if params is None else dict(params),
-            parent_frame=frame_id,
+            parent_group=group_id,
         )
         self.graph.add_node(node)
         return node
@@ -1939,20 +1940,88 @@ class GraphViewTestCase(unittest.TestCase):
         self.graph.add_node(node)
         return node
 
-    def test_add_frame_at_creates_default_ports_and_geometry(self) -> None:
-        frame_id = self.add_frame(pos=(400.0, 300.0))
-        node = self.graph.nodes[frame_id]
-        self.assertTrue(node.is_frame)
-        self.assertIsInstance(node.frame, FrameModel)
-        self.assertEqual(len(node.frame.inputs), 1)
-        self.assertEqual(len(node.frame.outputs), 1)
-        self.assertIsNone(node.frame.inputs[0].data_type)
-        self.assertIsNone(node.frame.outputs[0].data_type)
+    def drag_port_to(self, source, target_scene_pos: QPointF) -> None:
+        """从端口拖到场景坐标并松手，用于连线交互测试。"""
 
-        item = self.view._nodes[frame_id]
-        self.assertIsInstance(item, FrameItem)
-        self.assertAlmostEqual(item.size().width(), DEFAULT_FRAME_WIDTH, places=1)
-        self.assertAlmostEqual(item.size().height(), DEFAULT_FRAME_HEIGHT, places=1)
+        self.view.fit_graph()
+        self.view.show()
+        self.view.setFocus()
+        if _APP is not None:
+            _APP.processEvents()
+        start = self.view.mapFromScene(source.center_scene_pos())
+        end = self.view.mapFromScene(target_scene_pos)
+        QTest.mousePress(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            start,
+        )
+        for step in range(1, 6):
+            point = QPoint(
+                int(start.x() + (end.x() - start.x()) * step / 5),
+                int(start.y() + (end.y() - start.y()) * step / 5),
+            )
+            QTest.mouseMove(self.view.viewport(), point)
+            if _APP is not None:
+                _APP.processEvents()
+        QTest.mouseRelease(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            end,
+        )
+        if _APP is not None:
+            _APP.processEvents()
+
+    def drag_node_to(self, node_id: str, target_scene_pos: QPointF) -> None:
+        """拖动一个节点的卡片到场景坐标并松手（触发所属算子组变化）。"""
+
+        self.view.fit_graph()
+        self.view.show()
+        self.view.setFocus()
+        if _APP is not None:
+            _APP.processEvents()
+        item = self.view._nodes[node_id]
+        start = self.view.mapFromScene(item.sceneBoundingRect().center())
+        end = self.view.mapFromScene(target_scene_pos)
+        QTest.mousePress(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            start,
+        )
+        for step in range(1, 7):
+            point = QPoint(
+                int(start.x() + (end.x() - start.x()) * step / 6),
+                int(start.y() + (end.y() - start.y()) * step / 6),
+            )
+            QTest.mouseMove(self.view.viewport(), point)
+            if _APP is not None:
+                _APP.processEvents()
+        QTest.mouseRelease(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            end,
+        )
+        if _APP is not None:
+            _APP.processEvents()
+
+    def test_add_group_at_creates_default_ports_and_geometry(self) -> None:
+        group_id = self.add_group(pos=(400.0, 300.0))
+        node = self.graph.nodes[group_id]
+        self.assertTrue(node.is_group)
+        self.assertIsInstance(node.group, GroupModel)
+        self.assertEqual(len(node.group.inputs), 1)
+        self.assertEqual(len(node.group.outputs), 1)
+        self.assertIsNone(node.group.inputs[0].data_type)
+        self.assertIsNone(node.group.outputs[0].data_type)
+
+        item = self.view._nodes[group_id]
+        self.assertIsInstance(item, GroupItem)
+        self.assertIsNone(item._header_chip())  # 健康状态不再显示「待定」徽标
+        self.assertAlmostEqual(item.size().width(), DEFAULT_GROUP_WIDTH, places=1)
+        self.assertAlmostEqual(item.size().height(), DEFAULT_GROUP_HEIGHT, places=1)
         self.assertEqual(set(item.outer_input_ports), {"input_1"})
         self.assertEqual(set(item.outer_output_ports), {"output_1"})
         self.assertEqual(set(item.inner_output_ports), {"input_1"})
@@ -1972,66 +2041,278 @@ class GraphViewTestCase(unittest.TestCase):
             outer_out.scenePos().y() - inner_in.scenePos().y(), INNER_OFFSET, places=1
         )
 
-    def test_blank_context_menu_has_add_frame_action(self) -> None:
+    def test_blank_context_menu_has_add_group_action(self) -> None:
         with patch("app.graph.view.QMenu") as menu_cls:
             self.view.contextMenuEvent(_FakeContextMenuEvent(QPoint(10, 10)))
         actions = [call.args[0] for call in menu_cls.return_value.addAction.call_args_list if call.args]
-        self.assertIn("添加流程框", actions)
+        self.assertIn("添加算子组", actions)
         self.assertIn("粘贴节点", actions)
 
-    def test_frame_input_connection_binds_type_and_grows_pending_port(self) -> None:
-        frame_id = self.add_frame()
+    def test_group_input_connection_binds_type_and_grows_pending_port(self) -> None:
+        group_id = self.add_group()
         source = self.add_source("源", pos=(0.0, -400.0))
-        self.view.connect_ports(source.id, "image", frame_id, "input_1")
+        self.view.connect_ports(source.id, "image", group_id, "input_1")
 
-        frame = self.graph.nodes[frame_id].frame
-        self.assertEqual(frame.inputs[0].data_type, DataType.IMAGE)
-        self.assertEqual(len(frame.inputs), 2)
-        self.assertIsNone(frame.inputs[1].data_type)
+        group = self.graph.nodes[group_id].group
+        self.assertEqual(group.inputs[0].data_type, DataType.IMAGE)
+        self.assertEqual(len(group.inputs), 2)
+        self.assertIsNone(group.inputs[1].data_type)
         self.assertEqual(len(self.graph.connections), 1)
         connection = next(iter(self.graph.connections.values()))
         self.assertIn(connection.id, self.view._connections)
 
-        item = self.view._nodes[frame_id]
+        item = self.view._nodes[group_id]
         self.assertIn("input_2", item.outer_input_ports)
         self.assertTrue(item.outer_input_ports["input_2"].pending)
         self.assertFalse(item.outer_input_ports["input_1"].pending)
 
         self.undo.undo()
-        frame = self.graph.nodes[frame_id].frame
-        self.assertEqual(len(frame.inputs), 1)
-        self.assertIsNone(frame.inputs[0].data_type)
+        group = self.graph.nodes[group_id].group
+        self.assertEqual(len(group.inputs), 1)
+        self.assertIsNone(group.inputs[0].data_type)
         self.assertFalse(self.graph.connections)
 
         self.undo.redo()
-        frame = self.graph.nodes[frame_id].frame
-        self.assertEqual(frame.inputs[0].data_type, DataType.IMAGE)
-        self.assertEqual(len(frame.inputs), 2)
+        group = self.graph.nodes[group_id].group
+        self.assertEqual(group.inputs[0].data_type, DataType.IMAGE)
+        self.assertEqual(len(group.inputs), 2)
 
-    def test_frame_output_inner_connection_binds_and_grows_pending(self) -> None:
-        frame_id = self.add_frame(pos=(400.0, 300.0))
-        frame_pos = self.graph.nodes[frame_id].pos
-        child = self.add_child(frame_id, pos=(frame_pos[0] + 60.0, frame_pos[1] + 100.0))
-        self.view.connect_ports(child.id, "image", frame_id, "output_1")
+    def test_group_output_inner_connection_binds_and_grows_pending(self) -> None:
+        group_id = self.add_group(pos=(400.0, 300.0))
+        group_pos = self.graph.nodes[group_id].pos
+        child = self.add_child(group_id, pos=(group_pos[0] + 60.0, group_pos[1] + 100.0))
+        self.view.connect_ports(child.id, "image", group_id, "output_1")
 
-        frame = self.graph.nodes[frame_id].frame
-        self.assertEqual(frame.outputs[0].data_type, DataType.IMAGE)
-        self.assertEqual(len(frame.outputs), 2)
-        self.assertIsNone(frame.outputs[1].data_type)
-        item = self.view._nodes[frame_id]
+        group = self.graph.nodes[group_id].group
+        self.assertEqual(group.outputs[0].data_type, DataType.IMAGE)
+        self.assertEqual(len(group.outputs), 2)
+        self.assertIsNone(group.outputs[1].data_type)
+        item = self.view._nodes[group_id]
         self.assertIn("output_2", item.outer_output_ports)
         self.assertTrue(item.outer_output_ports["output_2"].pending)
         self.assertEqual(item.outer_output_ports["output_1"].data_type, DataType.IMAGE)
 
         sink = self.add_node(pos=(0.0, 900.0))
-        self.view.connect_ports(frame_id, "output_1", sink.id, "image")
+        self.view.connect_ports(group_id, "output_1", sink.id, "image")
         self.assertEqual(len(self.graph.connections), 2)
-        self.assertEqual(self.graph.input_connection(sink.id, "image").src_node, frame_id)
+        self.assertEqual(self.graph.input_connection(sink.id, "image").src_node, group_id)
 
-    def test_library_drop_inside_frame_sets_parent_frame(self) -> None:
-        frame_id = self.add_frame(pos=(500.0, 400.0))
-        frame_item = self.view._nodes[frame_id]
-        center = frame_item.sceneBoundingRect().center()
+    def test_drag_from_group_input_port_connects_inner_node(self) -> None:
+        group_id = self.add_group(pos=(400.0, 300.0))
+        group_pos = self.graph.nodes[group_id].pos
+        child = self.add_child(group_id, pos=(group_pos[0] + 60.0, group_pos[1] + 100.0))
+        outer_in = self.view._nodes[group_id].outer_input_ports["input_1"]
+        child_in = self.view._nodes[child.id].input_ports["image"]
+
+        # 从组输入端口（外框上的圆点）直接拖到组内节点：应以内侧输出端口为起点。
+        self.drag_port_to(outer_in, child_in.center_scene_pos())
+
+        self.assertEqual(len(self.graph.connections), 1)
+        connection = next(iter(self.graph.connections.values()))
+        self.assertEqual((connection.src_node, connection.src_port), (group_id, "input_1"))
+        self.assertEqual((connection.dst_node, connection.dst_port), (child.id, "image"))
+
+    def test_drop_on_incompatible_input_reports_reason(self) -> None:
+        group_id = self.add_group()
+        group_pos = self.graph.nodes[group_id].pos
+        child = self.add_child(group_id, pos=(group_pos[0] + 40.0, group_pos[1] + 80.0))
+        top = self.add_node(pos=(1000.0, 1000.0))
+        messages: list[str] = []
+        self.view.status_message.connect(messages.append)
+
+        self.drag_port_to(
+            self.view._nodes[top.id].output_ports["image"],
+            self.view._nodes[child.id].input_ports["image"].center_scene_pos(),
+        )
+
+        self.assertFalse(self.graph.connections)
+        self.assertTrue(any("层级" in message or "算子组" in message for message in messages))
+
+    def test_drop_connection_on_node_body_reports_hint(self) -> None:
+        source = self.add_node(pos=(0.0, 0.0))
+        target = self.add_node(pos=(0.0, 500.0))
+        messages: list[str] = []
+        self.view.status_message.connect(messages.append)
+
+        self.drag_port_to(
+            self.view._nodes[source.id].output_ports["image"],
+            self.view._nodes[target.id].sceneBoundingRect().center(),
+        )
+
+        self.assertFalse(self.graph.connections)
+        self.assertTrue(any("输入端口" in message for message in messages))
+
+    def test_click_group_input_port_does_not_emit_hint(self) -> None:
+        group_id = self.add_group()
+        outer_in = self.view._nodes[group_id].outer_input_ports["input_1"]
+        messages: list[str] = []
+        self.view.status_message.connect(messages.append)
+
+        self.view.fit_graph()
+        self.view.show()
+        if _APP is not None:
+            _APP.processEvents()
+        point = self.view.mapFromScene(outer_in.center_scene_pos())
+        QTest.mouseClick(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            point,
+        )
+        if _APP is not None:
+            _APP.processEvents()
+
+        self.assertFalse(any("输入端口" in message for message in messages))
+
+    def _chain_nodes(self) -> tuple[NodeModel, NodeModel, NodeModel]:
+        source = self.add_node(pos=(0.0, 0.0))
+        middle = self.add_node(pos=(0.0, 300.0))
+        sink = self.add_node(pos=(0.0, 600.0))
+        self.connect(source, middle)
+        self.connect(middle, sink)
+        return source, middle, sink
+
+    def _edge_set(self) -> set[tuple[str, str, str, str]]:
+        return {
+            (connection.src_node, connection.src_port, connection.dst_node, connection.dst_port)
+            for connection in self.graph.connections.values()
+        }
+
+    def test_drag_node_into_group_reconnects_through_ports(self) -> None:
+        source, middle, sink = self._chain_nodes()
+        group_id = self.add_group(pos=(800.0, 300.0))
+        before = self._edge_set()
+
+        self.drag_node_to(middle.id, self.view._nodes[group_id].sceneBoundingRect().center())
+
+        self.assertEqual(self.graph.nodes[middle.id].parent_group, group_id)
+        edges = self._edge_set()
+        self.assertEqual(len(edges), 4)
+        input_key = next(
+            dst_port
+            for src_node, _src_port, dst_node, dst_port in edges
+            if src_node == source.id and dst_node == group_id
+        )
+        output_key = next(
+            dst_port
+            for src_node, _src_port, dst_node, dst_port in edges
+            if src_node == middle.id and dst_node == group_id
+        )
+        self.assertIn((source.id, "image", group_id, input_key), edges)
+        self.assertIn((group_id, input_key, middle.id, "image"), edges)
+        self.assertIn((middle.id, "image", group_id, output_key), edges)
+        self.assertIn((group_id, output_key, sink.id, "image"), edges)
+
+        self.undo.undo()
+        self.assertIsNone(self.graph.nodes[middle.id].parent_group)
+        self.assertEqual(self._edge_set(), before)
+
+    def test_drag_node_out_of_group_restores_direct_connections(self) -> None:
+        source, middle, sink = self._chain_nodes()
+        group_id = self.add_group(pos=(800.0, 300.0))
+        self.drag_node_to(middle.id, self.view._nodes[group_id].sceneBoundingRect().center())
+        self.assertEqual(self.graph.nodes[middle.id].parent_group, group_id)
+        boundary_edges = self._edge_set()
+
+        self.drag_node_to(middle.id, QPointF(0.0, 1300.0))
+
+        self.assertIsNone(self.graph.nodes[middle.id].parent_group)
+        self.assertEqual(
+            self._edge_set(),
+            {
+                (source.id, "image", middle.id, "image"),
+                (middle.id, "image", sink.id, "image"),
+            },
+        )
+
+        self.undo.undo()
+        self.assertEqual(self.graph.nodes[middle.id].parent_group, group_id)
+        self.assertEqual(self._edge_set(), boundary_edges)
+
+    def test_dissolve_group_keeps_children_and_reconnects(self) -> None:
+        group_id = self.add_group(pos=(700.0, 300.0))
+        group_pos = self.graph.nodes[group_id].pos
+        child = self.add_child(group_id, pos=(group_pos[0] + 60.0, group_pos[1] + 110.0))
+        source = self.add_node(pos=(0.0, 0.0))
+        sink = self.add_node(pos=(0.0, 900.0))
+        self.view.connect_ports(source.id, "image", group_id, "input_1")
+        self.view.connect_ports(group_id, "input_1", child.id, "image")
+        self.view.connect_ports(child.id, "image", group_id, "output_1")
+        self.view.connect_ports(group_id, "output_1", sink.id, "image")
+        child_pos = self.graph.nodes[child.id].pos
+
+        self.view.dissolve_group(group_id)
+
+        self.assertNotIn(group_id, self.graph.nodes)
+        self.assertIsNone(self.graph.nodes[child.id].parent_group)
+        self.assertEqual(self.graph.nodes[child.id].pos, child_pos)
+        self.assertEqual(
+            self._edge_set(),
+            {
+                (source.id, "image", child.id, "image"),
+                (child.id, "image", sink.id, "image"),
+            },
+        )
+
+        self.undo.undo()
+        self.assertIn(group_id, self.graph.nodes)
+        self.assertEqual(self.graph.nodes[child.id].parent_group, group_id)
+        self.assertEqual(len(self.graph.connections), 4)
+
+    def test_drag_group_moves_children_with_mouse(self) -> None:
+        group_id = self.add_group(pos=(400.0, 300.0))
+        group_pos = self.graph.nodes[group_id].pos
+        child = self.add_child(group_id, pos=(group_pos[0] + 70.0, group_pos[1] + 110.0))
+        self.view._sync_group_geometries()
+        group_item = self.view._nodes[group_id]
+        before_group = self.graph.nodes[group_id].pos
+        before_child = self.graph.nodes[child.id].pos
+
+        self.view.fit_graph()
+        self.view.show()
+        if _APP is not None:
+            _APP.processEvents()
+        start = self.view.mapFromScene(
+            QPointF(group_item.pos().x() + 80.0, group_item.pos().y() + 10.0)
+        )
+        end = QPoint(start.x() + 80, start.y() + 60)
+        QTest.mousePress(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            start,
+        )
+        for step in range(1, 6):
+            point = QPoint(
+                start.x() + (end.x() - start.x()) * step // 5,
+                start.y() + (end.y() - start.y()) * step // 5,
+            )
+            QTest.mouseMove(self.view.viewport(), point)
+            if _APP is not None:
+                _APP.processEvents()
+        QTest.mouseRelease(
+            self.view.viewport(),
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+            end,
+        )
+        if _APP is not None:
+            _APP.processEvents()
+
+        group_dx = self.graph.nodes[group_id].pos[0] - before_group[0]
+        group_dy = self.graph.nodes[group_id].pos[1] - before_group[1]
+        self.assertGreater(abs(group_dx) + abs(group_dy), 1.0)
+        self.assertAlmostEqual(
+            self.graph.nodes[child.id].pos[0] - before_child[0], group_dx, places=1
+        )
+        self.assertAlmostEqual(
+            self.graph.nodes[child.id].pos[1] - before_child[1], group_dy, places=1
+        )
+
+    def test_library_drop_inside_group_sets_parent_group(self) -> None:
+        group_id = self.add_group(pos=(500.0, 400.0))
+        group_item = self.view._nodes[group_id]
+        center = group_item.sceneBoundingRect().center()
         before = set(self.graph.nodes)
 
         new_id = self.view.add_operator_at("test.blur", center)
@@ -2039,61 +2320,61 @@ class GraphViewTestCase(unittest.TestCase):
         created = [node_id for node_id in self.graph.nodes if node_id not in before]
         self.assertEqual(created, [new_id])
         node = self.graph.nodes[new_id]
-        self.assertEqual(node.parent_frame, frame_id)
-        self.assertIn(node.id, [item.id for item in self.graph.direct_children(frame_id)])
+        self.assertEqual(node.parent_group, group_id)
+        self.assertIn(node.id, [item.id for item in self.graph.direct_children(group_id)])
 
-        frame_item = self.view._nodes[frame_id]
-        frame_rect = QRectF(frame_item.pos(), frame_item.size())
+        group_item = self.view._nodes[group_id]
+        group_rect = QRectF(group_item.pos(), group_item.size())
         child_item = self.view._nodes[new_id]
-        self.assertTrue(frame_rect.contains(QRectF(child_item.pos(), child_item.size())))
+        self.assertTrue(group_rect.contains(QRectF(child_item.pos(), child_item.size())))
 
         self.undo.undo()
         self.assertNotIn(new_id, self.graph.nodes)
-        self.assertFalse(self.graph.direct_children(frame_id))
+        self.assertFalse(self.graph.direct_children(group_id))
 
-    def test_drag_node_into_frame_updates_parent_and_undo(self) -> None:
-        frame_id = self.add_frame(pos=(400.0, 300.0))
-        frame_item = self.view._nodes[frame_id]
+    def test_drag_node_into_group_updates_parent_and_undo(self) -> None:
+        group_id = self.add_group(pos=(400.0, 300.0))
+        group_item = self.view._nodes[group_id]
         node = self.add_node(pos=(1200.0, 1200.0))
         item = self.view._nodes[node.id]
         self.view._scene.clearSelection()
         item.setSelected(True)
 
         self.view.begin_move_tracking()
-        center = frame_item.sceneBoundingRect().center()
+        center = group_item.sceneBoundingRect().center()
         item.setPos(
             center.x() - item.size().width() / 2.0,
             center.y() - item.size().height() / 2.0,
         )
         self.view.finish_move_tracking()
 
-        self.assertEqual(self.graph.nodes[node.id].parent_frame, frame_id)
+        self.assertEqual(self.graph.nodes[node.id].parent_group, group_id)
         self.assertEqual(self.undo.count(), 2)
 
         self.undo.undo()
-        self.assertIsNone(self.graph.nodes[node.id].parent_frame)
+        self.assertIsNone(self.graph.nodes[node.id].parent_group)
         self.assertEqual(self.graph.nodes[node.id].pos, (1200.0, 1200.0))
 
-    def test_drag_frame_moves_all_descendants_single_undo(self) -> None:
-        frame_id = self.add_frame(pos=(400.0, 300.0))
-        frame_pos = self.graph.nodes[frame_id].pos
-        child = self.add_child(frame_id, pos=(frame_pos[0] + 40.0, frame_pos[1] + 80.0))
-        self.view._sync_frame_geometries()
-        frame_pos = self.graph.nodes[frame_id].pos
+    def test_drag_group_moves_all_descendants_single_undo(self) -> None:
+        group_id = self.add_group(pos=(400.0, 300.0))
+        group_pos = self.graph.nodes[group_id].pos
+        child = self.add_child(group_id, pos=(group_pos[0] + 40.0, group_pos[1] + 80.0))
+        self.view._sync_group_geometries()
+        group_pos = self.graph.nodes[group_id].pos
         child_pos = self.graph.nodes[child.id].pos
-        frame_item = self.view._nodes[frame_id]
+        group_item = self.view._nodes[group_id]
 
         self.view._scene.clearSelection()
-        frame_item.setSelected(True)
+        group_item.setSelected(True)
         self.view.begin_move_tracking()
         delta = QPointF(140.0, 100.0)
-        frame_item.setPos(frame_item.pos() + delta)
+        group_item.setPos(group_item.pos() + delta)
         self.view.finish_move_tracking()
 
         self.assertAlmostEqual(self.graph.nodes[child.id].pos[0], child_pos[0] + 140.0, places=1)
         self.assertAlmostEqual(self.graph.nodes[child.id].pos[1], child_pos[1] + 100.0, places=1)
-        self.assertAlmostEqual(self.graph.nodes[frame_id].pos[0], frame_pos[0] + 140.0, places=1)
-        self.assertAlmostEqual(self.graph.nodes[frame_id].pos[1], frame_pos[1] + 100.0, places=1)
+        self.assertAlmostEqual(self.graph.nodes[group_id].pos[0], group_pos[0] + 140.0, places=1)
+        self.assertAlmostEqual(self.graph.nodes[group_id].pos[1], group_pos[1] + 100.0, places=1)
         self.assertAlmostEqual(
             self.view._nodes[child.id].pos().x(), child_pos[0] + 140.0, places=1
         )
@@ -2102,47 +2383,47 @@ class GraphViewTestCase(unittest.TestCase):
         self.undo.undo()
         self.assertAlmostEqual(self.graph.nodes[child.id].pos[0], child_pos[0], places=1)
         self.assertAlmostEqual(self.graph.nodes[child.id].pos[1], child_pos[1], places=1)
-        self.assertAlmostEqual(self.graph.nodes[frame_id].pos[0], frame_pos[0], places=1)
-        self.assertAlmostEqual(self.graph.nodes[frame_id].pos[1], frame_pos[1], places=1)
+        self.assertAlmostEqual(self.graph.nodes[group_id].pos[0], group_pos[0], places=1)
+        self.assertAlmostEqual(self.graph.nodes[group_id].pos[1], group_pos[1], places=1)
 
-    def test_delete_frame_subtree_is_single_undo(self) -> None:
-        frame_id = self.add_frame(pos=(400.0, 300.0))
-        frame_pos = self.graph.nodes[frame_id].pos
-        child = self.add_child(frame_id, pos=(frame_pos[0] + 40.0, frame_pos[1] + 80.0))
-        inner = self.graph.add_connection(child.id, "image", frame_id, "output_1")
+    def test_delete_group_subtree_is_single_undo(self) -> None:
+        group_id = self.add_group(pos=(400.0, 300.0))
+        group_pos = self.graph.nodes[group_id].pos
+        child = self.add_child(group_id, pos=(group_pos[0] + 40.0, group_pos[1] + 80.0))
+        inner = self.graph.add_connection(child.id, "image", group_id, "output_1")
         sink = self.add_node(pos=(0.0, 1000.0))
-        outer = self.graph.add_connection(frame_id, "output_1", sink.id, "image")
+        outer = self.graph.add_connection(group_id, "output_1", sink.id, "image")
 
-        self.view._nodes[frame_id].setSelected(True)
+        self.view._nodes[group_id].setSelected(True)
         self.view.delete_selected()
-        self.assertNotIn(frame_id, self.graph.nodes)
+        self.assertNotIn(group_id, self.graph.nodes)
         self.assertNotIn(child.id, self.graph.nodes)
         self.assertFalse(self.graph.connections)
         self.assertFalse(self.view._connections)
 
         self.undo.undo()
-        self.assertIn(frame_id, self.graph.nodes)
+        self.assertIn(group_id, self.graph.nodes)
         self.assertIn(child.id, self.graph.nodes)
         self.assertEqual(set(self.graph.connections), {inner.id, outer.id})
-        self.assertIsInstance(self.view._nodes[frame_id], FrameItem)
+        self.assertIsInstance(self.view._nodes[group_id], GroupItem)
         self.assertIsInstance(self.view._nodes[child.id], NodeItem)
 
-    def test_copy_paste_frame_subtree_remaps_parent_frame(self) -> None:
-        frame_id = self.add_frame(pos=(400.0, 300.0))
-        frame_pos = self.graph.nodes[frame_id].pos
-        child = self.add_child(frame_id, pos=(frame_pos[0] + 40.0, frame_pos[1] + 80.0))
-        inner = self.graph.add_connection(child.id, "image", frame_id, "output_1")
+    def test_copy_paste_group_subtree_remaps_parent_group(self) -> None:
+        group_id = self.add_group(pos=(400.0, 300.0))
+        group_pos = self.graph.nodes[group_id].pos
+        child = self.add_child(group_id, pos=(group_pos[0] + 40.0, group_pos[1] + 80.0))
+        inner = self.graph.add_connection(child.id, "image", group_id, "output_1")
 
-        self.view._nodes[frame_id].setSelected(True)
+        self.view._nodes[group_id].setSelected(True)
         self.assertTrue(self.view.copy_selected())
         new_ids = self.view.paste_nodes()
         self.assertEqual(len(new_ids), 2)
-        new_frames = [node_id for node_id in new_ids if self.graph.nodes[node_id].is_frame]
-        self.assertEqual(len(new_frames), 1)
-        new_frame_id = new_frames[0]
-        new_children = [n for n in self.graph.direct_children(new_frame_id)]
+        new_groups = [node_id for node_id in new_ids if self.graph.nodes[node_id].is_group]
+        self.assertEqual(len(new_groups), 1)
+        new_group_id = new_groups[0]
+        new_children = [n for n in self.graph.direct_children(new_group_id)]
         self.assertEqual(len(new_children), 1)
-        self.assertEqual(new_children[0].parent_frame, new_frame_id)
+        self.assertEqual(new_children[0].parent_group, new_group_id)
         self.assertIn(new_children[0].id, new_ids)
 
         pasted_connections = [
@@ -2150,59 +2431,59 @@ class GraphViewTestCase(unittest.TestCase):
         ]
         self.assertEqual(len(pasted_connections), 1)
         self.assertEqual(pasted_connections[0].src_node, new_children[0].id)
-        self.assertEqual(pasted_connections[0].dst_node, new_frame_id)
+        self.assertEqual(pasted_connections[0].dst_node, new_group_id)
         self.assertIn(inner.id, self.graph.connections)
 
         self.undo.undo()
-        self.assertNotIn(new_frame_id, self.graph.nodes)
-        self.assertEqual(set(self.graph.nodes), {frame_id, child.id})
+        self.assertNotIn(new_group_id, self.graph.nodes)
+        self.assertEqual(set(self.graph.nodes), {group_id, child.id})
         self.assertEqual(set(self.graph.connections), {inner.id})
 
-    def test_save_frame_menu_uses_name_and_emits_signal(self) -> None:
-        frame_id = self.add_frame()
-        frame_pos = self.graph.nodes[frame_id].pos
-        self.add_child(frame_id, pos=(frame_pos[0] + 40.0, frame_pos[1] + 80.0))
+    def test_save_group_menu_uses_name_and_emits_signal(self) -> None:
+        group_id = self.add_group()
+        group_pos = self.graph.nodes[group_id].pos
+        self.add_child(group_id, pos=(group_pos[0] + 40.0, group_pos[1] + 80.0))
         statuses: list[str] = []
         changed: list[bool] = []
         self.view.status_message.connect(statuses.append)
         self.view.operators_changed.connect(lambda: changed.append(True))
-        saved = SimpleNamespace(name="我的流程", op_id="frame.demo")
+        saved = SimpleNamespace(name="我的流程", op_id="group.demo")
 
         with patch(
             "app.graph.view.QInputDialog.getText", return_value=("我的流程", True)
         ) as dialog, patch(
-            "app.graph.view.save_frame_operator", return_value=saved
+            "app.graph.view.save_group_operator", return_value=saved
         ) as save:
-            self.view.save_frame_as_operator(frame_id)
+            self.view.save_group_as_operator(group_id)
 
         dialog.assert_called_once()
         save.assert_called_once()
         args = save.call_args.args
         self.assertIs(args[0], self.graph)
-        self.assertEqual(args[1], frame_id)
+        self.assertEqual(args[1], group_id)
         self.assertEqual(args[2], "我的流程")
         self.assertIs(save.call_args.kwargs.get("registry"), self.registry)
         self.assertEqual(changed, [True])
         self.assertTrue(any("已保存算子" in message for message in statuses))
 
-    def test_save_frame_rejects_source_image_nodes(self) -> None:
-        frame_id = self.add_frame()
-        frame_pos = self.graph.nodes[frame_id].pos
+    def test_save_group_rejects_source_image_nodes(self) -> None:
+        group_id = self.add_group()
+        group_pos = self.graph.nodes[group_id].pos
         source = NodeModel(
             id=new_id("n"),
             op_id=SOURCE_OP_ID,
-            title="框内源图像",
-            pos=(frame_pos[0] + 30.0, frame_pos[1] + 80.0),
-            parent_frame=frame_id,
+            title="组内源图像",
+            pos=(group_pos[0] + 30.0, group_pos[1] + 80.0),
+            parent_group=group_id,
         )
         self.graph.add_node(source)
         statuses: list[str] = []
         self.view.status_message.connect(statuses.append)
 
         with patch("app.graph.view.QInputDialog.getText") as dialog, patch(
-            "app.graph.view.save_frame_operator"
+            "app.graph.view.save_group_operator"
         ) as save:
-            self.view.save_frame_as_operator(frame_id)
+            self.view.save_group_as_operator(group_id)
 
         dialog.assert_not_called()
         save.assert_not_called()
@@ -2243,26 +2524,26 @@ class GraphViewTestCase(unittest.TestCase):
         self.assertTrue(self.view._nodes[stale.id].is_stale)
         self.assertIn(connection.id, self.graph.connections)
 
-    def test_frame_ports_compatible_respects_scope(self) -> None:
-        frame_id = self.add_frame()
-        frame_pos = self.graph.nodes[frame_id].pos
-        child = self.add_child(frame_id, pos=(frame_pos[0] + 40.0, frame_pos[1] + 80.0))
+    def test_group_ports_compatible_respects_scope(self) -> None:
+        group_id = self.add_group()
+        group_pos = self.graph.nodes[group_id].pos
+        child = self.add_child(group_id, pos=(group_pos[0] + 40.0, group_pos[1] + 80.0))
         top = self.add_node(pos=(1000.0, 1000.0))
 
         self.assertFalse(self.view.ports_compatible(top.id, "image", child.id, "image"))
         self.assertFalse(self.view.ports_compatible(child.id, "image", top.id, "image"))
         self.assertTrue(
-            self.view.ports_compatible(child.id, "image", frame_id, "output_1")
+            self.view.ports_compatible(child.id, "image", group_id, "output_1")
         )
         self.assertTrue(
-            self.view.ports_compatible(frame_id, "input_1", child.id, "image")
+            self.view.ports_compatible(group_id, "input_1", child.id, "image")
         )
 
         messages: list[str] = []
         self.view.status_message.connect(messages.append)
         self.view.connect_ports(top.id, "image", child.id, "image")
         self.assertFalse(self.graph.connections)
-        self.assertTrue(any("层级" in message or "流程框" in message for message in messages))
+        self.assertTrue(any("层级" in message or "算子组" in message for message in messages))
 
         scene = self.view._scene
         top_output = self.view._nodes[top.id].output_ports["image"]
@@ -2273,14 +2554,14 @@ class GraphViewTestCase(unittest.TestCase):
         finally:
             scene._drag_source = None
 
-    def test_drop_frame_operator_materializes_with_single_undo(self) -> None:
-        self.view.set_registry(make_frame_registry())
-        frame_id = self.view.add_operator_at("frame.demo", QPointF(500.0, 400.0))
-        self.assertIsNotNone(frame_id)
-        node = self.graph.nodes[frame_id]
-        self.assertTrue(node.is_frame)
-        self.assertEqual(node.frame.operator_id, "frame.demo")
-        children = self.graph.direct_children(frame_id)
+    def test_drop_group_operator_materializes_with_single_undo(self) -> None:
+        self.view.set_registry(make_group_registry())
+        group_id = self.view.add_operator_at("group.demo", QPointF(500.0, 400.0))
+        self.assertIsNotNone(group_id)
+        node = self.graph.nodes[group_id]
+        self.assertTrue(node.is_group)
+        self.assertEqual(node.group.operator_id, "group.demo")
+        children = self.graph.direct_children(group_id)
         self.assertEqual(len(children), 1)
         self.assertEqual(children[0].op_id, "test.blur")
         self.assertEqual(children[0].params.get("ksize"), 5)
@@ -2298,35 +2579,57 @@ class GraphViewTestCase(unittest.TestCase):
         self.assertEqual(len(self.graph.nodes), 2)
         self.assertEqual(len(self.graph.connections), 2)
 
-    def test_auto_layout_only_lays_out_top_level_nodes(self) -> None:
-        frame_id = self.add_frame(pos=(400.0, 300.0))
-        frame_pos = self.graph.nodes[frame_id].pos
-        child = self.add_child(frame_id, pos=(frame_pos[0] + 30.0, frame_pos[1] + 90.0))
+    def test_auto_layout_lays_out_group_children(self) -> None:
+        group_id = self.add_group(pos=(400.0, 300.0))
+        group_pos = self.graph.nodes[group_id].pos
+        first = self.add_child(group_id, pos=(group_pos[0] + 30.0, group_pos[1] + 90.0))
+        second = self.add_child(group_id, pos=(group_pos[0] + 30.0, group_pos[1] + 240.0))
+        self.graph.add_connection(first.id, "image", second.id, "image")
         top = self.add_node(pos=(-900.0, 700.0))
-        self.view._sync_frame_geometries()
-        frame_pos = self.graph.nodes[frame_id].pos
-        child_pos = self.graph.nodes[child.id].pos
-        relative = (child_pos[0] - frame_pos[0], child_pos[1] - frame_pos[1])
+        self.view._sync_group_geometries()
+        before = {node_id: self.graph.nodes[node_id].pos for node_id in (first.id, second.id)}
 
         changes = self.view._layout_changes()
         changed_ids = {change[0] for change in changes}
-        self.assertNotIn(child.id, changed_ids)
-        self.assertTrue(changed_ids.issubset({frame_id, top.id}))
+        self.assertIn(first.id, changed_ids)
+        self.assertIn(second.id, changed_ids)
+        self.assertIn(group_id, changed_ids)
+        self.assertIn(top.id, changed_ids)
 
         self.view.auto_layout()
-        new_frame = self.graph.nodes[frame_id].pos
-        new_child = self.graph.nodes[child.id].pos
-        self.assertAlmostEqual(new_child[0] - new_frame[0], relative[0], places=1)
-        self.assertAlmostEqual(new_child[1] - new_frame[1], relative[1], places=1)
 
-    def test_frame_context_menu_has_save_and_replace_actions(self) -> None:
-        frame_id = self.add_frame()
-        frame_node = self.graph.nodes[frame_id]
-        point = self._show_and_focus_node(frame_node)
+        first_pos = self.graph.nodes[first.id].pos
+        second_pos = self.graph.nodes[second.id].pos
+        group_pos = self.graph.nodes[group_id].pos
+        # 组内节点按一条普通连线布局：下游排在下一层。
+        self.assertGreater(second_pos[1], first_pos[1])
+        # 组内布局从算子组内容区左上角开始。
+        self.assertAlmostEqual(
+            min(first_pos[0], second_pos[0]) - group_pos[0], GROUP_PADDING_X, places=1
+        )
+        group_item = self.view._nodes[group_id]
+        self.assertTrue(
+            group_item.sceneBoundingRect().contains(self.view._nodes[first.id].sceneBoundingRect())
+        )
+        self.assertTrue(
+            group_item.sceneBoundingRect().contains(self.view._nodes[second.id].sceneBoundingRect())
+        )
+
+        self.undo.undo()
+        self.assertEqual(
+            {node_id: self.graph.nodes[node_id].pos for node_id in (first.id, second.id)},
+            before,
+        )
+
+    def test_group_context_menu_has_save_and_replace_actions(self) -> None:
+        group_id = self.add_group()
+        group_node = self.graph.nodes[group_id]
+        point = self._show_and_focus_node(group_node)
         with patch("app.graph.view.QMenu") as menu_cls:
             self.view.contextMenuEvent(_FakeContextMenuEvent(point))
         actions = [call.args[0] for call in menu_cls.return_value.addAction.call_args_list if call.args]
         self.assertIn("保存为新算子…", actions)
+        self.assertIn("解散算子组", actions)
 
         missing = self.add_missing_node(pos=(1500.0, 1500.0))
         point = self._show_and_focus_node(missing)
@@ -2335,17 +2638,17 @@ class GraphViewTestCase(unittest.TestCase):
         actions = [call.args[0] for call in menu_cls.return_value.addAction.call_args_list if call.args]
         self.assertIn("替换算子…", actions)
 
-    def test_move_out_of_frame_command_and_undo(self) -> None:
-        frame_id = self.add_frame()
-        frame_pos = self.graph.nodes[frame_id].pos
-        child = self.add_child(frame_id, pos=(frame_pos[0] + 30.0, frame_pos[1] + 80.0))
-        self.view.move_out_of_frame(child.id)
-        self.assertIsNone(self.graph.nodes[child.id].parent_frame)
-        # add_frame_at 占一条撤销记录；移出流程框本身是一步。
+    def test_move_out_of_group_command_and_undo(self) -> None:
+        group_id = self.add_group()
+        group_pos = self.graph.nodes[group_id].pos
+        child = self.add_child(group_id, pos=(group_pos[0] + 30.0, group_pos[1] + 80.0))
+        self.view.move_out_of_group(child.id)
+        self.assertIsNone(self.graph.nodes[child.id].parent_group)
+        # add_group_at 占一条撤销记录；移出算子组本身是一步。
         self.assertEqual(self.undo.count(), 2)
 
         self.undo.undo()
-        self.assertEqual(self.graph.nodes[child.id].parent_frame, frame_id)
+        self.assertEqual(self.graph.nodes[child.id].parent_group, group_id)
 
 
 if __name__ == "__main__":

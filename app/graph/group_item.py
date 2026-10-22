@@ -1,11 +1,11 @@
-"""流程框节点条目：可嵌套的容器节点。
+"""算子组节点条目：可嵌套的容器节点。
 
-流程框在画布上表现为一个圆角容器：标题栏显示名称与状态（待定 / 失效），
-输入端口在外框顶边、输出端口在外框底边；每个外侧端口在框内约 14px 处有一个
-同款圆形的「内侧端口」，分别承担输出 / 输入的角色，供框内节点连接。
+算子组在画布上表现为一个圆角容器：标题栏显示名称与状态（失效 / 依赖缺失），
+输入端口在外框顶边、输出端口在外框底边；每个外侧端口在组内约 14px 处有一个
+同款圆形的「内侧端口」，分别承担输出 / 输入的角色，供组内节点连接。
 
-框的尺寸与位置由 GraphView 根据直接子节点的包围盒反推后调用
-set_frame_geometry 同步，本类只负责绘制与端口摆放。
+组的尺寸与位置由 GraphView 根据直接子节点的包围盒反推后调用
+set_group_geometry 同步，本类只负责绘制与端口摆放。
 """
 
 from __future__ import annotations
@@ -22,18 +22,18 @@ from app.graph.port_item import PortItem
 #: 外侧端口与内侧端口之间的偏移（像素）。
 INNER_OFFSET = 14.0
 #: 无子节点时的默认尺寸。
-DEFAULT_FRAME_WIDTH = 420.0
-DEFAULT_FRAME_HEIGHT = 220.0
+DEFAULT_GROUP_WIDTH = 420.0
+DEFAULT_GROUP_HEIGHT = 220.0
 #: 子节点包围盒之外的最小留白；顶部额外留给标题栏。
-FRAME_PADDING_X = 26.0
-FRAME_PADDING_TOP = 52.0
-FRAME_PADDING_BOTTOM = 52.0
+GROUP_PADDING_X = 26.0
+GROUP_PADDING_TOP = 52.0
+GROUP_PADDING_BOTTOM = 52.0
 #: 标题栏高度。
 TITLE_HEIGHT = 24.0
 
 
-class FrameItem(NodeItem):
-    """流程框容器条目（输入在顶边、输出在底边，含内外两侧端口）。"""
+class GroupItem(NodeItem):
+    """算子组容器条目（输入在顶边、输出在底边，含内外两侧端口）。"""
 
     CORNER = 12.0
     PORT_MARGIN = 28.0
@@ -49,9 +49,9 @@ class FrameItem(NodeItem):
         thumbnail_box: int = 72,
         parent: QGraphicsItem | None = None,
     ) -> None:
-        self.frame = node.frame
-        self._requested_width = DEFAULT_FRAME_WIDTH
-        self._requested_height = DEFAULT_FRAME_HEIGHT
+        self.group = node.group
+        self._requested_width = DEFAULT_GROUP_WIDTH
+        self._requested_height = DEFAULT_GROUP_HEIGHT
         self._outer_inputs: dict[str, PortItem] = {}
         self._inner_outputs: dict[str, PortItem] = {}
         self._inner_inputs: dict[str, PortItem] = {}
@@ -68,7 +68,7 @@ class FrameItem(NodeItem):
             thumbnail_box,
             parent,
         )
-        # 容器背景必须位于连线（z=-2）之下，否则框内连线会被填充色盖住；
+        # 容器背景必须位于连线（z=-2）之下，否则组内连线会被填充色盖住；
         # 端口作为子条目随后单独抬高，保证仍可拖拽 / 命中。
         self.setZValue(-3.0)
         self._refresh_stale()
@@ -91,14 +91,14 @@ class FrameItem(NodeItem):
     def inner_output_ports(self) -> dict[str, PortItem]:
         return self._inner_outputs
 
-    def _frame_inputs(self):
-        return list(self.frame.inputs) if self.frame is not None else []
+    def _group_inputs(self):
+        return list(self.group.inputs) if self.group is not None else []
 
-    def _frame_outputs(self):
-        return list(self.frame.outputs) if self.frame is not None else []
+    def _group_outputs(self):
+        return list(self.group.outputs) if self.group is not None else []
 
     def _build_ports(self) -> None:
-        """按 FrameModel 重建外侧 / 内侧端口（同一连接点图形）。"""
+        """按 GroupModel 重建外侧 / 内侧端口（同一连接点图形）。"""
 
         self._outer_inputs = {}
         self._inner_outputs = {}
@@ -108,7 +108,7 @@ class FrameItem(NodeItem):
         output_ports: dict[str, PortItem] = {}
         self._clear_child_ports()
 
-        for index, port in enumerate(self._frame_inputs()):
+        for index, port in enumerate(self._group_inputs()):
             spec = port.port_spec()
             outer = PortItem(
                 self, port.key, port.label, True, index, port_spec=spec,
@@ -119,12 +119,12 @@ class FrameItem(NodeItem):
                 pending=bool(port.pending),
             )
             outer.setToolTip(
-                f"流程框输入端口：{port.label}\n数据类型：{port.type_text}\n"
-                "从框内节点连接到这里时，数据来自框外上游"
+                f"算子组输入端口：{port.label}\n数据类型：{port.type_text}\n"
+                "拖动此端口可直接连接到组内节点；外侧用于接收组外上游数据"
             )
             inner.setToolTip(
-                f"流程框输入（内侧）：{port.label}\n数据类型：{port.type_text}\n"
-                "拖动此端口可连接到框内节点"
+                f"算子组输入（内侧）：{port.label}\n数据类型：{port.type_text}\n"
+                "拖动此端口可连接到组内节点"
             )
             outer.setZValue(4.0)
             inner.setZValue(4.0)
@@ -133,7 +133,7 @@ class FrameItem(NodeItem):
             input_ports[port.key] = outer
             output_ports[port.key] = inner
 
-        for index, port in enumerate(self._frame_outputs()):
+        for index, port in enumerate(self._group_outputs()):
             spec = port.port_spec()
             inner = PortItem(
                 self, port.key, port.label, True, index, port_spec=spec,
@@ -144,12 +144,12 @@ class FrameItem(NodeItem):
                 pending=bool(port.pending),
             )
             inner.setToolTip(
-                f"流程框输出（内侧）：{port.label}\n数据类型：{port.type_text}\n"
-                "框内节点连接到这里时，数据输出到框外"
+                f"算子组输出（内侧）：{port.label}\n数据类型：{port.type_text}\n"
+                "组内节点连接到这里时，数据输出到组外"
             )
             outer.setToolTip(
-                f"流程框输出端口：{port.label}\n数据类型：{port.type_text}\n"
-                "拖动此端口可连接到框外节点"
+                f"算子组输出端口：{port.label}\n数据类型：{port.type_text}\n"
+                "拖动此端口可连接到组外节点"
             )
             inner.setZValue(4.0)
             outer.setZValue(4.0)
@@ -182,17 +182,17 @@ class FrameItem(NodeItem):
         self.update()
 
     # ---------------------------------------------------------------- 几何布局
-    def frame_input_ports(self) -> list[PortItem]:
+    def group_input_ports(self) -> list[PortItem]:
         return list(self._outer_inputs.values())
 
-    def frame_output_ports(self) -> list[PortItem]:
+    def group_output_ports(self) -> list[PortItem]:
         return list(self._outer_outputs.values())
 
-    def set_frame_geometry(self, width: float, height: float) -> None:
-        """由视图根据子节点包围盒设置框尺寸。"""
+    def set_group_geometry(self, width: float, height: float) -> None:
+        """由视图根据子节点包围盒设置算子组尺寸。"""
 
-        width = max(DEFAULT_FRAME_WIDTH if not self._has_children() else 320.0, float(width))
-        height = max(DEFAULT_FRAME_HEIGHT if not self._has_children() else 180.0, float(height))
+        width = max(DEFAULT_GROUP_WIDTH if not self._has_children() else 320.0, float(width))
+        height = max(DEFAULT_GROUP_HEIGHT if not self._has_children() else 180.0, float(height))
         if (
             abs(self._requested_width - width) < 0.01
             and abs(self._requested_height - height) < 0.01
@@ -263,13 +263,13 @@ class FrameItem(NodeItem):
             port.set_connected(any(connection.src_port == key for connection in outgoing))
 
     def _refresh_stale(self) -> None:
-        operator_id = getattr(self.frame, "operator_id", None) if self.frame is not None else None
+        operator_id = getattr(self.group, "operator_id", None) if self.group is not None else None
         stale = False
         checker = getattr(self._view, "is_operator_registered", None)
         if operator_id:
             registered = bool(checker(operator_id)) if callable(checker) else True
             stale = not registered
-        elif not self.node.is_frame and self.frame is not None:
+        elif not self.node.is_group and self.group is not None:
             registered = bool(checker(self.node.op_id)) if callable(checker) else True
             stale = not registered
         if stale != self._stale:
@@ -281,15 +281,15 @@ class FrameItem(NodeItem):
         return self._stale
 
     def _refresh_connections(self) -> None:
-        refresh = getattr(self._view, "on_frame_item_geometry_changed", None)
+        refresh = getattr(self._view, "on_group_item_geometry_changed", None)
         if callable(refresh):
             refresh(self)
             return
         super()._refresh_connections()
 
     def refresh_from_model(self) -> None:
-        # 撤销 / 重做时模型可能整体替换 FrameModel 实例，这里重新同步引用。
-        self.frame = self.node.frame
+        # 撤销 / 重做时模型可能整体替换 GroupModel 实例，这里重新同步引用。
+        self.group = self.node.group
         ports_changed = self._ports_signature() != self._current_ports_signature()
         if ports_changed:
             self.rebuild_ports()
@@ -299,9 +299,9 @@ class FrameItem(NodeItem):
 
     def _ports_signature(self) -> tuple:
         data = []
-        for port in self._frame_inputs():
+        for port in self._group_inputs():
             data.append(("i", port.key, port.data_type.value if port.data_type else None))
-        for port in self._frame_outputs():
+        for port in self._group_outputs():
             data.append(("o", port.key, port.data_type.value if port.data_type else None))
         return tuple(data)
 
@@ -316,26 +316,22 @@ class FrameItem(NodeItem):
         return tuple(data)
 
     def _refresh_tooltip(self) -> None:
-        lines: list[str] = [self.node.display_title(), "流程框"]
+        lines: list[str] = [self.node.display_title(), "算子组"]
         if self._stale:
-            lines.append("依赖的自定义算子不存在，框内节点可能失效；可右键“替换算子…”")
-        if self.frame is not None:
-            for port in self.frame.inputs:
+            lines.append("依赖的自定义算子不存在，组内节点可能失效；可右键“替换算子…”")
+        if self.group is not None:
+            for port in self.group.inputs:
                 lines.append(f"输入 {port.label}：{port.type_text}")
-            for port in self.frame.outputs:
+            for port in self.group.outputs:
                 lines.append(f"输出 {port.label}：{port.type_text}")
-        lines.append("拖动框体可整体移动框内节点")
+        lines.append("拖动算子组可整体移动组内节点")
         self.setToolTip("\n".join(lines))
 
     def _header_chip(self) -> tuple[str, QColor] | None:
-        if self._stale:
-            operator_id = getattr(self.frame, "operator_id", None) if self.frame is not None else None
-            return ("依赖缺失" if operator_id else "失效"), QColor("#b45309")
-        if self.frame is not None and (
-            self.frame.has_pending(True) or self.frame.has_pending(False)
-        ):
-            return "待定", QColor("#64748b")
-        return None
+        if not self._stale:
+            return None
+        operator_id = getattr(self.group, "operator_id", None) if self.group is not None else None
+        return ("依赖缺失" if operator_id else "失效"), QColor("#b45309")
 
     # -------------------------------------------------------------------- 绘制
     def boundingRect(self) -> QRectF:  # noqa: N802 - Qt 接口
@@ -419,18 +415,18 @@ class FrameItem(NodeItem):
             painter.setPen(QColor("#ffffff"))
             painter.drawText(chip_rect, int(Qt.AlignmentFlag.AlignCenter), chip[0])
             x_cursor = chip_rect.left() - 6.0
-        frame_rect = QRectF(x_cursor - 42.0, 3.0, 42.0, TITLE_HEIGHT - 6.0)
+        group_rect = QRectF(x_cursor - 42.0, 3.0, 42.0, TITLE_HEIGHT - 6.0)
         painter.setPen(QColor("#64748b"))
         painter.setBrush(QColor(226, 232, 240, 180))
-        painter.drawRoundedRect(frame_rect, 7.0, 7.0)
+        painter.drawRoundedRect(group_rect, 7.0, 7.0)
         painter.setPen(QColor("#475569"))
-        painter.drawText(frame_rect, int(Qt.AlignmentFlag.AlignCenter), "流程框")
-        if self.frame is not None and getattr(self.frame, "operator_id", None):
+        painter.drawText(group_rect, int(Qt.AlignmentFlag.AlignCenter), "算子组")
+        if self.group is not None and getattr(self.group, "operator_id", None):
             sub_font = QFont("Microsoft YaHei UI")
             sub_font.setPointSizeF(7.0)
             painter.setFont(sub_font)
             painter.setPen(QColor("#64748b"))
-            subtitle = f"引用：{self.frame.operator_id}"
+            subtitle = f"引用：{self.group.operator_id}"
             painter.drawText(
                 QRectF(12.0, TITLE_HEIGHT + 5.0, self._width - 24.0, 14.0),
                 int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
@@ -467,24 +463,24 @@ class FrameItem(NodeItem):
             painter.drawText(
                 QRectF(16.0, self._height / 2.0 - 12.0, self._width - 32.0, 24.0),
                 int(Qt.AlignmentFlag.AlignCenter),
-                "将算子拖入流程框，组合为可复用的整体",
+                "将算子拖入算子组，组合为可复用的整体",
             )
 
     # ------------------------------------------------------------------ 交互
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value: Any) -> Any:  # noqa: N802
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
-            # 流程框始终位于连线（z=-2）与框内节点下方，选中时也不能盖住它们。
+            # 算子组始终位于连线（z=-2）与组内节点下方，选中时也不能盖住它们。
             self.setZValue(-2.8 if bool(value) else -3.0)
             return QGraphicsItem.itemChange(self, change, value)
         return super().itemChange(change, value)
 
 
 __all__ = [
-    "DEFAULT_FRAME_HEIGHT",
-    "DEFAULT_FRAME_WIDTH",
-    "FRAME_PADDING_BOTTOM",
-    "FRAME_PADDING_TOP",
-    "FRAME_PADDING_X",
-    "FrameItem",
+    "DEFAULT_GROUP_HEIGHT",
+    "DEFAULT_GROUP_WIDTH",
+    "GROUP_PADDING_BOTTOM",
+    "GROUP_PADDING_TOP",
+    "GROUP_PADDING_X",
+    "GroupItem",
     "INNER_OFFSET",
 ]

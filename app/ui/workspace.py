@@ -331,7 +331,7 @@ class WorkspaceWidget(QWidget):
             return node
         graph = self.workspace.graph
         queue: list[str] = []
-        # 框内节点的直接上游可能是流程框边界端口：先解析成真实上游节点。
+        # 组内节点的直接上游可能是算子组边界端口：先解析成真实上游节点。
         for connection in graph.incoming(node.id):
             resolved = graph.resolve_source(connection.src_node, connection.src_port)
             if resolved is not None:
@@ -348,8 +348,8 @@ class WorkspaceWidget(QWidget):
                 continue
             if candidate.is_source:
                 return candidate
-            if candidate.is_frame:
-                continue  # 框本身不是源图像，继续找它外部的上游
+            if candidate.is_group:
+                continue  # 算子组本身不是源图像，继续找它外部的上游
             queue.extend(graph.predecessors(current))
         sources = graph.source_nodes()
         return sources[0] if sources else None
@@ -413,8 +413,8 @@ class WorkspaceWidget(QWidget):
         if node is None or node.is_source:
             self.status_message.emit("源图像节点没有可调参数")
             return
-        if node.is_frame:
-            self.status_message.emit("流程框本身没有参数；双击框内节点可编辑算子参数")
+        if node.is_group:
+            self.status_message.emit("算子组本身没有参数；双击组内节点可编辑算子参数")
             return
         entry = self.registry.entry(node.op_id)
         if entry is None:

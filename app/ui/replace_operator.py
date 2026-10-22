@@ -1,10 +1,10 @@
-"""替换算子对话框：按一级分类浏览 / 搜索可用算子，并排除流程框算子。
+"""替换算子对话框：按一级分类浏览 / 搜索可用算子，并排除算子组。
 
 用于画布上「失效节点」或普通节点替换算子：
 
 * 数据源为 OperatorRegistry，按 registry.tabs() 的分类顺序展示，
   「用户自定义算子」固定在最顶部；
-* 默认排除流程框算子（FrameOperator），但允许当前算子保留在列表中；
+* 默认排除算子组（GroupOperator），但允许当前算子保留在列表中；
 * 搜索框跨全部分类过滤（名称 / id / 描述 / 分类 / 关键字），匹配项自动展开；
 * 双击算子或点击「替换」确认；exec() 后通过 selected_op_id() 读取结果，
   取消或无选择时返回 None。
@@ -29,15 +29,15 @@ from PySide6.QtWidgets import (
 from app.operators.loader import OperatorEntry, OperatorRegistry
 
 
-def _is_frame_operator(operator: object) -> bool:
-    """判断算子是否为流程框算子。
+def _is_group_operator(operator: object) -> bool:
+    """判断算子是否为算子组。
 
-    延迟导入 app.operators.frame，并用 frame_definition 属性兜底：
+    延迟导入 app.operators.group，并用 group_definition 属性兜底：
     即使帧模块尚未就绪 / 导入异常，选择列表也不会因此崩溃。
     """
 
     try:
-        from app.operators.frame import is_frame_operator as checker
+        from app.operators.group import is_group_operator as checker
     except Exception:  # noqa: BLE001 - 延迟导入，帧模块可能尚未就绪
         checker = None
     if checker is not None:
@@ -45,7 +45,7 @@ def _is_frame_operator(operator: object) -> bool:
             return bool(checker(operator))
         except Exception:  # noqa: BLE001 - 判定失败时退回属性检查
             pass
-    return getattr(operator, "frame_definition", None) is not None
+    return getattr(operator, "group_definition", None) is not None
 
 
 class ReplaceOperatorDialog(QDialog):
@@ -56,7 +56,7 @@ class ReplaceOperatorDialog(QDialog):
     registry:
         当前算子注册表。
     current_op_id:
-        被替换节点的算子 id；列表中会保留它（即使它是流程框算子），
+        被替换节点的算子 id；列表中会保留它（即使它是算子组），
         并在名称右侧标注「当前」。
     parent:
         Qt 父窗口。
@@ -104,7 +104,7 @@ class ReplaceOperatorDialog(QDialog):
         layout.addWidget(self.current_label)
 
         hint = QLabel(
-            "选择一个普通算子替换当前节点；流程框算子不能作为替换目标。", self
+            "选择一个普通算子替换当前节点；算子组不能作为替换目标。", self
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
@@ -183,7 +183,7 @@ class ReplaceOperatorDialog(QDialog):
         return self._apply_filter(text)
 
     def operator_ids(self) -> list[str]:
-        """按展示顺序返回列表中的全部算子 id（已排除流程框算子）。"""
+        """按展示顺序返回列表中的全部算子 id（已排除算子组）。"""
 
         return list(self._entry_items.keys())
 
@@ -257,7 +257,7 @@ class ReplaceOperatorDialog(QDialog):
             for category, entries in tabs.items():
                 available: list[OperatorEntry] = []
                 for entry in entries:
-                    if entry.id == self._current_op_id or not _is_frame_operator(
+                    if entry.id == self._current_op_id or not _is_group_operator(
                         entry.operator
                     ):
                         available.append(entry)

@@ -15,9 +15,9 @@
   无法中断时允许新请求并行启动，旧结果最终被 generation 检查丢弃；
 * 节点级结果缓存（快照）：点击节点立刻拿到上次结果，参数变更会重算当前节点
   与下游，保证画布显示的数据始终与参数一致；
-* 流程框节点（Frame Node）在快照阶段用 GraphModel.resolve_source 把框边界上的
-  连线解析成真实普通节点端口；框的每个输出端口作为一条 "@out:<port>" 伪输入参与
-  依赖 / 拓扑排序，框内节点仍作为独立节点执行并回传 node_finished；
+* 算子组节点（Group Node）在快照阶段用 GraphModel.resolve_source 把组边界上的
+  连线解析成真实普通节点端口；组的每个输出端口作为一条 "@out:<port>" 伪输入参与
+  依赖 / 拓扑排序，组内节点仍作为独立节点执行并回传 node_finished；
 * 算子异常被捕获并记录，节点标红，不中断其它分支；
 * 默认并行度取 AppSettings.execution_workers（默认 4，范围 1..16），构造时
   也可用 workers= 显式指定；
@@ -51,9 +51,9 @@ from typing import Any, Iterable, Sequence
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 from app.config import AppSettings
-from app.core.constants import FRAME_OP_ID
+from app.core.constants import GROUP_OP_ID
 from app.core.data_types import data_type_of, summarize_outputs
-from app.core.frame import FrameModel
+from app.core.group import GroupModel
 from app.core.model import WorkspaceModel
 from app.core.types import ImageData
 from app.operators.loader import OperatorRegistry
@@ -68,14 +68,14 @@ from app.operators.spec import (
 
 LOG = logging.getLogger(__name__)
 
-#: 流程框输出端口在快照 inputs 里的伪输入 key 前缀。
-FRAME_OUTPUT_INPUT_PREFIX = "@out:"
+#: 算子组输出端口在快照 inputs 里的伪输入 key 前缀。
+GROUP_OUTPUT_INPUT_PREFIX = "@out:"
 
 
-def _frame_output_input_key(port_key: str) -> str:
-    """流程框输出端口对应的伪输入 key（真实来源节点在快照阶段解析）。"""
+def _group_output_input_key(port_key: str) -> str:
+    """算子组输出端口对应的伪输入 key（真实来源节点在快照阶段解析）。"""
 
-    return f"{FRAME_OUTPUT_INPUT_PREFIX}{port_key}"
+    return f"{GROUP_OUTPUT_INPUT_PREFIX}{port_key}"
 
 
 @dataclass
@@ -145,12 +145,12 @@ class _NodeSnap:
     params: dict[str, Any]
     source_image_id: str | None
     revision: int
-    parent_frame: str | None = None
-    frame: FrameModel | None = None
+    parent_group: str | None = None
+    group: GroupModel | None = None
 
     @property
-    def is_frame(self) -> bool:
-        return self.op_id == FRAME_OP_ID and self.frame is not None
+    def is_group(self) -> bool:
+        return self.op_id == GROUP_OP_ID and self.group is not None
 
 
 @dataclass
@@ -160,7 +160,7 @@ class _GraphSnapshot:
     children: dict[str, list[str]]
     images: dict[str, ImageData]
     registry: OperatorRegistry
-    #: 原始结构后继（未做流程框边界解析）。仅用于“计算下游”时把流程框及其
+    #: 原始结构后继（未做算子组边界解析）。仅用于“计算下游”时把算子组及其
     #: 外部消费者一并纳入计算集合，不参与依赖等待 / 拓扑排序。
     structural_children: dict[str, list[str]] = field(default_factory=dict)
     seed: dict[str, NodeResult] = field(default_factory=dict)
@@ -454,11 +454,11 @@ class ExecutionEngine(QObject):
     def _capture_graph(self) -> _GraphSnapshot:
         """抓取一份不可变快照。
 
-        流程框（Frame Node）不是普通算子：它的输入端口作为框内节点的数据源、
-        输出端口作为框内节点的数据终点。这里用 GraphModel.resolve_source 把
+        算子组（Group Node）不是普通算子：它的输入端口作为组内节点的数据源、
+        输出端口作为组内节点的数据终点。这里用 GraphModel.resolve_source 把
         每条真实连线解析到“真实上游普通节点 + 端口”，确保邻接表、拓扑排序、
-        并行调度和缓存键始终使用真实节点 id；框的每个输出端口额外记录一条
-        "@out:<port>" 伪输入，供 _compute_frame 等待 / 组装输出。
+        并行调度和缓存键始终使用真实节点 id；组的每个输出端口额外记录一条
+        "@out:<port>" 伪输入，供 _compute_group 等待 / 组装输出。
         """
 
         graph = self.workspace.graph
@@ -471,8 +471,8 @@ class ExecutionEngine(QObject):
                 params=copy.deepcopy(node.params),
                 source_image_id=node.source_image_id,
                 revision=node.revision,
-                parent_frame=node.parent_frame,
-                frame=node.frame.copy() if node.frame is not None else None,
+                parent_group=node.parent_group,
+                group=node.group.copy() if node.group is not None else None,
             )
         inputs: dict[tuple[str, str], tuple[str, str]] = {}
         children: dict[str, list[str]] = {node_id: [] for node_id in nodes}
@@ -486,38 +486,38 @@ class ExecutionEngine(QObject):
                 connection.dst_node,
                 connection.dst_port,
             )
-            dst_is_frame = dst_node is not None and dst_node.is_frame and dst_node.frame is not None
-            # 原始结构边：只用于“计算下游”的集合扩展。“框输入 -> 框内普通节点”
-            # 是外部数据流入框的边界边，不是框节点自己产生的数据；框输出路径上
+            dst_is_group = dst_node is not None and dst_node.is_group and dst_node.group is not None
+            # 原始结构边：只用于“计算下游”的集合扩展。“组输入 -> 组内普通节点”
+            # 是外部数据流入组的边界边，不是算子组节点自己产生的数据；组输出路径上
             # 的这类节点会作为 resolve 后的真实来源被祖先闭包选中，不必把所有
-            # 读取框输入的框内节点都拉进下游集合（避免无关失效分支拖垮整框）。
-            # 但“框输入 -> 嵌套流程框”要保留，否则预览外层框时不会计算内层框。
-            if role != "frame_input_inner" or dst_is_frame:
+            # 读取组输入的组内节点都拉进下游集合（避免无关失效分支拖垮整个算子组）。
+            # 但“组输入 -> 嵌套算子组”要保留，否则预览外层算子组时不会计算内层算子组。
+            if role != "group_input_inner" or dst_is_group:
                 structural = children.setdefault(connection.src_node, [])
                 if connection.dst_node not in structural:
                     structural.append(connection.dst_node)
-            if dst_is_frame:
-                frame = dst_node.frame
-                if connection.dst_port in frame.output_keys():
-                    # 框内节点写到框输出端口：依赖由伪输入 "@out:<port>" 表达，
+            if dst_is_group:
+                group = dst_node.group
+                if connection.dst_port in group.output_keys():
+                    # 组内节点写到组输出端口：依赖由伪输入 "@out:<port>" 表达，
                     # 真实的依赖是 resolve_source 之后的普通节点。
                     continue
-                if connection.dst_port in frame.input_keys():
-                    # 框外数据写入框输入端口：框本身不消费它，只供框内节点解析。
+                if connection.dst_port in group.input_keys():
+                    # 组外数据写入组输入端口：算子组本身不消费它，只供组内节点解析。
                     continue
             resolved = graph.resolve_source(connection.src_node, connection.src_port)
             if resolved is None or resolved[0] not in nodes:
-                # 边界断开（例如框输出端口没有内部来源）：按“缺少输入”处理。
+                # 边界断开（例如组输出端口没有内部来源）：按“缺少输入”处理。
                 continue
             inputs[(connection.dst_node, connection.dst_port)] = resolved
 
-        # 流程框输出端口 -> 真实来源节点，作为伪输入参与 deps / 拓扑 / 缓存。
+        # 算子组输出端口 -> 真实来源节点，作为伪输入参与 deps / 拓扑 / 缓存。
         for node_id, snap in nodes.items():
-            if not snap.is_frame:
+            if not snap.is_group:
                 continue
-            for port_key, source in graph.frame_output_sources(node_id).items():
+            for port_key, source in graph.group_output_sources(node_id).items():
                 if source[0] in nodes:
-                    inputs[(node_id, _frame_output_input_key(port_key))] = source
+                    inputs[(node_id, _group_output_input_key(port_key))] = source
 
         seed = {
             node_id: result
@@ -700,9 +700,9 @@ class _EvalState:
         selected = self._closure(roots, self._preds)
         if self.snapshot.compute_downstream:
             downstream = self._closure(roots, self._succs)
-            # 流程框是容器节点，普通「解析后依赖边」只连到真实上游 / 下游：
-            # 框节点本身通常没有出边（外部消费者直接依赖真实来源节点）。这里
-            # 叠加原始结构边，使得预览 / 保存流程框（或框内节点）时，框及其
+            # 算子组是容器节点，普通「解析后依赖边」只连到真实上游 / 下游：
+            # 算子组节点本身通常没有出边（外部消费者直接依赖真实来源节点）。这里
+            # 叠加原始结构边，使得预览 / 保存算子组（或组内节点）时，算子组及其
             # 外部下游也会被纳入本次计算集合（允许过度失效，结果仍按 revision
             # 校验）。
             downstream |= self._closure(roots, self.snapshot.structural_children)
@@ -808,8 +808,8 @@ class _EvalState:
         snap = self.snapshot.nodes.get(node_id)
         if snap is None:
             return None
-        if snap.is_frame:
-            return self._compute_frame(snap, deps)
+        if snap.is_group:
+            return self._compute_group(snap, deps)
         if snap.op_id == "__source__":
             return self._compute_source(snap)
         return self._compute_operator(snap, deps)
@@ -849,30 +849,30 @@ class _EvalState:
         self.engine._computed.emit(self.generation, result)
         return result
 
-    def _compute_frame(
+    def _compute_group(
         self,
         snap: _NodeSnap,
         deps: dict[str, Future[Any]],
     ) -> NodeResult | None:
-        """流程框节点：等待各输出端口的真实上游，按端口类型组装结果。
+        """算子组节点：等待各输出端口的真实上游，按端口类型组装结果。
 
-        流程框自身不执行算子；框内节点已经作为普通节点独立执行。这里只负责
-        把「框输出端口 -> resolve 后的真实来源节点端口」的值取出，并按
-        FramePort 声明的类型调用 coerce_output_value 规范化。没有内部来源的
-        输出端口直接跳过（允许空 outputs）。上游失败 / 端口缺失时整个框失败，
+        算子组自身不执行算子；组内节点已经作为普通节点独立执行。这里只负责
+        把「组输出端口 -> resolve 后的真实来源节点端口」的值取出，并按
+        GroupPort 声明的类型调用 coerce_output_value 规范化。没有内部来源的
+        输出端口直接跳过（允许空 outputs）。上游失败 / 端口缺失时整个算子组失败，
         但不会影响其它分支。
         """
 
-        frame = snap.frame
-        if frame is None:
-            self.record_failure(snap.id, "流程框缺少端口定义")
+        group = snap.group
+        if group is None:
+            self.record_failure(snap.id, "算子组缺少端口定义")
             return None
         upstream_results: dict[str, NodeResult | None] = {}
         pending: dict[str, Any] = {}
-        for port in frame.outputs:
-            source = self.snapshot.inputs.get((snap.id, _frame_output_input_key(port.key)))
+        for port in group.outputs:
+            source = self.snapshot.inputs.get((snap.id, _group_output_input_key(port.key)))
             if source is None:
-                # 该输出端口没有内部来源（例如新建框尚未接线）：允许空输出。
+                # 该输出端口没有内部来源（例如新建算子组尚未接线）：允许空输出。
                 continue
             src_node, src_port = source
             if src_node not in upstream_results:
@@ -899,7 +899,7 @@ class _EvalState:
         self.engine._started.emit(self.generation, snap.id)
         outputs: dict[str, Any] = {}
         labels: dict[str, str] = {}
-        for port in frame.outputs:
+        for port in group.outputs:
             if port.key not in pending:
                 continue
             try:
@@ -907,14 +907,14 @@ class _EvalState:
             except OperatorError as exc:
                 self.record_failure(
                     snap.id,
-                    f"流程框输出“{port.label}”的数据无效：{exc}",
+                    f"算子组输出“{port.label}”的数据无效：{exc}",
                     traceback.format_exc(),
                 )
                 return None
             except Exception as exc:  # noqa: BLE001 - 端口定义异常也不能拖垮线程
                 self.record_failure(
                     snap.id,
-                    f"流程框输出“{port.label}”处理失败：{exc.__class__.__name__}: {exc}",
+                    f"算子组输出“{port.label}”处理失败：{exc.__class__.__name__}: {exc}",
                     traceback.format_exc(),
                 )
                 return None
