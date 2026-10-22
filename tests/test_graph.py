@@ -2207,6 +2207,163 @@ class GraphViewTestCase(unittest.TestCase):
         self.assertIsNone(self.graph.nodes[middle.id].parent_group)
         self.assertEqual(self._edge_set(), before)
 
+    def test_drag_node_into_empty_group_reuses_pending_ports(self) -> None:
+        source, middle, sink = self._chain_nodes()
+        group_id = self.add_group(pos=(800.0, 300.0))
+
+        self.drag_node_to(middle.id, self.view._nodes[group_id].sceneBoundingRect().center())
+
+        group = self.graph.nodes[group_id].group
+        self.assertEqual([port.key for port in group.inputs], ["input_1", "input_2"])
+        self.assertEqual(group.inputs[0].data_type, DataType.IMAGE)
+        self.assertTrue(group.inputs[1].pending)
+        self.assertEqual([port.key for port in group.outputs], ["output_1", "output_2"])
+        self.assertEqual(group.outputs[0].data_type, DataType.IMAGE)
+        self.assertTrue(group.outputs[1].pending)
+        # 第一个待定端口必须被使用，不能跳过它再追加新端口。
+        self.assertEqual(
+            self._edge_set(),
+            {
+                (source.id, "image", group_id, "input_1"),
+                (group_id, "input_1", middle.id, "image"),
+                (middle.id, "image", group_id, "output_1"),
+                (group_id, "output_1", sink.id, "image"),
+            },
+        )
+        item = self.view._nodes[group_id]
+        self.assertEqual(list(item.outer_input_ports), ["input_1", "input_2"])
+        self.assertFalse(item.outer_input_ports["input_1"].pending)
+        self.assertTrue(item.outer_input_ports["input_2"].pending)
+        self.assertEqual(list(item.outer_output_ports), ["output_1", "output_2"])
+        self.assertTrue(item.outer_output_ports["output_2"].pending)
+
+        # 撤销拖入后端口恢复为初始的单个待定端口；重做再次复用它们。
+        self.undo.undo()
+        group = self.graph.nodes[group_id].group
+        self.assertEqual([port.key for port in group.inputs], ["input_1"])
+        self.assertTrue(group.inputs[0].pending)
+        self.assertEqual([port.key for port in group.outputs], ["output_1"])
+        self.assertTrue(group.outputs[0].pending)
+        self.undo.redo()
+        group = self.graph.nodes[group_id].group
+        self.assertEqual([port.key for port in group.inputs], ["input_1", "input_2"])
+        self.assertEqual(group.inputs[0].data_type, DataType.IMAGE)
+        self.assertTrue(group.inputs[1].pending)
+
+    def test_drag_node_into_group_reuses_legacy_free_typed_port(self) -> None:
+        """旧版本遗留的“已定类型但已无连线”端口也应被第一条跨层连线复用。"""
+
+        source, middle, sink = self._chain_nodes()
+        group_id = self.add_group(pos=(800.0, 300.0))
+        group = self.graph.nodes[group_id].group
+        group.bind("input_1", True, DataType.IMAGE)
+        group.bind("output_1", False, DataType.IMAGE)
+        self.view._nodes[group_id].refresh_from_model()
+        self.assertEqual([port.key for port in group.inputs], ["input_1", "input_2"])
+        self.assertEqual([port.key for port in group.outputs], ["output_1", "output_2"])
+
+        self.drag_node_to(middle.id, self.view._nodes[group_id].sceneBoundingRect().center())
+
+        group = self.graph.nodes[group_id].group
+        self.assertEqual([port.key for port in group.inputs], ["input_1", "input_2"])
+        self.assertEqual(group.inputs[0].data_type, DataType.IMAGE)
+        self.assertTrue(group.inputs[1].pending)
+        self.assertEqual([port.key for port in group.outputs], ["output_1", "output_2"])
+        self.assertEqual(group.outputs[0].data_type, DataType.IMAGE)
+        self.assertTrue(group.outputs[1].pending)
+        self.assertEqual(
+            self._edge_set(),
+            {
+                (source.id, "image", group_id, "input_1"),
+                (group_id, "input_1", middle.id, "image"),
+                (middle.id, "image", group_id, "output_1"),
+                (group_id, "output_1", sink.id, "image"),
+            },
+        )
+
+    def test_drag_multi_input_node_into_group_orders_ports_by_inputs(self) -> None:
+        first = self.add_node(pos=(0.0, -500.0))
+        second = self.add_node(pos=(300.0, -500.0))
+        merge = self.add_node("test.merge", pos=(150.0, 0.0))
+        # 故意先连接输入 b、再连接输入 a：组端口仍按算子声明的 a、b 顺序分配，
+        # 这样组内连线不会交叉。
+        self.connect(second, merge, dst_port="b")
+        self.connect(first, merge, dst_port="a")
+        group_id = self.add_group(pos=(800.0, 300.0))
+
+        self.drag_node_to(merge.id, self.view._nodes[group_id].sceneBoundingRect().center())
+
+        edges = self._edge_set()
+        self.assertIn((first.id, "image", group_id, "input_1"), edges)
+        self.assertIn((group_id, "input_1", merge.id, "a"), edges)
+        self.assertIn((second.id, "image", group_id, "input_2"), edges)
+        self.assertIn((group_id, "input_2", merge.id, "b"), edges)
+        group = self.graph.nodes[group_id].group
+        self.assertEqual(
+            [port.key for port in group.inputs], ["input_1", "input_2", "input_3"]
+        )
+        self.assertTrue(group.inputs[2].pending)
+
+    def test_remove_group_input_connection_reclaims_port_and_reuses_pending(self) -> None:
+        group_id = self.add_group(pos=(800.0, 300.0))
+        source = self.add_source("源", pos=(0.0, -400.0))
+        self.view.connect_ports(source.id, "image", group_id, "input_1")
+        group = self.graph.nodes[group_id].group
+        self.assertEqual([port.key for port in group.inputs], ["input_1", "input_2"])
+        self.assertEqual(group.inputs[0].data_type, DataType.IMAGE)
+
+        connection = self.graph.input_connection(group_id, "input_1")
+        self.assertIsNotNone(connection)
+        self.undo.push(RemoveConnectionCommand(self.graph, connection))
+
+        # 连接删除后，已定类型端口也被删除；只剩一个待定端口等待下一条连线。
+        group = self.graph.nodes[group_id].group
+        self.assertEqual([port.key for port in group.inputs], ["input_1"])
+        self.assertTrue(group.inputs[0].pending)
+        item = self.view._nodes[group_id]
+        self.assertEqual(list(item.outer_input_ports), ["input_1"])
+        self.assertTrue(item.outer_input_ports["input_1"].pending)
+
+        self.undo.undo()
+        group = self.graph.nodes[group_id].group
+        self.assertEqual([port.key for port in group.inputs], ["input_1", "input_2"])
+        self.assertEqual(group.inputs[0].data_type, DataType.IMAGE)
+        self.assertIsNotNone(self.graph.input_connection(group_id, "input_1"))
+
+        self.undo.redo()
+        group = self.graph.nodes[group_id].group
+        self.assertEqual([port.key for port in group.inputs], ["input_1"])
+        self.assertTrue(group.inputs[0].pending)
+
+        # 下次连接重新落到待定端点上（而不是继续往后追加端口）。
+        self.view.connect_ports(source.id, "image", group_id, "input_1")
+        group = self.graph.nodes[group_id].group
+        self.assertEqual([port.key for port in group.inputs], ["input_1", "input_2"])
+        self.assertEqual(group.inputs[0].data_type, DataType.IMAGE)
+        self.assertTrue(group.inputs[1].pending)
+
+    def test_remove_group_output_connection_reclaims_port(self) -> None:
+        group_id = self.add_group(pos=(700.0, 300.0))
+        group_pos = self.graph.nodes[group_id].pos
+        child = self.add_child(group_id, pos=(group_pos[0] + 60.0, group_pos[1] + 110.0))
+        self.view.connect_ports(child.id, "image", group_id, "output_1")
+        group = self.graph.nodes[group_id].group
+        self.assertEqual([port.key for port in group.outputs], ["output_1", "output_2"])
+        self.assertEqual(group.outputs[0].data_type, DataType.IMAGE)
+
+        connection = self.graph.input_connection(group_id, "output_1")
+        self.assertIsNotNone(connection)
+        self.undo.push(RemoveConnectionCommand(self.graph, connection))
+        group = self.graph.nodes[group_id].group
+        self.assertEqual([port.key for port in group.outputs], ["output_1"])
+        self.assertTrue(group.outputs[0].pending)
+
+        self.undo.undo()
+        group = self.graph.nodes[group_id].group
+        self.assertEqual([port.key for port in group.outputs], ["output_1", "output_2"])
+        self.assertEqual(group.outputs[0].data_type, DataType.IMAGE)
+        self.assertIsNotNone(self.graph.input_connection(group_id, "output_1"))
+
     def test_drag_node_out_of_group_restores_direct_connections(self) -> None:
         source, middle, sink = self._chain_nodes()
         group_id = self.add_group(pos=(800.0, 300.0))

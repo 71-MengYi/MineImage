@@ -66,6 +66,7 @@ class RemoveNodeCommand(QUndoCommand):
         node = graph.nodes.get(node_id)
         self._snapshot = _copy_node(node) if node is not None else None
         self._connections: list[ConnectionModel] = []
+        self._group_state: dict[str, dict] | None = None
 
     @property
     def node_id(self) -> str:
@@ -75,6 +76,8 @@ class RemoveNodeCommand(QUndoCommand):
         node = self._graph.nodes.get(self._node_id)
         if node is None:
             return
+        # 删除连线时可能回收算子组上不再使用的端口；撤销要恢复完整端口状态。
+        self._group_state = self._graph.group_state_snapshot()
         try:
             removed = self._graph.remove_node(self._node_id)
         except GraphError:
@@ -86,6 +89,9 @@ class RemoveNodeCommand(QUndoCommand):
             return
         if self._node_id not in self._graph.nodes:
             self._graph.add_node(_copy_node(self._snapshot))
+        if self._group_state is not None:
+            self._graph.restore_group_state(self._group_state)
+            self._group_state = None
         for connection in self._connections:
             if connection.id in self._graph.connections:
                 continue
@@ -192,12 +198,17 @@ class AddConnectionCommand(QUndoCommand):
 
 
 class RemoveConnectionCommand(QUndoCommand):
-    """删除一条连线，撤销时用原 id 恢复。"""
+    """删除一条连线，撤销时用原 id 恢复。
+
+    删除算子组边界连线后，算子组会自动回收两侧都不再使用的已定类型端口；撤销
+    时必须先恢复端口快照，再用原 id 重建连线。
+    """
 
     def __init__(self, graph: GraphModel, connection: ConnectionModel, text: str = "删除连线") -> None:
         super().__init__(text)
         self._graph = graph
         self._snapshot = _copy_connection(connection)
+        self._group_state: dict[str, dict] | None = None
 
     @property
     def connection_id(self) -> str:
@@ -205,6 +216,7 @@ class RemoveConnectionCommand(QUndoCommand):
 
     def redo(self) -> None:
         if self._snapshot.id in self._graph.connections:
+            self._group_state = self._graph.group_state_snapshot()
             self._graph.remove_connection(self._snapshot.id)
 
     def undo(self) -> None:
@@ -217,6 +229,9 @@ class RemoveConnectionCommand(QUndoCommand):
         existing = self._graph.input_connection(snapshot.dst_node, snapshot.dst_port)
         if existing is not None and existing.id != snapshot.id:
             return
+        if self._group_state is not None:
+            self._graph.restore_group_state(self._group_state)
+            self._group_state = None
         try:
             self._graph.add_connection(
                 snapshot.src_node,
@@ -577,10 +592,25 @@ class ReconnectGroupMoveCommand(QUndoCommand):
         self._added = list(added or [])
         self._ports = list(ports or [])
         self._added_ids: list[str] = []
+        self._group_state: dict[str, dict] | None = None
+        self._changed_groups: set[str] = set()
 
     def redo(self) -> None:
+        # 端口会被复用 / 新增，删除旧连线时也可能回收端口；整体快照供撤销恢复。
+        self._group_state = self._graph.group_state_snapshot()
+        self._changed_groups = set()
         for group_id, is_input, key, label, data_type in self._ports:
             self._add_port(group_id, is_input, key, label, data_type)
+        for group_id, is_input in sorted(
+            {(group_id, is_input) for group_id, is_input, *_rest in self._ports}
+        ):
+            self._ensure_pending(group_id, is_input)
+        # 先把新增 / 复用的端口同步到画布，随后创建的连线才能找到端口条目。
+        for group_id in sorted(self._changed_groups):
+            node = self._graph.nodes.get(group_id)
+            if node is not None:
+                node.touch()
+                self._graph.node_changed.emit(group_id)
         for connection in self._removed:
             if connection.id in self._graph.connections:
                 self._graph.remove_connection(connection.id)
@@ -619,8 +649,12 @@ class ReconnectGroupMoveCommand(QUndoCommand):
                 self._graph.set_node_parent(node_id, old_parent)
             except GraphError:
                 continue
-        for group_id, is_input, key, _label, _data_type in reversed(self._ports):
-            self._remove_port(group_id, is_input, key)
+        if self._group_state is not None:
+            self._graph.restore_group_state(self._group_state)
+            self._group_state = None
+        else:
+            for group_id, is_input, key, _label, _data_type in reversed(self._ports):
+                self._remove_port(group_id, is_input, key)
         for connection in self._removed:
             if connection.id in self._graph.connections:
                 continue
@@ -647,10 +681,36 @@ class ReconnectGroupMoveCommand(QUndoCommand):
         group = getattr(node, "group", None) if node is not None else None
         if group is None:
             return
-        keys = group.input_keys() if is_input else group.output_keys()
-        if key in keys:
+        ports = group.ports(is_input)
+        existing = group.port(key, is_input)
+        if existing is not None:
+            # 复用空闲端口：待定端口确定类型；旧版本遗留的已定类型空闲端口则
+            # 直接改写为本次连线的类型（或恢复为待定），位置保持不变。
+            if data_type is None:
+                if existing.pending:
+                    return
+                ports[ports.index(existing)] = GroupPort(key, existing.label, None)
+            else:
+                ports[ports.index(existing)] = GroupPort(
+                    key, label or existing.label, data_type
+                )
+            self._changed_groups.add(group_id)
             return
-        group.ports(is_input).append(GroupPort(key, label, data_type))
+        ports.append(GroupPort(key, label, data_type))
+        self._changed_groups.add(group_id)
+
+    def _ensure_pending(self, group_id: str, is_input: bool) -> None:
+        """分配完端口后保证该侧仍有待定端口供下一条连线使用。"""
+
+        node = self._graph.nodes.get(group_id)
+        group = getattr(node, "group", None) if node is not None else None
+        if group is None:
+            return
+        before = len(group.ports(is_input))
+        group.ensure_pending(is_input)
+        group.relabel_auto_ports()
+        if len(group.ports(is_input)) != before:
+            self._changed_groups.add(group_id)
 
     @property
     def failed_connections(self) -> int:
@@ -702,10 +762,13 @@ class DissolveGroupCommand(QUndoCommand):
         self._direct = list(direct_connections)
         self._direct_ids = [new_id("c") for _ in self._direct]
         self._applied_ids: list[str] = []
+        self._group_state: dict[str, dict] | None = None
 
     def redo(self) -> None:
         if self._snapshot is None:
             return
+        # 删除边界连线可能回收父算子组上不再使用的端口；整体快照供撤销恢复。
+        self._group_state = self._graph.group_state_snapshot()
         # 先把直接子节点挂到组的父级，新的直连才能通过层级校验。
         for child_id, _old_parent in self._children:
             if child_id not in self._graph.nodes:
@@ -745,6 +808,9 @@ class DissolveGroupCommand(QUndoCommand):
                 self._graph.set_node_parent(child_id, old_parent)
             except GraphError:
                 continue
+        if self._group_state is not None:
+            self._graph.restore_group_state(self._group_state)
+            self._group_state = None
         for connection in self._old_connections:
             if connection.id in self._graph.connections:
                 continue

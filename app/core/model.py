@@ -15,7 +15,7 @@ from typing import Any, Callable, Iterable
 from PySide6.QtCore import QObject, Signal
 
 from app.core.constants import GROUP_OP_ID, SOURCE_OP_ID
-from app.core.group import INVALID_LEVEL, GroupModel
+from app.core.group import INVALID_LEVEL, GroupModel, GroupPort
 from app.core.types import ImageData
 
 
@@ -527,6 +527,85 @@ class GraphModel(QObject):
                 result[key] = resolved
         return result
 
+    def group_port_free(self, group_id: str, key: str, is_input: bool) -> bool:
+        """算子组边界端口是否已经完全空闲（内外两侧都没有连线）。
+
+        只有空闲端口才允许被自动连线复用或回收；只要任一侧仍有连线，端口就
+        继续保留，避免删除一条线时错误地拆掉另一侧的连接。
+        """
+
+        node = self.nodes.get(group_id)
+        group = node.group if node is not None and node.is_group else None
+        if group is None:
+            return False
+        keys = group.input_keys() if is_input else group.output_keys()
+        if key not in keys:
+            return False
+        for connection in self.connections.values():
+            if connection.src_node == group_id and connection.src_port == key:
+                return False
+            if connection.dst_node == group_id and connection.dst_port == key:
+                return False
+        return True
+
+    def _group_boundary_ports(
+        self, connection: ConnectionModel
+    ) -> list[tuple[str, str, bool]]:
+        """返回连线两端属于算子组边界端口的 ``(组 id, key, 是否输入)``。"""
+
+        result: list[tuple[str, str, bool]] = []
+        for node_id, key in (
+            (connection.src_node, connection.src_port),
+            (connection.dst_node, connection.dst_port),
+        ):
+            node = self.nodes.get(node_id)
+            group = node.group if node is not None and node.is_group else None
+            if group is None:
+                continue
+            if key in group.input_keys():
+                result.append((node_id, key, True))
+            elif key in group.output_keys():
+                result.append((node_id, key, False))
+        return result
+
+    def _reclaim_group_port(self, group_id: str, key: str, is_input: bool) -> bool:
+        """连线删除后回收已经不再使用的已定类型端口。
+
+        待定端口是"下一条连线"的入口，不参与回收；已定类型端口一旦两侧都没有
+        连线，就从算子组上删除，并让待定端口顶替它的 key，保证「下一条连线仍
+        落在待定端点上」且端口编号不会随连接增删不断增长。
+        """
+
+        node = self.nodes.get(group_id)
+        group = node.group if node is not None and node.is_group else None
+        if group is None:
+            return False
+        port = group.port(key, is_input)
+        if port is None or port.pending:
+            return False
+        if not self.group_port_free(group_id, key, is_input):
+            return False
+        group.remove_port(key, is_input)
+        free_pending = next(
+            (
+                item
+                for item in group.ports(is_input)
+                if item.pending and self.group_port_free(group_id, item.key, is_input)
+            ),
+            None,
+        )
+        if free_pending is not None:
+            # 空闲待定端口顶替被回收的 key，下一条连线自然会接在这里。
+            free_pending.key = key
+        else:
+            group.ports(is_input).append(
+                GroupPort(key, f"{'输入' if is_input else '输出'} {len(group.ports(is_input)) + 1}", None)
+            )
+        group.ensure_pending(is_input)
+        group.relabel_auto_ports()
+        node.touch()
+        return True
+
     def group_state_snapshot(self) -> dict[str, dict[str, Any]]:
         """所有算子组的端口快照，供连线命令撤销时恢复自动增长的端口。"""
 
@@ -550,8 +629,15 @@ class GraphModel(QObject):
             connection = self.connections.pop(connection_id)
         except KeyError as exc:
             raise GraphError(f"连线不存在：{connection_id}") from exc
+        reclaimed = [
+            group_id
+            for group_id, key, is_input in self._group_boundary_ports(connection)
+            if self._reclaim_group_port(group_id, key, is_input)
+        ]
         self.connection_removed.emit(connection)
         self.structure_changed.emit()
+        for group_id in dict.fromkeys(reclaimed):
+            self.node_changed.emit(group_id)
         return connection
 
     def remove_connections_to(self, node_id: str, port: str) -> list[ConnectionModel]:

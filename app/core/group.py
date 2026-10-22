@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,6 +40,10 @@ def _port_key(index: int, is_input: bool) -> str:
 
 def _port_label(index: int, is_input: bool) -> str:
     return f"{'输入' if is_input else '输出'} {index}"
+
+
+#: 自动生成的端口显示名（“输入 1”/“输出 2”），结构变化后会按位置重新编号。
+_AUTO_PORT_LABEL = re.compile(r"^(输入|输出)\s*\d+$")
 
 
 def _jsonable(value: Any) -> Any:
@@ -214,11 +219,36 @@ class GroupModel:
         index = self.next_index(is_input)
         port = GroupPort(_port_key(index, is_input), _port_label(index, is_input))
         self.ports(is_input).append(port)
+        self.relabel_auto_ports()
         return port
 
     def ensure_pending_ports(self) -> None:
         self.ensure_pending(True)
         self.ensure_pending(False)
+
+    def remove_port(self, key: str, is_input: bool) -> GroupPort | None:
+        """删除指定端口；不存在时返回 ``None``。"""
+
+        ports = self.ports(is_input)
+        for index, port in enumerate(ports):
+            if port.key == key:
+                return ports.pop(index)
+        return None
+
+    def relabel_auto_ports(self) -> None:
+        """按端口在列表中的位置重新编号自动生成的显示名。
+
+        动态回收端口后 key 可能出现空洞（例如保留 ``input_3``），但用户可见的
+        「输入 N」应始终是连续且与端口顺序一致的；手写的自定义标签保持不变。
+        """
+
+        for is_input, ports in ((True, self.inputs), (False, self.outputs)):
+            for index, port in enumerate(ports):
+                if not _AUTO_PORT_LABEL.match(port.label or ""):
+                    continue
+                label = _port_label(index + 1, is_input)
+                if port.label != label:
+                    port.label = label
 
     def bind(self, key: str, is_input: bool, data_type: DataType | str | None) -> bool:
         """把待定端口绑定为具体类型；绑定成功时自动追加新的待定端口。
@@ -237,6 +267,7 @@ class GroupModel:
             return False
         port.data_type = dtype
         self.ensure_pending(is_input)
+        self.relabel_auto_ports()
         return True
 
     def bind_from_spec(self, key: str, is_input: bool, spec: PortSpec | None) -> bool:

@@ -231,6 +231,45 @@ class GroupGraphTests(unittest.TestCase):
         self.assertTrue(group.group.outputs[1].pending)
         self.assertIn(group.id, snapshot)
 
+    def test_remove_connection_reclaims_only_fully_free_group_port(self) -> None:
+        self.graph.set_port_type_resolver(lambda _n, _p, _i: DataType.IMAGE)
+        group = self.graph.create_group_node("算子组", (0, 0))
+        inner = _node(self.graph, "fake.inner", "内部", parent=group.id)
+        source = _node(self.graph, "fake.source", "源")
+        outer = self.graph.add_connection(source.id, "image", group.id, "input_1")
+        inner_edge = self.graph.add_connection(group.id, "input_1", inner.id, "image")
+        self.assertEqual([port.key for port in group.group.inputs], ["input_1", "input_2"])
+
+        # 只断开外侧：内侧仍在使用，端口继续保留（且不会误删另一侧连线）。
+        self.graph.remove_connection(outer.id)
+        self.assertEqual([port.key for port in group.group.inputs], ["input_1", "input_2"])
+        self.assertFalse(group.group.inputs[0].pending)
+        self.assertIsNotNone(self.graph.outgoing(group.id))
+
+        # 再断开内侧：两侧都空闲，端口回收，空闲待定端口顶替同一 key。
+        self.graph.remove_connection(inner_edge.id)
+        self.assertEqual([port.key for port in group.group.inputs], ["input_1"])
+        self.assertTrue(group.group.inputs[0].pending)
+        self.assertEqual(group.group.inputs[0].label, "输入 1")
+
+    def test_remove_connection_reclaims_group_output_port(self) -> None:
+        self.graph.set_port_type_resolver(lambda _n, _p, _i: DataType.IMAGE)
+        group = self.graph.create_group_node("算子组", (0, 0))
+        inner = _node(self.graph, "fake.inner", "内部", parent=group.id)
+        sink = _node(self.graph, "fake.sink", "下游")
+        outer = self.graph.add_connection(group.id, "output_1", sink.id, "image")
+        inner_edge = self.graph.add_connection(inner.id, "image", group.id, "output_1")
+        self.assertEqual([port.key for port in group.group.outputs], ["output_1", "output_2"])
+
+        # 只有外侧连线时先断开：端口仍被内侧占用，保留。
+        self.graph.remove_connection(inner_edge.id)
+        self.assertEqual([port.key for port in group.group.outputs], ["output_1", "output_2"])
+        self.assertFalse(group.group.outputs[0].pending)
+        # 内外两侧都断开后回收为待定端口。
+        self.graph.remove_connection(outer.id)
+        self.assertEqual([port.key for port in group.group.outputs], ["output_1"])
+        self.assertTrue(group.group.outputs[0].pending)
+
     def test_node_serialization_preserves_group(self) -> None:
         group = self.graph.create_group_node("算子组", (10, 20))
         inner = _node(self.graph, "fake.inner", "内部", parent=group.id)

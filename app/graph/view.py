@@ -1192,8 +1192,30 @@ class GraphView(QGraphicsView):
                     (connection.src_node, connection.src_port, connection.dst_node, connection.dst_port)
                 )
 
-        plan: dict[str, list] = {"removed": [], "added": [], "ports": []}
-        for edge in edges:
+        plan: dict[str, list] = {"removed": [], "added": [], "ports": [], "used_ports": set()}
+        # 端口分配顺序跟随节点自身的输入 / 输出顺序，避免多输入节点的跨层连线
+        # 因为连接创建顺序不同而交叉；同一节点内按端口声明顺序处理。
+        node_order = {node_id: index for index, node_id in enumerate(self.graph.nodes)}
+
+        def edge_order(edge: tuple[str, str, str, str]) -> tuple[int, int, int]:
+            src_node, src_port, dst_node, dst_port = edge
+            dst_moved = dst_node in parent_map
+            src_moved = src_node in parent_map
+            if dst_moved and not src_moved:
+                return (
+                    0,
+                    node_order.get(dst_node, 0),
+                    self._port_declaration_index(dst_node, dst_port, True),
+                )
+            if src_moved and not dst_moved:
+                return (
+                    1,
+                    node_order.get(src_node, 0),
+                    self._port_declaration_index(src_node, src_port, False),
+                )
+            return (2, node_order.get(src_node, 0), 0)
+
+        for edge in sorted(edges, key=edge_order):
             if not self._route_logical_edge(edge, parent_map, plan):
                 return None
         for connection in removed.values():
@@ -1317,15 +1339,56 @@ class GraphView(QGraphicsView):
         plan["added"].append((current_node, current_port, dst_node, dst_port))
         return True
 
+    def _port_declaration_index(self, node_id: str, key: str, is_input: bool) -> int:
+        """端口在节点声明中的序号（用于按节点输入 / 输出顺序分配组端口）。"""
+
+        node = self.graph.nodes.get(node_id)
+        if node is None:
+            return 999
+        group = getattr(node, "group", None)
+        if group is not None:
+            ports = group.inputs if is_input else group.outputs
+        elif node.is_source:
+            return 0
+        else:
+            try:
+                spec = self._registry.spec(node.op_id)
+            except Exception:  # noqa: BLE001 - 未注册算子按末尾处理
+                spec = None
+            if spec is None:
+                return 999
+            ports = spec.inputs if is_input else spec.outputs
+        for index, port in enumerate(ports):
+            if port.key == key:
+                return index
+        return 999
+
     def _plan_group_port(
         self, plan: dict[str, list], group_id: str, is_input: bool, data_type
     ) -> str | None:
-        """在计划里给算子组分配一个新端口 key（不直接修改图模型）。"""
+        """在计划里给算子组分配一个端口 key（不直接修改图模型）。
+
+        优先复用第一个两侧都没有连线的空闲端口：空算子组拖入节点时，第一条跨层
+        连线应使用已有的「输入 1」并把它确定类型，而不是跳过它往后追加新点；
+        旧版本遗留的已定类型空闲端口也会被直接复用。没有空闲端口时才创建新端口。
+        """
 
         node = self.graph.nodes.get(group_id)
         group = node.group if node is not None and node.is_group else None
         if group is None:
             return None
+        used = plan.setdefault("used_ports", set())
+        for port in group.ports(is_input):
+            token = (group_id, is_input, port.key)
+            if token in used:
+                continue
+            if not self.graph.group_port_free(group_id, port.key, is_input):
+                continue
+            # 已定类型但两侧都没有连线的端口也视为空闲（旧版本删除连线时不会
+            # 回收端口，这里直接复用第一个空闲点，避免首个端口悬空导致连线交叉）。
+            used.add(token)
+            plan["ports"].append((group_id, is_input, port.key, port.label, data_type))
+            return port.key
         keys = set(group.input_keys() if is_input else group.output_keys())
         keys.update(
             key
