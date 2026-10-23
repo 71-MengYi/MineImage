@@ -26,7 +26,7 @@ from typing import Any, ClassVar, Iterable, Mapping, Sequence
 import cv2
 import numpy as np
 
-from app.core.types import ImageData
+from app.core.types import ImageData, ImageList, first_image, image_values  # noqa: F401 - 兼容旧导入
 
 
 class DataType(str, Enum):
@@ -424,9 +424,15 @@ def _component_statistics(labels: np.ndarray) -> tuple[tuple[int, ...], tuple[tu
 # 通用工具
 # ---------------------------------------------------------------------------
 def data_type_of(value: Any) -> DataType | None:
-    """返回数据值对应的 :class:`DataType`；未知类型返回 ``None``。"""
+    """返回数据值对应的 :class:`DataType`；未知类型返回 None。
+
+    批量结果以同构的 list / tuple 表示（例如图像矩阵逐张计算后的数值端口），
+    这里在元素类型一致时沿用元素的数据类型，使下游端口仍能识别并继续逐张执行。
+    """
 
     if isinstance(value, ImageData):
+        return DataType.IMAGE
+    if isinstance(value, ImageList):
         return DataType.IMAGE
     if isinstance(value, NumberValue):
         return DataType.NUMBER
@@ -436,6 +442,12 @@ def data_type_of(value: Any) -> DataType | None:
         return DataType.CONTOURS
     if isinstance(value, ComponentsData):
         return DataType.COMPONENTS
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        kinds = {data_type_of(item) for item in value}
+        if len(kinds) == 1:
+            return kinds.pop()
     return None
 
 
@@ -448,6 +460,13 @@ def summarize_value(value: Any) -> str:
 
     if isinstance(value, ImageData):
         return value.summary()
+    if isinstance(value, ImageList):
+        return value.summary()
+    if isinstance(value, (list, tuple)):
+        kind = data_type_of(value)
+        if kind is not None:
+            return f"{kind.label} ×{len(value)}"
+        return f"{len(value)} 项"
     summary = getattr(value, "summary", None)
     if callable(summary):
         return str(summary())
@@ -458,10 +477,13 @@ def render_preview(value: Any) -> ImageData | None:
     """把结构化数据渲染成图像，供算子显式生成可视化输出。
 
     引擎的主预览与节点缩略图不再自动调用本函数；数值等不可渲染的数据返回 None。
+    图像矩阵取首张图作为兼容预览。
     """
 
     if isinstance(value, ImageData):
         return value
+    if isinstance(value, ImageList):
+        return first_image(value)
     renderer = getattr(value, "render_preview", None)
     if callable(renderer):
         return renderer()

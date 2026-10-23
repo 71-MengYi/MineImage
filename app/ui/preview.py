@@ -59,7 +59,6 @@ from app.core.types import (
     to_display_rgb,
     to_scaled_rgb,
 )
-from app.ui.display_modes import display_mode_title
 
 _MODES = ("single", "side_by_side", "swipe")
 _MODE_ALIASES = {
@@ -470,6 +469,15 @@ class PreviewWidget(QWidget):
     def zoom_percent(self) -> float:
         return round(self._zoom * 100.0, 2)
 
+    def info_text(self) -> str:
+        """信息标签的详情文本（节点标题之外的补充信息）。
+
+        预览右下角的信息标签已移到状态栏：标题占「节点」字段，尺寸 / 缩放 /
+        耗时由状态栏的独立字段展示，这里只保留不重复的补充信息（色彩空间、
+        数据类型、多输出汇总等）。
+        """
+        return self._info
+
     def image_size(self) -> tuple[int, int] | None:
         image = self._image or self._original
         if image is None:
@@ -512,7 +520,6 @@ class PreviewWidget(QWidget):
             self._paint_swipe(painter)
         else:
             self._paint_single(painter)
-        self._paint_info_caption(painter)
         if self._display_mode == "mesh":
             self._paint_mesh_hint(painter)
         self._paint_pick_overlay(painter)
@@ -1244,38 +1251,6 @@ class PreviewWidget(QWidget):
             lines,
             12.0,
             self.height() - 12.0,
-            align_bottom=True,
-        )
-
-    def _paint_info_caption(self, painter: QPainter) -> None:
-        lines: list[str] = []
-        title = self._node_title or (
-            "原始图像" if self._image is None and self._original is not None else ""
-        )
-        if title:
-            lines.append(title)
-        if self._info:
-            lines.append(self._info)
-        image = self._image or self._original
-        if image is not None:
-            zoom_text = f"{self.zoom_percent():.0f}%"
-            mode_text = display_mode_title(self._display_mode)
-            suffix = f" · {mode_text}" if self._display_mode != "imshow" else ""
-            if len(lines) < 2:
-                lines.append(f"{image.width}×{image.height} · {zoom_text}{suffix}")
-            else:
-                lines.append(f"{zoom_text} · {image.width}×{image.height}{suffix}")
-        if not lines:
-            return
-        max_width = max(120.0, self.width() - 24.0)
-        rect = self._chip_rect(painter, lines, max_width=max_width)
-        self._paint_chip(
-            painter,
-            rect,
-            lines,
-            self.width() - 12.0,
-            self.height() - 12.0,
-            align_right=True,
             align_bottom=True,
         )
 

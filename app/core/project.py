@@ -172,7 +172,11 @@ def load_project(path: str | Path) -> WorkspaceModel:
         missing = [
             node.id
             for node in graph.nodes.values()
-            if node.is_source and (not node.source_image_id or node.source_image_id not in workspace.images)
+            if node.is_source
+            and (
+                not node.source_ids
+                or any(image_id not in workspace.images for image_id in node.source_ids)
+            )
         ]
         if missing:
             raise ProjectFormatError(f"流程节点引用了缺失的图像：{', '.join(missing)}")

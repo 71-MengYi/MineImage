@@ -118,6 +118,111 @@ class ImageData:
 
 
 @dataclass(frozen=True)
+class ImageList:
+    """图像矩阵：一组有序的单张图像，用于多图输入 / 批量算子输出。
+
+    数据流约定：图像矩阵仍然使用 DataType.IMAGE 端口类型，单张图像与图像矩阵
+    可以连接到同一个输入端口；引擎会在执行算子时逐张展开，再把各张结果重新
+    打包成 ImageList。图像尺寸与通道数不必相同，例如一次打开多张不同分辨率的
+    图片。
+    """
+
+    images: tuple[ImageData, ...] = ()
+    name: str = "图像矩阵"
+
+    def __post_init__(self) -> None:
+        raw = self.images
+        if raw is None:
+            raw = ()
+        elif isinstance(raw, ImageData):
+            raw = (raw,)
+        normalized: list[ImageData] = []
+        for item in raw:
+            if isinstance(item, ImageData):
+                normalized.append(item)
+            elif isinstance(item, np.ndarray):
+                normalized.append(ImageData(item))
+            else:
+                raise ValueError(f"图像矩阵中的元素必须是 ImageData，收到 {type(item).__name__}")
+        object.__setattr__(self, "images", tuple(normalized))
+        object.__setattr__(self, "name", str(self.name or "图像矩阵"))
+
+    # ------------------------------------------------------------------ 属性
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __iter__(self):
+        return iter(self.images)
+
+    def __getitem__(self, index: int) -> ImageData:
+        return self.images[index]
+
+    @property
+    def count(self) -> int:
+        return len(self.images)
+
+    @property
+    def first(self) -> ImageData | None:
+        return self.images[0] if self.images else None
+
+    @property
+    def width(self) -> int:
+        return self.first.width if self.first is not None else 0
+
+    @property
+    def height(self) -> int:
+        return self.first.height if self.first is not None else 0
+
+    @property
+    def color_space(self) -> str:
+        values = {image.color_space for image in self.images}
+        if not values:
+            return ""
+        return next(iter(values)) if len(values) == 1 else "混合"
+
+    @property
+    def dtype_name(self) -> str:
+        values = {image.dtype_name for image in self.images}
+        if not values:
+            return ""
+        return next(iter(values)) if len(values) == 1 else "混合"
+
+    def image_at(self, index: int) -> ImageData | None:
+        """按索引取单张图像；越界时返回 None，负数按 Python 规则处理。"""
+
+        if not self.images:
+            return None
+        try:
+            return self.images[int(index)]
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    def summary(self) -> str:
+        first = self.first
+        if first is None:
+            return "图像矩阵：0 张"
+        return f"图像矩阵：{self.count} 张 · 首张 {first.width}×{first.height} · {self.color_space} · {self.dtype_name}"
+
+    def copy(self) -> "ImageList":
+        return ImageList(tuple(image.copy() for image in self.images), self.name)
+
+
+def image_values(value: Any) -> tuple[ImageData, ...]:
+    """把图像 / 图像矩阵统一展开成单张图像元组；其它类型返回空元组。"""
+
+    if isinstance(value, ImageData):
+        return (value,)
+    if isinstance(value, ImageList):
+        return value.images
+    return ()
+
+
+def first_image(value: Any) -> ImageData | None:
+    values = image_values(value)
+    return values[0] if values else None
+
+
+@dataclass(frozen=True)
 class PixelSample:
     """状态栏使用的像素采样结果；数值为原始 dtype。"""
 

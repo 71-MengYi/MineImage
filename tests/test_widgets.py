@@ -224,6 +224,13 @@ class PreviewWidgetTests(unittest.TestCase):
         self.assertLessEqual(bottom_right.x(), self.widget.width())
         self.assertLessEqual(bottom_right.y(), self.widget.height())
 
+    def test_info_text_for_status_bar(self) -> None:
+        """预览右下角信息标签的详情现在由状态栏「节点」字段展示。"""
+        self.widget.set_image(self.image, "高斯模糊", "BGR · uint8")
+        self.assertEqual(self.widget.info_text(), "BGR · uint8")
+        self.widget.set_image(None, "高斯模糊", "正在计算…")
+        self.assertEqual(self.widget.info_text(), "正在计算…")
+
     def test_view_to_image_roundtrip(self) -> None:
         self.widget.fit_to_window()
         view = self.widget.image_to_view(100.5, 50.5)

@@ -619,16 +619,27 @@ class MainWindow(QMainWindow):
             self.open_image_path(path)
 
     def open_image(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "打开图像 / 矩阵", "", SOURCE_FILTER)
-        if not path:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "打开图像 / 矩阵（可多选，多张图像会组成图像矩阵）",
+            "",
+            SOURCE_FILTER,
+        )
+        if not paths:
             return
-        self.open_image_path(path)
+        self.open_image_paths(paths)
 
     def open_image_path(self, path: str | Path) -> None:
-        workspace = WorkspaceModel(Path(path).stem)
+        self.open_image_paths([path])
+
+    def open_image_paths(self, paths: list[str | Path]) -> None:
+        path_list = [Path(path) for path in paths if str(path)]
+        if not path_list:
+            return
+        workspace = WorkspaceModel(path_list[0].stem)
         widget = self._add_workspace(workspace)
         self.tabs.setCurrentWidget(widget)
-        if not widget.add_image(str(path)):
+        if not widget.add_image_matrix(path_list):
             index = self.tabs.indexOf(widget)
             if index >= 0:
                 self.tabs.removeTab(index)
@@ -638,21 +649,30 @@ class MainWindow(QMainWindow):
             widget.deleteLater()
             self._update_central()
             return
-        kind = "矩阵" if is_matrix_file(path) else "图像"
-        self.settings.add_recent_file(str(path))
-        self.status_message_label.setText(f"已打开{kind}：{Path(path).name}")
+        for path in path_list:
+            self.settings.add_recent_file(str(path))
+        if len(path_list) == 1:
+            kind = "矩阵" if is_matrix_file(path_list[0]) else "图像"
+            self.status_message_label.setText(f"已打开{kind}：{path_list[0].name}")
+        else:
+            self.status_message_label.setText(
+                f"已打开 {len(path_list)} 个文件：{path_list[0].name} 等"
+            )
         self._update_window_title()
 
     def add_image(self) -> None:
         widget = self._active_workspace()
         if widget is None:
             widget = self.new_workspace()
-        path, _ = QFileDialog.getOpenFileName(self, "添加图像 / 矩阵到当前流程", "", SOURCE_FILTER)
-        if not path:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "添加图像 / 矩阵到当前流程（可多选）", "", SOURCE_FILTER
+        )
+        if not paths:
             return
-        if widget.add_image(path):
-            self.settings.add_recent_file(path)
-            self._update_window_title()
+        for path in paths:
+            if widget.add_image(path):
+                self.settings.add_recent_file(path)
+        self._update_window_title()
 
     def open_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "打开 MineImage 工程", "", PROJECT_FILTER)

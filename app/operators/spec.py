@@ -39,7 +39,7 @@ from app.core.data_types import (
     coerce_number,
     data_type_of,
 )
-from app.core.types import ImageData
+from app.core.types import ImageData, ImageList, image_values
 
 #: 自定义控件 / 布局的注册名允许的字符（与 :mod:`app.ui.param_widgets` 保持一致）。
 PARAM_UI_NAME_PATTERN = r"^[A-Za-z_][A-Za-z0-9_.-]*$"
@@ -130,8 +130,9 @@ class PortSpec:
             return data_type_of(value) is not None
         if data_type_of(value) is not self.data_type:
             return False
-        if isinstance(value, ImageData) and self.data_type is DataType.IMAGE:
-            return self.accepts_image(value)
+        if self.data_type is DataType.IMAGE:
+            images = image_values(value)
+            return bool(images) and all(self.accepts_image(image) for image in images)
         return True
 
 
@@ -589,10 +590,16 @@ def validate_inputs(spec: OperatorSpec, inputs: Mapping[str, Any | None]) -> Non
             raise OperatorError(
                 f"输入“{port.label}”需要{port.data_type.label}数据，当前为{actual_text}。"
             )
-        if isinstance(value, ImageData) and not port.accepts_image(value):
-            raise OperatorError(
-                f"输入“{port.label}”需要 {port.accept_text()} 图像，当前为 {value.color_space}。"
-            )
+        if port.data_type is DataType.IMAGE:
+            images = image_values(value)
+            if not images:
+                raise OperatorError(f"输入“{port.label}”的图像矩阵为空。")
+            for image in images:
+                if not port.accepts_image(image):
+                    raise OperatorError(
+                        f"输入“{port.label}”需要 {port.accept_text()} 图像，"
+                        f"当前包含 {image.color_space}。"
+                    )
     if missing:
         raise OperatorError(f"缺少输入：{'、'.join(missing)}")
 
@@ -612,8 +619,14 @@ def coerce_output_value(port: PortSpec, value: Any) -> Any:
         return value
     try:
         if port.data_type is DataType.IMAGE:
-            if isinstance(value, ImageData):
+            if isinstance(value, (ImageData, ImageList)):
                 return value
+            if (
+                isinstance(value, (list, tuple))
+                and value
+                and all(isinstance(item, ImageData) for item in value)
+            ):
+                return ImageList(tuple(value))
             return ImageData(value)
         if port.data_type is DataType.NUMBER:
             return coerce_number(value, key_label)

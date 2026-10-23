@@ -157,8 +157,18 @@ class GraphScene(QGraphicsScene):
             self._view.begin_move_tracking()
             top_item = self._view.item_at_scene(event.scenePos())
             # 点击节点时启动延迟选中信号；点击端口 / 空白处不触发。
-            if top_item is not None and hasattr(top_item, "node_id") and not isinstance(top_item, PortItem):
-                self._view.schedule_selection_signal()
+            if (
+                top_item is not None
+                and hasattr(top_item, "node_id")
+                and not isinstance(top_item, PortItem)
+            ):
+                local_pos = top_item.mapFromScene(event.scenePos())
+                index_at = getattr(top_item, "image_index_at", None)
+                if callable(index_at) and index_at(local_pos) is not None:
+                    # 点击矩阵缩略图：只切换选中的图，不按“节点被选中”处理。
+                    self._view.cancel_selection_timer()
+                else:
+                    self._view.schedule_selection_signal()
 
     def mouseMoveEvent(self, event: QGraphicsSceneMouseEvent) -> None:  # noqa: N802 - Qt 接口
         if self._drag_source is not None:

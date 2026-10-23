@@ -18,6 +18,9 @@
 * 每次对外计算请求开始前检查用户算子文件（mtime_ns + size）是否变化；变化时
   同步发出 operator_reload_requested，由主窗口重建注册表，原请求继续使用新
   注册表执行，因此保存算子文件后无需手动刷新算子库；
+* 图像矩阵（ImageList）输入：算子节点对每张图像独立执行，图像输出端口重新
+  聚合为 ImageList、其它输出端口聚合为逐张结果列表；长度为 1 的输入自动
+  广播，各批量输入数量不一致时整个节点失败；
 * 算子组节点（Group Node）在快照阶段用 GraphModel.resolve_source 把组边界上的
   连线解析成真实普通节点端口；组的每个输出端口作为一条 "@out:<port>" 伪输入参与
   依赖 / 拓扑排序，组内节点仍作为独立节点执行并回传 node_finished；
@@ -55,14 +58,16 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 from app.config import AppSettings
 from app.core.constants import GROUP_OP_ID
-from app.core.data_types import data_type_of, summarize_outputs
+from app.core.data_types import DataType, data_type_of, summarize_outputs
 from app.core.group import GroupModel
 from app.core.model import WorkspaceModel
-from app.core.types import ImageData
+from app.core.types import ImageData, ImageList, image_values
 from app.operators.loader import OperatorRegistry
 from app.operators.spec import (
     OperatorError,
+    OperatorSpec,
     ParamValidationError,
+    PortSpec,
     coerce_output_value,
     normalize_params,
     output_to_dict,
@@ -90,18 +95,60 @@ class NodeResult:
     preview: bool = True
     port_labels: dict[str, str] = field(default_factory=dict)
 
-    @property
-    def primary(self) -> ImageData | None:
-        """第一个图像输出；纯数值 / 结构化数据的节点返回 None。"""
+    def _first_image_output(self) -> ImageData | ImageList | None:
+        """第一个图像输出（单张图像或图像矩阵）；没有图像输出时返回 None。"""
 
         for value in self.outputs.values():
-            if isinstance(value, ImageData):
+            if isinstance(value, (ImageData, ImageList)):
                 return value
         return None
 
     @property
+    def primary_images(self) -> tuple[ImageData, ...]:
+        """第一个图像输出展开后的全部图像；没有图像输出时返回空元组。
+
+        单张图像输出返回 ``(image,)``，图像矩阵按顺序返回全部图像，便于界面
+        统一遍历 / 索引，不需要区分端口里是 ImageData 还是 ImageList。
+        """
+
+        value = self._first_image_output()
+        if isinstance(value, ImageList):
+            return value.images
+        if isinstance(value, ImageData):
+            return (value,)
+        return ()
+
+    @property
+    def has_image_matrix(self) -> bool:
+        """第一个图像输出是否为多张图像矩阵。"""
+
+        value = self._first_image_output()
+        return isinstance(value, ImageList) and value.count > 1
+
+    @property
+    def image_count(self) -> int:
+        """第一个图像输出中的图像数量（无图像输出为 0）。"""
+
+        return len(self.primary_images)
+
+    def image_at(self, index: int) -> ImageData | None:
+        """按序号取第一个图像输出中的单张图像；越界返回 None。"""
+
+        try:
+            return self.primary_images[int(index)]
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    @property
+    def primary(self) -> ImageData | None:
+        """第一个图像输出的第一张图像；纯数值 / 结构化数据的节点返回 None。"""
+
+        images = self.primary_images
+        return images[0] if images else None
+
+    @property
     def preview_image(self) -> ImageData | None:
-        """用于主预览 / 缩略图的图像：只取图像输出，结构化数据不再渲染。"""
+        """用于主预览 / 缩略图的图像：图像矩阵取首张，结构化数据不再渲染。"""
 
         return self.primary
 
@@ -150,6 +197,8 @@ class _NodeSnap:
     revision: int
     parent_group: str | None = None
     group: GroupModel | None = None
+    #: 源节点引用的全部图像 id（按显示顺序）；普通算子节点为空。
+    source_image_ids: list[str] = field(default_factory=list)
 
     @property
     def is_group(self) -> bool:
@@ -617,6 +666,7 @@ class ExecutionEngine(QObject):
                 title=node.title,
                 params=copy.deepcopy(node.params),
                 source_image_id=node.source_image_id,
+                source_image_ids=list(node.source_ids),
                 revision=node.revision,
                 parent_group=node.parent_group,
                 group=node.group.copy() if node.group is not None else None,
@@ -984,17 +1034,35 @@ class _EvalState:
         return self._cached(src_node)
 
     def _compute_source(self, snap: _NodeSnap) -> NodeResult | None:
+        """源节点：按声明顺序返回单张图像或图像矩阵。
+
+        多图源节点把 ``source_image_ids`` 中的全部图像按顺序包装成 ImageList；
+        只有 1 张时仍输出 ImageData，保证既有单图流程与缓存语义不变。
+        """
+
         self.engine._started.emit(self.generation, snap.id)
         started = time.perf_counter()
-        image = self.snapshot.images.get(snap.source_image_id or "")
-        if image is None:
+        image_ids = list(snap.source_image_ids)
+        if not image_ids and snap.source_image_id:
+            image_ids = [snap.source_image_id]
+        if not image_ids:
             self.record_failure(snap.id, "源图像数据缺失，请重新载入图像")
             return None
-        wrapped = ImageData(image.array, snap.title or image.name, image.color_space)
+        images: list[ImageData] = []
+        for image_id in image_ids:
+            image = self.snapshot.images.get(image_id)
+            if image is None:
+                self.record_failure(snap.id, "源图像数据缺失，请重新载入图像")
+                return None
+            images.append(ImageData(image.array, image.name or snap.title, image.color_space))
+        if len(images) == 1:
+            value: Any = images[0]
+        else:
+            value = ImageList(tuple(images), snap.title or "图像矩阵")
         elapsed = (time.perf_counter() - started) * 1000.0
         result = NodeResult(
             snap.id,
-            {"image": wrapped},
+            {"image": value},
             elapsed,
             snap.revision,
             port_labels={"image": "图像"},
@@ -1124,17 +1192,19 @@ class _EvalState:
         self.engine._started.emit(self.generation, snap.id)
         try:
             params = normalize_params(spec, snap.params)
-            validate_inputs(spec, inputs)
-            entry.operator.validate(inputs, params)
-            call_kwargs: dict[str, Any] = dict(inputs)
-            call_kwargs.update(params)
-            output = entry.operator.process(**call_kwargs)
-            outputs = output_to_dict(spec, output)
-            if not outputs and not spec.allow_empty_output:
-                raise OperatorError("算子没有产生任何输出")
-            for key, value in outputs.items():
-                if isinstance(value, ImageData) and value.name in ("", "image"):
-                    value.name = f"{snap.title}:{key}"
+            plan = self._batch_plan(spec, inputs)
+            if plan is None:
+                outputs = self._process_single(snap, spec, entry, inputs, params)
+            else:
+                outputs = self._process_batch(
+                    snap,
+                    spec,
+                    entry,
+                    inputs,
+                    params,
+                    plan[0],
+                    plan[1],
+                )
         except ParamValidationError as exc:
             self.record_failure(snap.id, f"参数错误：{exc.message}", traceback.format_exc())
             return None
@@ -1154,6 +1224,179 @@ class _EvalState:
         self._store_result(result)
         self.engine._computed.emit(self.generation, result)
         return result
+
+    # ------------------------------------------------------------ 批量执行
+    @staticmethod
+    def _batch_items(value: Any) -> list[Any] | None:
+        """把批量输入展开成逐项列表；普通单值输入返回 None。
+
+        批量输入有两种形式：图像矩阵 ImageList，以及同构的已知数据列表 / 元组
+        （例如数值批量结果 [NumberValue, ...]）。空列表不算批量，留给
+        validate_inputs 按端口类型报错。
+        """
+
+        if isinstance(value, ImageList):
+            return list(value.images)
+        if isinstance(value, (list, tuple)):
+            if value and data_type_of(value) is not None:
+                return list(value)
+        return None
+
+    def _batch_plan(
+        self,
+        spec: OperatorSpec,
+        inputs: dict[str, Any | None],
+    ) -> tuple[dict[str, list[Any]], int] | None:
+        """识别批量输入并校验长度。
+
+        * 只有 1 项的批量输入按单张解包（未进入批量循环时返回 None）；
+        * 其余批量输入的逐项数量必须为 1（广播）或 N（最大数量），否则报错。
+        """
+
+        batches: dict[str, list[Any]] = {}
+        for port in spec.inputs:
+            items = self._batch_items(inputs.get(port.key))
+            if items is not None:
+                batches[port.key] = items
+        if not batches:
+            return None
+        labels = {port.key: port.label for port in spec.inputs}
+        for key, items in batches.items():
+            if not items:
+                raise OperatorError(f"输入“{labels[key]}”的图像矩阵为空，无法逐张执行。")
+        length = max(len(items) for items in batches.values())
+        if length == 1:
+            # 仅 1 张的 ImageList / 批量列表按单张解包，保持既有单图路径与耗时。
+            for key, items in batches.items():
+                inputs[key] = items[0]
+            return None
+        mismatched = [
+            f"{labels[key]}：{len(items)} 张"
+            for key, items in batches.items()
+            if len(items) not in (1, length)
+        ]
+        if mismatched:
+            raise OperatorError(
+                "输入图像矩阵数量不一致（"
+                + "，".join(mismatched)
+                + f"）；各批量输入需要为 {length} 张，或只有 1 张以广播。"
+            )
+        return batches, length
+
+    @staticmethod
+    def _call_operator(
+        entry: Any,
+        spec: OperatorSpec,
+        item_inputs: dict[str, Any | None],
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """对同一份输入执行一次算子的完整流程（逐张批量与单张共用）。"""
+
+        validate_inputs(spec, item_inputs)
+        entry.operator.validate(item_inputs, params)
+        call_kwargs: dict[str, Any] = dict(item_inputs)
+        call_kwargs.update(params)
+        output = entry.operator.process(**call_kwargs)
+        outputs = output_to_dict(spec, output)
+        if not outputs and not spec.allow_empty_output:
+            raise OperatorError("算子没有产生任何输出")
+        return outputs
+
+    @staticmethod
+    def _process_single(
+        snap: _NodeSnap,
+        spec: OperatorSpec,
+        entry: Any,
+        inputs: dict[str, Any | None],
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """非批量执行：保持既有单张行为与输出命名。"""
+
+        outputs = _EvalState._call_operator(entry, spec, inputs, params)
+        for key, value in outputs.items():
+            if isinstance(value, ImageData) and value.name in ("", "image"):
+                value.name = f"{snap.title}:{key}"
+        return outputs
+
+    @staticmethod
+    def _is_image_output_port(port: PortSpec, values: list[Any]) -> bool:
+        """输出端口实际聚合为图像矩阵还是普通列表。"""
+
+        if port.any_type:
+            # 万能端口按运行时类型决定：全部是图像才合并成 ImageList。
+            return bool(values) and all(
+                data_type_of(value) is DataType.IMAGE for value in values
+            )
+        return port.data_type is DataType.IMAGE
+
+    def _process_batch(
+        self,
+        snap: _NodeSnap,
+        spec: OperatorSpec,
+        entry: Any,
+        inputs: dict[str, Any | None],
+        params: dict[str, Any],
+        batches: dict[str, list[Any]],
+        length: int,
+    ) -> dict[str, Any]:
+        """逐张执行算子并把各输出端口聚合为数组（图像端口为 ImageList）。"""
+
+        per_item: list[dict[str, Any]] = []
+        for index in range(length):
+            item_inputs = dict(inputs)
+            for key, items in batches.items():
+                # 长度为 1 的批量输入广播到每一张。
+                item_inputs[key] = items[min(index, len(items) - 1)]
+            try:
+                per_item.append(self._call_operator(entry, spec, item_inputs, params))
+            except Exception as exc:  # noqa: BLE001 - 统一转成带序号的节点错误
+                if isinstance(exc, OperatorError):
+                    raise OperatorError(f"第 {index + 1} 张执行失败：{exc}") from exc
+                raise OperatorError(
+                    f"第 {index + 1} 张执行失败：{exc.__class__.__name__}: {exc}"
+                ) from exc
+
+        ports = {port.key: port for port in spec.outputs}
+        keys: list[str] = [
+            port.key
+            for port in spec.outputs
+            if any(port.key in item for item in per_item)
+        ]
+        for item in per_item:
+            for key in item:
+                if key not in keys:
+                    keys.append(key)
+        if not keys and not spec.allow_empty_output:
+            raise OperatorError("算子没有产生任何输出")
+
+        outputs: dict[str, Any] = {}
+        for key in keys:
+            port = ports.get(key)
+            if port is None:  # pragma: no cover - output_to_dict 已拒绝未声明端口
+                raise OperatorError(f"算子返回了未声明的输出端口：{key}")
+            for index, item in enumerate(per_item):
+                if key not in item:
+                    raise OperatorError(
+                        f"第 {index + 1} 张缺少输出端口“{port.label}”的数据，"
+                        "无法合并批量结果"
+                    )
+            values = [item[key] for item in per_item]
+            if self._is_image_output_port(port, values):
+                images: list[ImageData] = []
+                for index, value in enumerate(values):
+                    for image in image_values(value):
+                        if image.name in ("", "image"):
+                            image = ImageData(
+                                image.array,
+                                f"{snap.title}:{key} · 第 {index + 1} 张",
+                                image.color_space,
+                            )
+                        images.append(image)
+                outputs[key] = ImageList(tuple(images))
+            else:
+                # 数值 / 结构化端口：保持逐张结果的顺序。
+                outputs[key] = values
+        return outputs
 
     def record_failure(self, node_id: str, message: str, details: str = "") -> None:
         if not self._mark_failure(node_id):

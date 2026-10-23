@@ -122,7 +122,11 @@ class MainWindowIntegrationTests(unittest.TestCase):
         self.assertEqual(len(widget.workspace.graph.source_nodes()), 1)
         self.assertIsNotNone(widget.engine.result(widget._current_node_id))
         self.assertIsNotNone(widget.preview.image_size())
-        self.assertIn("节点:", self.win._status_labels["node"].text())
+        node_status = self.win._status_labels["node"].text()
+        self.assertIn("节点:", node_status)
+        # 预览右下角的信息标签已移除，色彩空间 / 数据类型等信息并入状态栏节点字段。
+        self.assertIn("BGR", node_status)
+        self.assertIn("uint8", node_status)
         self.assertNotEqual(self.win._status_labels["size"].text(), "图像: --")
         self.assertIsNotNone(widget.graph_view.items() if hasattr(widget.graph_view, "items") else True)
         # 初始三栏比例为 1:2:4（算子库 : 画布 : 预览）

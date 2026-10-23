@@ -193,6 +193,7 @@ class GraphView(QGraphicsView):
     """节点画布视图。"""
 
     selection_changed = Signal(str)  # "" 表示取消选择
+    node_image_selected = Signal(str, int)  # 节点 id, 图像矩阵中的序号（0 起）
     node_activated = Signal(str)  # 双击节点
     node_created = Signal(str)  # 画布内新增算子节点
     connection_changed = Signal(str)  # 目标节点 id
@@ -318,6 +319,43 @@ class GraphView(QGraphicsView):
         finally:
             self._syncing_selection = False
 
+    # -------------------------------------------------------- 图像矩阵缩略图
+    def on_node_image_selected(self, item: NodeItem, index: int) -> None:
+        """NodeItem 点选矩阵缩略图后的回调：通知工作区切换预览。
+
+        点缩略图只切换“当前显示哪一张”，不能把节点变成选中状态。为避免画布上
+        留下另一个节点的蓝色选中框、而右侧预览已经切到当前节点，这里同步清空
+        场景选择（清空过程不触发 220ms 的单选信号，预览由工作区直接更新）。
+        """
+
+        if item is None:
+            return
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            index = 0
+        self.cancel_selection_timer()
+        if self._scene.selectedItems():
+            self._syncing_selection = True
+            try:
+                self._scene.clearSelection()
+            finally:
+                self._syncing_selection = False
+        self.node_image_selected.emit(item.node_id, max(0, index))
+
+    def selected_image_index(self, node_id: str) -> int:
+        """节点卡片上当前选中的图像序号；单图 / 无结果 / 未知节点为 0。"""
+
+        item = self._nodes.get(node_id)
+        if isinstance(item, NodeItem):
+            return item.selected_image_index
+        return 0
+
+    def set_selected_image_index(self, node_id: str, index: int) -> None:
+        item = self._nodes.get(node_id)
+        if isinstance(item, NodeItem):
+            item.set_selected_image_index(index)
+
     # ------------------------------------------------------------ 复制 / 粘贴
     def copy_selected(self) -> bool:
         """复制选中的节点及它们之间的连线到系统剪贴板。"""
@@ -372,11 +410,10 @@ class GraphView(QGraphicsView):
                 node = NodeModel.from_dict(raw)
             except (KeyError, TypeError, ValueError):
                 continue
-            if (
-                node.is_source
-                and node.source_image_id
-                and node.source_image_id not in self.workspace.images
+            if node.is_source and any(
+                image_id not in self.workspace.images for image_id in node.source_ids
             ):
+                # 图像矩阵源节点必须所有图都存在，才允许整体粘贴。
                 skipped += 1
                 continue
             source_nodes.append(node)
@@ -1162,12 +1199,16 @@ class GraphView(QGraphicsView):
         self._stop_elapsed_flash(node_id)
         self._stop_running_timer_if_idle()
         was_selected = bool(old is not None and old.isSelected())
+        old_image_index = old.selected_image_index if isinstance(old, NodeItem) else 0
         if old is not None and old.scene() is self._scene:
             self._scene.removeItem(old)
         self._item_signatures.pop(node_id, None)
         if node is None:
             return
         item = self._create_node_item(node)
+        if isinstance(item, NodeItem) and old_image_index:
+            # 重建前选中的矩阵序号尽量保留（set_result 会按新张数 clamp）。
+            item.set_selected_image_index(old_image_index)
         if was_selected:
             self._syncing_selection = True
             try:
@@ -3173,6 +3214,13 @@ class GraphView(QGraphicsView):
         if event.button() == Qt.MouseButton.LeftButton:
             item = self._node_item_at(event.position().toPoint())
             if item is not None:
+                # 双击矩阵缩略图只切换选中的图，交给 NodeItem 处理，不打开参数面板。
+                local_pos = item.mapFromScene(
+                    self.mapToScene(event.position().toPoint())
+                )
+                if item.image_index_at(local_pos) is not None:
+                    super().mouseDoubleClickEvent(event)
+                    return
                 self._selection_timer.stop()
                 self._syncing_selection = True
                 try:

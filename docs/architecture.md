@@ -17,25 +17,29 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 ```
 
 * **模型**：`app/core/model.py`。`WorkspaceModel` 持有 `GraphModel` 与源图像
-  `images: dict[str, ImageData]`。节点参数变化通过 `NodeModel.touch()` 增加
-  `revision`。引擎用 revision 丢弃过期结果。`WorkspaceModel.display_mode` 保存
-  工作区级预览显示模式（`imshow` / `imagesc` / `mesh`），随 `.mi` 工程持久化。
+* **模型**：`app/core/model.py`。`WorkspaceModel` 持有 `GraphModel` 与源图像
+  `images: OrderedDict[str, ImageData]`；源节点用 `NodeModel.source_image_ids` 按顺序
+  引用其中多张图（`source_ids` 兼容旧的单图 `source_image_id`）。节点参数变化通过
+  `NodeModel.touch()` 增加 `revision`。引擎用 revision 丢弃过期结果。
+  `WorkspaceModel.display_mode` 保存工作区级预览显示模式（`imshow` / `imagesc` /
+  `mesh`），随 `.mi` 工程持久化。
 * **矩阵 IO**：`app/core/matrixio.py` 负责 CSV / TSV / TXT 等文本矩阵的解析（分隔符、
   表头 / 行名与缺失值），导入后统一为单通道灰度 `ImageData`；`.npy` 仍按 NumPy 数组
   读取，矩阵数组随源图像以 npz 内嵌保存，工程格式版本不变。
 * **端口数据类型**：`app/core/data_types.py` 是端口类型的唯一来源。`DataType`
   定义 `image / number / edges / contours / components` 五种类型；
   `NumberValue / EdgesData / ContoursData / ComponentsData` 是结构化值的运行时
-  容器；`coerce_data_type()` 归一化中英文别名，`render_preview()` /
-  `summarize_value()` 供算子显式可视化与摘要使用。`PortSpec.data_type` 声明端口类型
+  容器；图像端口的值可以是单张 `ImageData`，也可以是多图容器 `ImageList`（图像
+  矩阵，仍属于 `DataType.IMAGE`）。`coerce_data_type()` 归一化中英文别名，
+  `render_preview()` / `summarize_value()` 供算子显式可视化与摘要使用。`PortSpec.data_type` 声明端口类型
   （默认图像），`port_types_compatible() / connection_error()` 决定连线是否允许，
   `validate_inputs()` 在执行前校验输入，`output_to_dict() / coerce_output_value()`
   按端口类型规范化算子返回值。
 * **类型化数据流**：数据流从“图像容器”升级为“类型化端口值”。连线传递的不再只
-  是 `ImageData`，也可能是 `NumberValue`、`EdgesData`、`ContoursData` 或
-  `ComponentsData`；`NodeResult.outputs` 是泛化的 `dict[str, Any]`，
-  `preview_image` 优先取图像输出、否则渲染结构化数据，`summary_text()` 汇总
-  各端口摘要。
+  是 `ImageData` / `ImageList`，也可能是 `NumberValue`、`EdgesData`、`ContoursData`
+  或 `ComponentsData`；`NodeResult.outputs` 是泛化的 `dict[str, Any]`，
+  `preview_image` 取第一个图像输出的首张、没有图像输出时为 `None`，`summary_text()`
+  汇总各端口摘要。
 * **结构化数据不再自动预览**：`NodeResult.preview_image` 只返回图像输出；数值、
   边缘、轮廓、连通域不再由 `render_preview()` 转成主预览或节点缩略图。节点卡片对
   单个数值直接显示、对图像显示缩略图、对数组提示「数组数据 / 双击查看」；参数面板的
@@ -91,7 +95,7 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 
 | `DataType` | 值 | 运行时容器 | 说明 |
 | --- | --- | --- | --- |
-| `IMAGE` | `image` | `ImageData` | 默认端口类型；`ndarray` 自动包装并按形状推断颜色空间 |
+| `IMAGE` | `image` | `ImageData` / `ImageList` | 默认端口类型；单张与图像矩阵共用同一类型；`ndarray` 自动包装并按形状推断颜色空间 |
 | `NUMBER` | `number` | `NumberValue` | 携带 `label` / `unit`；也可直接返回 `int` / `float` |
 | `EDGES` | `edges` | `EdgesData` | `segments` 为 `(N,2)` 点数组或点数组元组，可带 `image_size` |
 | `CONTOURS` | `contours` | `ContoursData` | 与 `EdgesData` 同构，另可携带 `hierarchy` |
@@ -112,6 +116,88 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 * 结构化数据不再自动渲染成主预览 / 缩略图；`render_preview()` 仅供算子显式
   生成可视化输出。`summarize_value()` / `summarize_outputs()` 生成状态栏与节点摘要，
   数组详情在参数面板的「输出数据」区以文本展示。
+
+## 图像矩阵与批量执行
+
+图像矩阵（`ImageList`）让一次打开的多张图在同一个源节点里流转，也让算子按图批量执行。
+它不新增端口类型：对连线校验、工程格式和界面来说仍是 `image` 类型。
+
+### 数据层
+
+* **容器**：`app/core/types.py` 的
+  `ImageList(images: tuple[ImageData, ...], name="图像矩阵")` 是不可变容器，提供
+  `count / first / image_at() / summary() / copy()`；`image_values()` 把单张 / 矩阵
+  统一展开成 `tuple[ImageData, ...]`，`first_image()` 取首张。
+* **类型**：`data_type_of(ImageList)` 返回 `DataType.IMAGE`；`validate_inputs()` 对图像
+  端口逐张校验颜色空间，空矩阵直接报错；`coerce_output_value()` 接受 `ImageList`，
+  也把非空 `list/tuple[ImageData]` 包装成矩阵。矩阵内各图尺寸 / 颜色空间 / dtype
+  可以不同，不会自动缩放或统一。
+* **节点模型**：`NodeModel.source_image_ids` 保存源节点引用的全部图像 id 与顺序；
+  `source_ids` 属性在列表为空时回退旧工程的 `source_image_id`。`to_dict()` 写出
+  `source_image_ids`，`from_dict()` 把 `source_image_id` 合并进列表并去重。
+* **工作区**：`WorkspaceModel.add_source_images(images, paths, ...)` 为每张图分配
+  `img` id 并创建一个源节点；`add_source_image()` 委托给前者处理单图。
+  `images_for_node(node)` 按 `source_ids` 顺序返回全部 `ImageData`，
+  `image_for_node()` 只返回第一张（兼容单图调用方）；`prune_unused_images()` 保留
+  所有被 `source_ids` 引用的图。
+* **工程格式**：`.mi` 的 `project.json` 记录源节点的 `source_image_ids`，图像仍逐张
+  存为 `images/<image_id>.npz`；保存 / 打开不改变单图工程的文件结构，多图工程只是
+  多几个 npz。`load_project()` 会校验每个源节点引用的图像都存在。
+* **界面创建入口**：`WorkspaceWidget.add_image_matrix(paths)` 用于“文件 → 打开图像”
+  多选：读取失败的文件跳过并汇总提示，成功的图放进同一个源节点；
+  `add_image(path)` 仍是一张图一个源节点，“添加图像”多选时逐文件调用它。
+
+### 引擎批量语义
+
+* **源节点输出**：`_compute_source()` 按 `source_image_ids` 取图；1 张输出
+  `ImageData`，多张输出 `ImageList(name=节点标题)`，图片缺失时报
+  「源图像数据缺失，请重新载入图像」。
+* **结果便捷属性**：`NodeResult.primary_images / has_image_matrix / image_count /
+  image_at()` 直接基于第一个图像输出（`ImageData` 或 `ImageList`）；`primary /
+  preview_image` 仍取首张，保证旧的单图调用方不变。
+* **批量识别**：`_batch_plan()` 把 `ImageList` 视为批量输入，也把同构的
+  `list/tuple`（`data_type_of` 能识别，例如逐张数值结果）视为批量输入。所有批量
+  输入中最大长度为 N；每个批量输入长度必须为 1 或 N，长度为 1 的输入广播到每
+  一张；长度不在 `{1, N}` 时节点失败，提示「输入图像矩阵数量不一致（...）」。
+  空批量输入单独报错。只有 1 张的矩阵按单张解包，保持原有单图执行路径与耗时。
+* **逐张执行**：`_process_batch()` 对 i=0..N-1 构造一份输入（批量端口取第
+  `min(i, len-1)` 项，其余输入原样），逐张调用 `validate_inputs / validate /
+  process / output_to_dict`；参数只在循环外规范化一次。
+* **输出聚合**：每个输出端口按声明类型聚合：图像端口（以及实际逐项都是图像的万能
+  端口）合并为 `ImageList`（逐张结果按顺序展开）；数值 / 边缘 / 轮廓 / 连通域
+  等其他端口保持逐张 `list` 顺序。某张缺少某个输出端口时节点失败。任一张执行失败
+  时整个节点失败，错误信息包含「第 i+1 张」。
+* **算子组**：组内节点仍作为普通节点独立执行；组输出端口的来源若是图像矩阵，按端口
+  类型 `coerce_output_value()` 保留 / 包装矩阵，详见 [group_node.md](group_node.md)
+  第 5 节。
+
+### 画布与预览
+
+* **NodeItem 网格**：`app/graph/node_item.py` 在结果第一个图像输出为多图时进入
+  `_content_mode="grid"`，`_grid_images` 保存全部图像，节点中部按方形单元格排布；
+  `grid_columns()` 的列数规则为 1 张 1 列、2–4 张 2 列、5 张及以上 3 列（1 张实际
+  仍走单图缩略图模式），单元格边长不超过缩略图设置，节点高度随行数增长。每格绘制
+  缩略图、左上角序号与选中描边。
+* **命中测试**：`NodeItem.image_at(index)`、`image_tile_rects()` 暴露网格数据，
+  `image_index_at(QPointF)` 用单元格矩形返回序号（未命中 / 非网格返回 `None`）。
+* **选中序号**：`_selected_image_index` 默认 0，`set_result()` 后按新张数 clamp，
+  张数变少时尽量保留原索引；`set_selected_image_index(index)` 同样 clamp。
+* **点击语义**：`NodeItem.mousePressEvent` 先做 `image_index_at()`；命中时
+  `_select_grid_image()` 只更新序号并经 `GraphView.on_node_image_selected()` 发射
+  `node_image_selected(str, int)`，`accept()` 后直接返回，不经过 `QGraphicsItem`
+  的选中 / 拖动逻辑。因此点缩略图不会选中节点、不会移动节点；双击缩略图也不会
+  打开参数面板。点击标题 / footer 等其它区域才交给基类选中节点。
+* **GraphView 接口**：`node_image_selected = Signal(str, int)`（节点 id、0 起序号）、
+  `on_node_image_selected(item, index)`、`selected_image_index(node_id)`、
+  `set_selected_image_index(node_id, index)`；`_recreate_node_item()` 重建条目时
+  保留旧选中序号。
+* **缩略图关闭**：`set_thumbnails_enabled(False)` 后不建网格，`_content_mode="matrix"`，
+  只显示「图像矩阵 ×N」文字；界面此时不提供点选单图的入口。
+* **工作区预览**：`WorkspaceWidget._result_images()` 优先用
+  `NodeResult.primary_images` 展开矩阵；`_show_result()` 用节点当前选中序号取一张，
+  状态栏详情显示「图像矩阵 N 张 · 第 i/N 张 · 色彩空间 · dtype」。
+  `_refresh_original()` 在结果节点上用结果节点的选中序号取源矩阵中的同一张（越界
+  回退第一张），导出当前节点图像也取这一张。
 
 ## 算子组节点与自定义算子
 
@@ -213,13 +299,15 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 
 * BGR / BGRA（OpenCV 习惯），灰度 `(H,W)`。
 * uint8 / uint16 / int16 / float32 等均可；显示层归一化，状态栏显示原始值。
-* `app/core/types.py` 提供 `ImageData`、`to_display_rgb`、`sample_pixel`。
+* `app/core/types.py` 提供 `ImageData`、`ImageList`、`to_display_rgb`、`sample_pixel`；
+  图像矩阵的 `color_space` / `dtype_name` 在成员不一致时返回「混合」。
 
 ## 时间与缓存语义
 
 | 操作 | 行为 |
 | --- | --- |
 | 单击节点 | `engine.preview_node(id)`：有同一 revision 快照立即回放；否则让该节点与全部下游失效，后台重算目标节点并递归重算全部下游 |
+| 单击矩阵缩略图 | 只切换当前显示的单图序号并刷新右侧预览；不改变节点选择、不触发重算，使用已有快照 |
 | 参数拖动 | UI 防抖 120ms；更新模型参数后调用 `preview_node(id)`，实时重算当前节点并递归更新全部下游，不必先点“保存” |
 | 保存 | `engine.commit_node(id)`：强制使该节点与下游失效，并重算整棵下游子树（用于确认最终结果） |
 | 切换节点 | 与单击节点一致：有有效快照直接显示，否则 `preview_node(id)` 重算该节点与全部下游 |
@@ -268,6 +356,7 @@ GraphView(workspace: WorkspaceModel, registry: OperatorRegistry,
           undo_stack: QUndoStack, settings: AppSettings, parent=None)
 
 selection_changed = Signal(str)       # "" 表示取消选择
+node_image_selected = Signal(str, int)  # 节点 id, 图像矩阵中的序号（0 起）
 node_activated = Signal(str)          # 双击节点
 node_created = Signal(str)            # 画布内新增算子节点
 connection_changed = Signal(str)      # 目标节点 id；工作区失效其下游并在 30ms 内合并重算
@@ -283,6 +372,8 @@ notify_error(node_id: str, message: str | None) -> None
 clear_running() -> None              # 新请求取消旧请求时清掉遗留的运行中计时
 selected_node_id() -> str | None
 set_selected_node(node_id: str) -> None
+selected_image_index(node_id: str) -> int     # 节点卡片当前选中的图像序号
+set_selected_image_index(node_id: str, index: int) -> None
 copy_selected() -> bool              # Ctrl+C：复制选中节点及副本间连线；算子组会自动带上全部后代
 paste_nodes() -> list[str]           # Ctrl+V：粘贴并返回新节点 id，整次一步撤销
 auto_layout() -> None                # 顶层 + 各层算子组内部节点一起布局
@@ -481,9 +572,9 @@ apply_theme(app: QApplication) -> None
 
 | 范围 | 负责人 |
 | --- | --- |
-| `app/core/**`（含 `app/core/group.py`、`app/core/editor.py`、`app/core/operator_files.py`）, `app/operators/spec.py`, `app/operators/loader.py`, `app/operators/template.py`, `app/operators/group.py`, `app/config.py`, `app/ui/main_window.py`, `app/ui/workspace.py`, `app/main.py`, `pyproject.toml`, `tests/test_group.py`, `tests/test_group_integration.py` | Lead |
-| `app/engine/**`, `app/operators/builtin/**`, `tests/test_engine.py`, `tests/test_operators.py`, `tests/test_group_engine.py` | engine-ops |
-| `app/graph/**`（含 `app/graph/group_item.py`）, `tests/test_graph.py` | graph-ui |
+| `app/core/**`（含 `app/core/group.py`、`app/core/editor.py`、`app/core/operator_files.py`）, `app/operators/spec.py`, `app/operators/loader.py`, `app/operators/template.py`, `app/operators/group.py`, `app/config.py`, `app/ui/main_window.py`, `app/ui/workspace.py`, `app/main.py`, `pyproject.toml`, `tests/test_group.py`, `tests/test_group_integration.py`, `tests/test_image_matrix_core.py`, `tests/test_image_matrix_ui.py` | Lead |
+| `app/engine/**`, `app/operators/builtin/**`, `tests/test_engine.py`, `tests/test_operators.py`, `tests/test_group_engine.py`, `tests/test_image_matrix_engine.py` | engine-ops |
+| `app/graph/**`（含 `app/graph/group_item.py`）, `tests/test_graph.py`, `tests/test_image_matrix_grid.py` | graph-ui |
 | `app/ui/preview.py`, `app/ui/display_modes.py`, `app/ui/library.py`, `app/ui/replace_operator.py`, `app/ui/params.py`, `app/ui/settings_dialog.py`, `app/ui/theme.py`, `tests/test_widgets.py` | shell-ui |
 | `docs/**`, `README.md`, `packaging/**`, `examples/**` | qa-docs |
 

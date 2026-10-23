@@ -36,7 +36,7 @@ from PySide6.QtWidgets import QGraphicsItem, QStyleOptionGraphicsItem, QWidget
 from app.core.constants import MATRIX_SUFFIXES
 from app.core.data_types import DataType, NumberValue, data_type_of, format_number
 from app.core.model import NodeModel
-from app.core.types import make_thumbnail
+from app.core.types import ImageData, image_values, make_thumbnail
 from app.graph.port_item import PortItem
 from app.operators.spec import OperatorSpec, PortSpec
 
@@ -98,6 +98,10 @@ class NodeItem(QGraphicsItem):
     NOTE_PADDING = 10.0
     NOTE_MIN_TEXT_H = 34.0
     NOTE_MAX_TEXT_H = 150.0
+    # 图像矩阵网格：方形单元格、单元格间距与序号徽标尺寸。
+    GRID_SPACING = 6.0
+    GRID_BADGE_W = 15.0
+    GRID_BADGE_H = 13.0
 
     def __init__(
         self,
@@ -120,7 +124,18 @@ class NodeItem(QGraphicsItem):
         self._thumbnail_box = max(24, int(thumbnail_box))
         self._result: Any = None
         self._thumb_pixmap: QPixmap | None = None
-        self._content_mode = "empty"  # empty | thumb | number | numbers | array | note
+        #: 图像矩阵网格（仅 _content_mode == "grid" 时非空）。
+        self._grid_images: tuple[ImageData, ...] = ()
+        self._grid_pixmaps: list[QPixmap | None] = []
+        self._grid_rect = QRectF()
+        self._image_tile_rects: list[QRectF] = []
+        #: 结果中图像矩阵的总张数（缩略图关闭时仍保留，供文字提示 / 恢复选择）。
+        self._matrix_image_count = 0
+        self._selected_image_index = 0
+        self._grid_press_active = False
+        self._content_mode = (
+            "empty"  # empty | thumb | grid | matrix | number | numbers | array | note
+        )
         self._content_label = ""
         self._content_value = ""
         self._content_hint = ""
@@ -204,6 +219,26 @@ class NodeItem(QGraphicsItem):
         return self._canvas_text
 
     @property
+    def image_count(self) -> int:
+        """当前网格中的缩略图数量；非网格模式（含缩略图关闭）为 0。"""
+
+        return len(self._grid_images)
+
+    @property
+    def matrix_image_count(self) -> int:
+        """结果中第一组图像输出的总张数（单图为 1，无图像为 0）。"""
+
+        return self._matrix_image_count
+
+    @property
+    def has_image_grid(self) -> bool:
+        return self._content_mode == "grid" and bool(self._grid_images)
+
+    @property
+    def selected_image_index(self) -> int:
+        return self._selected_image_index
+
+    @property
     def is_stale(self) -> bool:
         """节点引用的算子未注册 / 已失效。"""
 
@@ -232,6 +267,69 @@ class NodeItem(QGraphicsItem):
 
     def size(self) -> QSizeF:
         return self.node_size()
+
+    def width(self) -> float:
+        """节点卡片宽度（局部坐标，不含端口圆点的包围盒）。"""
+
+        return self._width
+
+    def height(self) -> float:
+        """节点卡片高度（局部坐标，不含端口圆点的包围盒）。"""
+
+        return self._height
+
+    # ------------------------------------------------------------ 图像矩阵 API
+    @staticmethod
+    def grid_columns(count: int) -> int:
+        """图像矩阵的列数：1 张 1 列、2-4 张 2 列、5 张及以上 3 列。"""
+
+        count = max(1, int(count))
+        if count <= 1:
+            return 1
+        if count <= 4:
+            return 2
+        return 3
+
+    def image_at(self, index: int) -> ImageData | None:
+        try:
+            return self._grid_images[int(index)]
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    def image_tile_rects(self) -> list[QRectF]:
+        """返回每个缩略图单元格的局部矩形（按行优先顺序）。"""
+
+        return [QRectF(rect) for rect in self._image_tile_rects]
+
+    def image_index_at(self, pos: QPointF) -> int | None:
+        """命中测试：返回局部坐标下命中的缩略图序号，未命中返回 None。"""
+
+        if not self.has_image_grid:
+            return None
+        try:
+            point = QPointF(pos)
+        except (TypeError, ValueError):
+            return None
+        for index, rect in enumerate(self._image_tile_rects):
+            if rect.contains(point):
+                return index
+        return None
+
+    def set_selected_image_index(self, index: int) -> None:
+        """选中矩阵中的第 index 张图；越界时钳制到有效范围。"""
+
+        count = len(self._grid_images) or self._matrix_image_count
+        if count <= 0:
+            index = 0
+        else:
+            try:
+                index = int(index)
+            except (TypeError, ValueError):
+                index = 0
+            index = max(0, min(index, count - 1))
+        if index != self._selected_image_index:
+            self._selected_image_index = index
+            self.update()
 
     def _refresh_connections(self) -> None:
         """节点高度变化会移动上下边缘端口，通知视图刷新相连连线。"""
@@ -328,34 +426,41 @@ class NodeItem(QGraphicsItem):
 
         thumb_area = 0.0
         self._thumb_rect = QRectF()
+        self._grid_rect = QRectF()
+        self._image_tile_rects = []
         self._content_rect = QRectF()
-        if self._thumb_pixmap is not None and not self._thumb_pixmap.isNull():
-            thumb_area = max(
-                40.0,
-                min(self._thumbnail_box + 8.0, float(self._thumb_pixmap.height()) + 8.0),
-            )
-            self._thumb_rect = QRectF(
-                self.THUMB_MARGIN,
-                self._content_top,
-                self._width - 2.0 * self.THUMB_MARGIN,
-                thumb_area,
-            )
-        text_area = 0.0
-        if not thumb_area:
-            if self.is_note_card:
-                text_area = self._canvas_text_height()
-            elif self._content_mode == "number":
-                text_area = 48.0
-            elif self._content_mode in ("array", "numbers"):
-                text_area = 40.0
-            if text_area:
-                self._content_rect = QRectF(
+        if self._content_mode == "grid" and self._grid_images:
+            # 图像矩阵：中部 content 区域按方形网格排布，四周留 THUMB_MARGIN。
+            self._layout_image_grid()
+            content_height = self._grid_rect.height() + 2.0 * self.THUMB_MARGIN
+        else:
+            if self._thumb_pixmap is not None and not self._thumb_pixmap.isNull():
+                thumb_area = max(
+                    40.0,
+                    min(self._thumbnail_box + 8.0, float(self._thumb_pixmap.height()) + 8.0),
+                )
+                self._thumb_rect = QRectF(
                     self.THUMB_MARGIN,
                     self._content_top,
                     self._width - 2.0 * self.THUMB_MARGIN,
-                    text_area,
+                    thumb_area,
                 )
-        content_height = thumb_area or text_area or self.MIN_CONTENT_H
+            text_area = 0.0
+            if not thumb_area:
+                if self.is_note_card:
+                    text_area = self._canvas_text_height()
+                elif self._content_mode == "number":
+                    text_area = 48.0
+                elif self._content_mode in ("array", "numbers", "matrix"):
+                    text_area = 40.0
+                if text_area:
+                    self._content_rect = QRectF(
+                        self.THUMB_MARGIN,
+                        self._content_top,
+                        self._width - 2.0 * self.THUMB_MARGIN,
+                        text_area,
+                    )
+            content_height = thumb_area or text_area or self.MIN_CONTENT_H
 
         bottom_stack = self.BOTTOM_LABEL_GAP + self.FOOTER_H + self.CONTENT_GAP
         if output_count:
@@ -382,6 +487,37 @@ class NodeItem(QGraphicsItem):
             footer_top -= self.LABEL_H + self.FOOTER_LABEL_GAP
         self._footer_rect = QRectF(0.0, footer_top, self._width, self.FOOTER_H)
         self.update()
+
+    def _layout_image_grid(self) -> None:
+        """计算方形单元格网格；节点宽度不足时按可用宽度自动收缩。"""
+
+        count = len(self._grid_images)
+        columns = self.grid_columns(count)
+        rows = (count + columns - 1) // columns
+        spacing = self.GRID_SPACING
+        available = max(1.0, self._width - 2.0 * self.THUMB_MARGIN)
+        cell = min(
+            float(self._thumbnail_box),
+            (available - spacing * (columns - 1)) / columns,
+        )
+        cell = max(12.0, cell)
+        row_width = columns * cell + spacing * (columns - 1)
+        grid_height = rows * cell + spacing * (rows - 1)
+        left = (self._width - row_width) / 2.0
+        top = self._content_top + self.THUMB_MARGIN
+        rects: list[QRectF] = []
+        for index in range(count):
+            row, column = divmod(index, columns)
+            rects.append(
+                QRectF(
+                    left + column * (cell + spacing),
+                    top + row * (cell + spacing),
+                    cell,
+                    cell,
+                )
+            )
+        self._image_tile_rects = rects
+        self._grid_rect = QRectF(left, top, row_width, grid_height)
 
     def boundingRect(self) -> QRectF:  # noqa: N802 - Qt 接口
         # 端口圆点位于上下边缘之外，需要纳入包围盒（半径约 9 + 3）。
@@ -513,9 +649,12 @@ class NodeItem(QGraphicsItem):
         self.update()
 
     def _update_content(self) -> None:
-        """按结果类型决定节点中部显示缩略图、数值、数组提示或便签文字。"""
+        """按结果类型决定节点中部显示缩略图、图像矩阵、数值、数组提示或便签文字。"""
 
         self._thumb_pixmap = None
+        self._grid_images = ()
+        self._grid_pixmaps = []
+        self._matrix_image_count = 0
         self._content_mode = "empty"
         self._content_label = ""
         self._content_value = ""
@@ -525,24 +664,48 @@ class NodeItem(QGraphicsItem):
             self._update_canvas_text()
             return
         if self._result is None:
+            self._selected_image_index = 0
             return
 
         outputs = getattr(self._result, "outputs", {}) or {}
         numbers = [value for value in outputs.values() if isinstance(value, NumberValue)]
-        preview = getattr(self._result, "preview_image", None)
-        if preview is not None and self._thumbnails_enabled:
+        # 找到第一个含图像的输出（单张 ImageData 或 ImageList），多图时展开成矩阵。
+        images: tuple[ImageData, ...] = ()
+        for value in outputs.values():
+            images = image_values(value)
+            if images:
+                break
+        if not images:
+            preview = getattr(self._result, "preview_image", None)
+            if isinstance(preview, ImageData):
+                images = (preview,)
+        self._matrix_image_count = len(images)
+
+        if len(images) > 1:
+            # 缩略图开启时在节点中部渲染网格；关闭时退回文字提示。
+            self._selected_image_index = max(
+                0, min(self._selected_image_index, len(images) - 1)
+            )
+            if self._thumbnails_enabled:
+                self._grid_images = images
+                self._grid_pixmaps = [self._make_grid_pixmap(image) for image in images]
+                self._content_mode = "grid"
+            else:
+                self._content_mode = "matrix"
+                self._content_label = f"图像矩阵 ×{len(images)}"
+                self._content_hint = "开启节点缩略图查看图像矩阵"
+            if len(numbers) == 1:
+                self._footer_number = self._footer_number_text(numbers[0])
+            return
+
+        self._selected_image_index = 0
+        if len(images) == 1 and self._thumbnails_enabled:
             try:
-                rgb = make_thumbnail(preview, self._thumbnail_box)
+                rgb = make_thumbnail(images[0], self._thumbnail_box)
                 self._thumb_pixmap = _rgb_to_pixmap(rgb)
                 self._content_mode = "thumb"
                 if len(numbers) == 1:
-                    value = numbers[0]
-                    unit = str(value.unit or "").strip()
-                    label = str(value.label or "数值").strip()
-                    self._footer_number = (
-                        f"{label} {format_number(value.value)}"
-                        + (f" {unit}" if unit else "")
-                    )
+                    self._footer_number = self._footer_number_text(numbers[0])
                 return
             except Exception:  # noqa: BLE001 - 缩略图失败不能影响画布
                 self._thumb_pixmap = None
@@ -639,6 +802,18 @@ class NodeItem(QGraphicsItem):
         if not self.node.is_source or not self.node.source_path:
             return False
         return Path(self.node.source_path).suffix.lower() in MATRIX_SUFFIXES
+
+    @staticmethod
+    def _footer_number_text(value: NumberValue) -> str:
+        unit = str(value.unit or "").strip()
+        label = str(value.label or "数值").strip()
+        return f"{label} {format_number(value.value)}" + (f" {unit}" if unit else "")
+
+    def _make_grid_pixmap(self, image: ImageData) -> QPixmap | None:
+        try:
+            return _rgb_to_pixmap(make_thumbnail(image, self._thumbnail_box))
+        except Exception:  # noqa: BLE001 - 单张缩略图失败时保留空占位格
+            return None
 
     def _refresh_tooltip(self) -> None:
         lines: list[str] = [self.node.display_title()]
@@ -809,6 +984,9 @@ class NodeItem(QGraphicsItem):
         # 便签文字：直接绘制在卡片中部，不画结果数据框。
         if self._content_mode == "note" and self._content_rect.height() > 0.0:
             self._paint_canvas_text(painter)
+        # 图像矩阵网格：每格一张缩略图，选中格加蓝色描边。
+        elif self.has_image_grid:
+            self._paint_image_grid(painter)
         # 数值 / 数组提示：没有缩略图时占用节点中部
         elif self._content_rect.height() > 0.0:
             painter.setPen(QPen(QColor("#e2e7ec"), 1.0))
@@ -922,7 +1100,106 @@ class NodeItem(QGraphicsItem):
             y += self._canvas_line_spacing
         painter.restore()
 
+    def _paint_image_grid(self, painter: QPainter) -> None:
+        """绘制图像矩阵：方形单元格 + 居中缩略图 + 左上角序号徽标。"""
+
+        badge_font = QFont("Microsoft YaHei UI")
+        badge_font.setPointSizeF(6.5)
+        badge_font.setBold(True)
+        painter.save()
+        try:
+            for index, rect in enumerate(self._image_tile_rects):
+                selected = index == self._selected_image_index
+                border_color = QColor("#2563eb") if selected else QColor("#e2e7ec")
+                painter.setPen(QPen(border_color, 2.0 if selected else 1.0))
+                painter.setBrush(QColor("#f6f8fa"))
+                painter.drawRoundedRect(rect, 5.0, 5.0)
+                pixmap = (
+                    self._grid_pixmaps[index]
+                    if index < len(self._grid_pixmaps)
+                    else None
+                )
+                if pixmap is not None and not pixmap.isNull():
+                    scaled = pixmap.scaled(
+                        max(1, int(rect.width() - 4.0)),
+                        max(1, int(rect.height() - 4.0)),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    x = rect.center().x() - scaled.width() / 2.0
+                    y = rect.center().y() - scaled.height() / 2.0
+                    painter.drawPixmap(QPointF(round(x), round(y)), scaled)
+                # 左上角序号徽标，便于与工作区预览的“第 n/N 张”对应。
+                badge_rect = QRectF(
+                    rect.x() + 4.0,
+                    rect.y() + 4.0,
+                    self.GRID_BADGE_W,
+                    self.GRID_BADGE_H,
+                )
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(
+                    QColor(37, 99, 235, 235) if selected else QColor(15, 23, 42, 160)
+                )
+                painter.drawRoundedRect(badge_rect, 4.0, 4.0)
+                painter.setFont(badge_font)
+                painter.setPen(QColor("#ffffff"))
+                painter.drawText(
+                    badge_rect,
+                    int(Qt.AlignmentFlag.AlignCenter),
+                    str(index + 1),
+                )
+        finally:
+            painter.restore()
+
     # ------------------------------------------------------------------ 交互
+    def _select_grid_image(self, index: int) -> None:
+        """选中网格中的一张图，并通知视图切换工作区预览（不改节点选中状态）。"""
+
+        self.set_selected_image_index(index)
+        callback = getattr(self._view, "on_node_image_selected", None)
+        if callable(callback):
+            try:
+                callback(self, self._selected_image_index)
+            except Exception:  # noqa: BLE001 - 预览切换失败不能影响画布交互
+                pass
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        if event.button() == Qt.MouseButton.LeftButton:
+            index = self.image_index_at(event.pos())
+            if index is not None:
+                # 缩略图点击只切换选中的图：不选中节点、不移动节点，也不清空其它选择。
+                self._grid_press_active = True
+                self._select_grid_image(index)
+                event.accept()
+                return
+        self._grid_press_active = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        if self._grid_press_active:
+            # 从缩略图上拖动不应带动节点。
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        if self._grid_press_active:
+            self._grid_press_active = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        if event.button() == Qt.MouseButton.LeftButton:
+            index = self.image_index_at(event.pos())
+            if index is not None:
+                # 双击缩略图也只切换选中图，不触发参数面板。
+                self._grid_press_active = False
+                self._select_grid_image(index)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value: Any) -> Any:  # noqa: N802 - Qt 接口
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged and not self._syncing:
             if self._view is not None:

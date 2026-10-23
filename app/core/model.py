@@ -44,7 +44,10 @@ class NodeModel:
     title: str
     pos: tuple[float, float] = (0.0, 0.0)
     params: dict[str, Any] = field(default_factory=dict)
+    #: 源节点引用的第一张图像（兼容旧工程 / 单图打开）。
     source_image_id: str | None = None
+    #: 源节点引用的全部图像；为空时回退到 source_image_id。
+    source_image_ids: list[str] = field(default_factory=list)
     source_path: str | None = None
     revision: int = 0
     #: 所属算子组的节点 id；None 表示顶层节点。
@@ -59,6 +62,15 @@ class NodeModel:
     @property
     def is_group(self) -> bool:
         return self.op_id == GROUP_OP_ID and self.group is not None
+
+    @property
+    def source_ids(self) -> list[str]:
+        """源节点引用的全部图像 id；旧工程只有一个 source_image_id。"""
+
+        ids = [str(image_id) for image_id in self.source_image_ids if image_id]
+        if not ids and self.source_image_id:
+            ids = [str(self.source_image_id)]
+        return ids
 
     def touch(self) -> None:
         self.revision += 1
@@ -76,6 +88,9 @@ class NodeModel:
             "source_image_id": self.source_image_id,
             "source_path": self.source_path,
         }
+        ids = self.source_ids
+        if ids:
+            data["source_image_ids"] = ids
         if self.parent_group is not None:
             data["parent_group"] = self.parent_group
         if self.group is not None:
@@ -92,13 +107,21 @@ class NodeModel:
             else None
         )
         parent = data.get("parent_group")
+        raw_ids = data.get("source_image_ids")
+        image_ids = [str(item) for item in raw_ids if item] if isinstance(raw_ids, (list, tuple)) else []
+        single = data.get("source_image_id")
+        if single:
+            single = str(single)
+            if single not in image_ids:
+                image_ids.insert(0, single)
         return cls(
             id=str(data["id"]),
             op_id=str(data["op_id"]),
             title=str(data.get("title") or data.get("op_id") or ""),
             pos=(float(pos[0]), float(pos[1])),
             params=dict(data.get("params") or {}),
-            source_image_id=data.get("source_image_id"),
+            source_image_id=image_ids[0] if image_ids else None,
+            source_image_ids=image_ids,
             source_path=data.get("source_path"),
             parent_group=str(parent) if parent else None,
             group=group,
@@ -205,14 +228,19 @@ class GraphModel(QObject):
         title: str,
         source_path: str | None = None,
         pos: tuple[float, float] = (0.0, 0.0),
+        image_ids: Iterable[str] | None = None,
     ) -> NodeModel:
+        ids = [str(item) for item in (image_ids or ()) if item]
+        if image_id and image_id not in ids:
+            ids.insert(0, image_id)
         return self.add_node(
             NodeModel(
                 id=new_id("n"),
                 op_id=SOURCE_OP_ID,
                 title=title,
                 pos=pos,
-                source_image_id=image_id,
+                source_image_id=ids[0] if ids else image_id,
+                source_image_ids=ids,
                 source_path=source_path,
             )
         )
@@ -845,22 +873,69 @@ class WorkspaceModel(QObject):
         pos: tuple[float, float] = (0.0, 0.0),
         title: str | None = None,
     ) -> NodeModel:
-        image_id = new_id("img")
-        display_name = title or (Path(path).name if path else image.name) or "原始图像"
-        image.name = display_name
-        self.images[image_id] = image
-        self.image_paths[image_id] = path
-        node = self.graph.create_source_node(image_id, display_name, path, pos)
-        self.image_added.emit(image_id)
+        return self.add_source_images([image], [path], pos=pos, title=title)
+
+    def add_source_images(
+        self,
+        images: Iterable[ImageData],
+        paths: Iterable[str | None] | None = None,
+        pos: tuple[float, float] = (0.0, 0.0),
+        title: str | None = None,
+    ) -> NodeModel:
+        """创建一个引用多张图像的源节点（图像矩阵）。
+
+        每个工作区图像仍是独立条目，节点用 source_image_ids 记录顺序；这样单图
+        工程格式无需改变，多图工程只是多存几个 npz。
+        """
+
+        image_list = list(images)
+        if not image_list:
+            raise ValueError("至少需要一张源图像")
+        path_list = list(paths) if paths is not None else []
+        if len(path_list) < len(image_list):
+            path_list.extend([None] * (len(image_list) - len(path_list)))
+        first_path = path_list[0]
+        display_name = title or (
+            Path(first_path).name if first_path else image_list[0].name
+        ) or "原始图像"
+        image_ids: list[str] = []
+        for index, image in enumerate(image_list):
+            path = path_list[index]
+            image_id = new_id("img")
+            name = Path(path).name if path else image.name
+            image.name = name or f"图像 {index + 1}"
+            self.images[image_id] = image
+            self.image_paths[image_id] = path
+            image_ids.append(image_id)
+        node = self.graph.create_source_node(
+            image_ids[0], display_name, first_path, pos, image_ids=image_ids
+        )
+        for image_id in image_ids:
+            self.image_added.emit(image_id)
         return node
 
+    def images_for_node(self, node: NodeModel) -> list[ImageData]:
+        """按源节点声明的顺序返回其全部源图像。"""
+
+        result: list[ImageData] = []
+        for image_id in node.source_ids:
+            image = self.images.get(image_id)
+            if image is not None:
+                result.append(image)
+        return result
+
     def image_for_node(self, node: NodeModel) -> ImageData | None:
-        if not node.source_image_id:
-            return None
-        return self.images.get(node.source_image_id)
+        """源节点的第一张图像（兼容单图调用方）。"""
+
+        images = self.images_for_node(node)
+        return images[0] if images else None
 
     def prune_unused_images(self) -> None:
-        used = {node.source_image_id for node in self.graph.nodes.values() if node.source_image_id}
+        used = {
+            image_id
+            for node in self.graph.nodes.values()
+            for image_id in node.source_ids
+        }
         for image_id in list(self.images.keys()):
             if image_id not in used:
                 self.images.pop(image_id, None)

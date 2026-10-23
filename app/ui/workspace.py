@@ -23,6 +23,7 @@ from app.core.imageio import ImageIOError, load_image, save_image
 from app.core.matrixio import is_matrix_file
 from app.core.model import NodeModel, WorkspaceModel
 from app.core.project import save_project
+from app.core.types import ImageData, image_values
 from app.engine.engine import ExecutionEngine, NodeResult
 from app.graph.commands import MoveNodeCommand, SetNodeParamsCommand
 from app.graph.view import GraphView
@@ -99,6 +100,9 @@ class WorkspaceWidget(QWidget):
         self._param_node_id: str | None = None
         self._param_session_old: dict = {}
         self._current_image = None
+        #: 当前节点的全部图像结果（单图只有一个元素，图像矩阵按端口顺序展开）。
+        self._current_images: list[ImageData] = []
+        self._current_image_index = 0
         self._last_pixel_sample = None
         self._last_undo_index = 0
         # 连线变化后待更新的目标节点：合并同一次操作里的多条连线事件。
@@ -206,6 +210,9 @@ class WorkspaceWidget(QWidget):
     def _connect_signals(self) -> None:
         self.library.status_message.connect(self.status_message.emit)
         self.graph_view.selection_changed.connect(self._on_node_selected)
+        image_selected = getattr(self.graph_view, "node_image_selected", None)
+        if image_selected is not None:
+            image_selected.connect(self._on_node_image_selected)
         self.graph_view.node_activated.connect(self.open_parameters)
         self.graph_view.node_created.connect(self._on_node_created)
         self.graph_view.node_removed.connect(self._on_node_removed)
@@ -277,19 +284,30 @@ class WorkspaceWidget(QWidget):
             self.engine.preview_node(self._current_node_id)
 
     # ------------------------------------------------------------------ 图像
-    def add_image(self, path: str | Path) -> bool:
+    def _load_image_file(self, path: str | Path, *, report: bool = True) -> ImageData | None:
+        """读取一张图像（含 CSV 等矩阵文件）；失败时记录日志并按需弹出错误框。"""
+
         is_matrix = is_matrix_file(path)
         kind = "矩阵" if is_matrix else "图像"
         try:
-            image = load_image(path)
+            return load_image(path)
         except ImageIOError as exc:
             LOG.error("无法打开%s %s：%s", kind, path, exc)
-            QMessageBox.critical(self, f"无法打开{kind}", str(exc))
+            if report:
+                QMessageBox.critical(self, f"无法打开{kind}", str(exc))
             self.status_message.emit(str(exc))
-            return False
         except Exception as exc:  # noqa: BLE001
             LOG.exception("无法打开%s %s", kind, path)
-            QMessageBox.critical(self, f"无法打开{kind}", f"{exc.__class__.__name__}: {exc}")
+            if report:
+                QMessageBox.critical(self, f"无法打开{kind}", f"{exc.__class__.__name__}: {exc}")
+        return None
+
+    def add_image(self, path: str | Path) -> bool:
+        """追加一张源图像节点（保留“一个文件一个源节点”的旧行为）。"""
+
+        is_matrix = is_matrix_file(path)
+        image = self._load_image_file(path)
+        if image is None:
             return False
         position = self.workspace.next_source_position()
         node = self.workspace.add_source_image(image, str(path), pos=position)
@@ -305,6 +323,53 @@ class WorkspaceWidget(QWidget):
             )
         else:
             self.status_message.emit(f"已添加图像：{Path(path).name}")
+        return True
+
+    def add_image_matrix(self, paths: list[str | Path]) -> bool:
+        """把一次选择的多张图像放进同一个源节点（图像矩阵）。
+
+        通过“文件 → 打开图像”多选打开时使用；单张图像也走同一入口，保证
+        源节点结构一致。读取失败的文件会记录日志并汇总提示，其余图像仍会
+        正常打开。
+        """
+
+        path_list = [Path(path) for path in paths if str(path)]
+        if not path_list:
+            return False
+        images: list[ImageData] = []
+        loaded_paths: list[str] = []
+        failures: list[str] = []
+        for path in path_list:
+            image = self._load_image_file(path, report=False)
+            if image is None:
+                failures.append(path.name)
+                continue
+            images.append(image)
+            loaded_paths.append(str(path))
+        if failures:
+            LOG.error("以下图像无法打开：%s", "、".join(failures))
+            QMessageBox.critical(
+                self,
+                "部分图像无法打开",
+                "以下文件读取失败，已跳过：\n" + "\n".join(failures),
+            )
+        if not images:
+            self.status_message.emit("没有可打开的图像")
+            return False
+        position = self.workspace.next_source_position()
+        node = self.workspace.add_source_images(images, loaded_paths, pos=position)
+        self.graph_view.set_selected_node(node.id)
+        self._on_node_selected(node.id)
+        self.graph_view.auto_layout()
+        self.graph_view.fit_graph()
+        self._mark_dirty()
+        if len(images) == 1:
+            kind = "矩阵" if is_matrix_file(loaded_paths[0]) else "图像"
+            self.status_message.emit(f"已打开{kind}：{Path(loaded_paths[0]).name}")
+        else:
+            self.status_message.emit(
+                f"已打开 {len(images)} 个文件：{Path(loaded_paths[0]).name} 等"
+            )
         return True
 
     def _on_images_dropped(self, paths: list[str]) -> None:
@@ -345,6 +410,8 @@ class WorkspaceWidget(QWidget):
             self._elapsed_state = "idle"
             self._current_node_id = None
             self._current_image = None
+            self._current_images = []
+            self._current_image_index = 0
             self._pixel_coord = "--"
             self._pixel_value = "--"
             self.preview.set_image(None, "", "未选择节点")
@@ -364,6 +431,8 @@ class WorkspaceWidget(QWidget):
         self._elapsed_state = "idle"
         self._last_elapsed_ms = None
         self._current_image = None
+        self._current_images = []
+        self._current_image_index = 0
         self._pixel_coord = "--"
         self._pixel_value = "--"
         self._refresh_original(node)
@@ -381,8 +450,20 @@ class WorkspaceWidget(QWidget):
         if source is None:
             self.preview.set_original_image(None, "原始图像")
             return
-        image = self.workspace.image_for_node(source)
-        self.preview.set_original_image(image, source.display_title())
+        images = self.workspace.images_for_node(source)
+        if not images:
+            self.preview.set_original_image(None, source.display_title())
+            return
+        # 图像矩阵在对比模式下使用与当前结果相同的序号：结果节点看自己的选中序号，
+        # 源节点看源节点网格的序号；越界时回退第一张。
+        current_id = self._current_node_id
+        if current_id and current_id != source.id:
+            index = self._selected_image_index(current_id)
+        else:
+            index = self._selected_image_index(source.id)
+        if index >= len(images):
+            index = 0
+        self.preview.set_original_image(images[index], source.display_title())
 
     def _find_source_ancestor(self, node: NodeModel) -> NodeModel | None:
         if node.is_source:
@@ -412,6 +493,57 @@ class WorkspaceWidget(QWidget):
         sources = graph.source_nodes()
         return sources[0] if sources else None
 
+    def _result_images(self, result: NodeResult | None) -> list[ImageData]:
+        """按输出端口顺序取结果的图像列表；图像矩阵会展开成多张。"""
+
+        if result is None:
+            return []
+        getter = getattr(result, "primary_images", None)
+        if callable(getter):
+            try:
+                images = list(getter())
+            except Exception:  # noqa: BLE001 - 旧结果对象没有该属性时回退
+                images = []
+            if images:
+                return images
+        for value in (getattr(result, "outputs", {}) or {}).values():
+            images = list(image_values(value))
+            if images:
+                return images
+        return []
+
+    def _selected_image_index(self, node_id: str | None) -> int:
+        """节点卡片上当前选中的图像序号（单图 / 无结果时为 0）。"""
+
+        if not node_id:
+            return 0
+        getter = getattr(self.graph_view, "selected_image_index", None)
+        if callable(getter):
+            try:
+                return max(0, int(getter(node_id)))
+            except Exception:  # noqa: BLE001
+                return 0
+        return 0
+
+    def _on_node_image_selected(self, node_id: str, index: int) -> None:
+        """点击节点网格中的某张图：只切换预览，不改变画布节点选择。"""
+
+        node = self.workspace.graph.nodes.get(node_id)
+        if node is None:
+            return
+        self._current_node_id = node_id
+        self._last_elapsed_ms = None
+        self._current_images = []
+        self._current_image_index = max(0, int(index))
+        self._refresh_original(node)
+        result = self.engine.result(node_id)
+        if result is not None and result.revision == node.revision:
+            self._show_result(result, node)
+        else:
+            self.engine.preview_node(node_id)
+            self.preview.set_image(None, node.display_title(), "正在计算…")
+        self._emit_status()
+
     # ------------------------------------------------------------------ 算子
     def _on_node_created(self, node_id: str) -> None:
         self._mark_dirty()
@@ -426,6 +558,9 @@ class WorkspaceWidget(QWidget):
         self.engine.invalidate_all()
         if self._current_node_id == node_id:
             self._current_node_id = None
+            self._current_image = None
+            self._current_images = []
+            self._current_image_index = 0
             self.preview.set_image(None, "", "节点已删除")
         if self._param_node_id == node_id:
             self._param_node_id = None
@@ -643,11 +778,16 @@ class WorkspaceWidget(QWidget):
     def _fallback_input_image(self, node: NodeModel):
         for connection in self.workspace.graph.incoming(node.id):
             result = self.engine.result(connection.src_node)
-            if result is not None and result.primary is not None:
-                return result.primary
+            images = self._result_images(result)
+            if images:
+                index = self._selected_image_index(connection.src_node)
+                return images[min(index, len(images) - 1)]
         source = self._find_source_ancestor(node)
         if source is not None:
-            return self.workspace.image_for_node(source)
+            images = self.workspace.images_for_node(source)
+            if images:
+                index = self._selected_image_index(source.id)
+                return images[min(index, len(images) - 1)]
         return None
 
     def _on_pick_finished(self, tool: str, value: object) -> None:
@@ -690,17 +830,28 @@ class WorkspaceWidget(QWidget):
 
     def _show_result(self, result: NodeResult, node: NodeModel) -> None:
         self._last_elapsed_ms = result.elapsed_ms
-        image = result.preview_image
+        images = self._result_images(result)
         summary = result.summary_text()
-        if image is None:
+        if not images:
             self._current_image = None
+            self._current_images = []
+            self._current_image_index = 0
             self.preview.set_image(None, node.display_title(), summary or "算子没有输出图像")
             return
+        index = self._selected_image_index(node.id)
+        index = max(0, min(index, len(images) - 1))
+        image = images[index]
+        self._current_images = images
+        self._current_image_index = index
         self._current_image = image
-        meta = f"{result.elapsed_ms:.1f} ms · {image.width}×{image.height} · {image.color_space} · {image.dtype_name}"
+        # 预览右下角的信息标签已并入状态栏：尺寸 / 缩放 / 耗时由独立字段展示，
+        # 这里只把色彩空间、数据类型和多输出汇总等补充信息交给状态栏的「节点」字段。
+        detail = f"{image.color_space} · {image.dtype_name}"
+        if len(images) > 1:
+            detail = f"图像矩阵 {len(images)} 张 · 第 {index + 1}/{len(images)} 张 · {detail}"
         if len(result.outputs) > 1:
-            meta += f" · 输出 {len(result.outputs)}：{result.output_type_summary()}"
-        self.preview.set_image(image, node.display_title(), meta)
+            detail += f" · 输出 {len(result.outputs)}：{result.output_type_summary()}"
+        self.preview.set_image(image, node.display_title(), detail)
 
     def _on_node_failed(self, node_id: str, message: str) -> None:
         self.graph_view.notify_error(node_id, message)
@@ -708,6 +859,8 @@ class WorkspaceWidget(QWidget):
             node = self.workspace.graph.nodes.get(node_id)
             title = node.display_title() if node else ""
             self._current_image = None
+            self._current_images = []
+            self._current_image_index = 0
             self.preview.set_image(None, title, f"计算失败：{message}")
             self._last_elapsed_ms = None
             self._stop_elapsed_clock()
@@ -793,8 +946,11 @@ class WorkspaceWidget(QWidget):
                 if self._last_elapsed_ms is not None
                 else "--"
             )
+        node_title = node.display_title() if node else ""
+        detail = self.preview.info_text()
+        node_text = " · ".join(part for part in (node_title, detail) if part) or "--"
         info = {
-            "node": node.display_title() if node else "--",
+            "node": node_text,
             "size": size,
             "zoom": zoom,
             "coord": self._pixel_coord,
@@ -885,22 +1041,27 @@ class WorkspaceWidget(QWidget):
         return self.splitter.sizes()
 
     def export_current_image(self, path: str | Path) -> bool:
-        """把当前节点最新快照导出为文件（保留原始 dtype）。"""
+        """把当前节点最新快照导出为文件（图像矩阵导出当前选中的一张）。"""
         node_id = self._current_node_id
         result = self.engine.result(node_id) if node_id else None
-        if result is None or result.primary is None:
+        images = self._result_images(result)
+        if not images:
             if result is not None and result.outputs:
                 self.status_message.emit("当前节点没有图像输出，无法导出为文件")
             else:
                 self.status_message.emit("当前节点没有可导出的结果")
             return False
+        index = self._selected_image_index(node_id)
+        index = max(0, min(index, len(images) - 1))
+        image = images[index]
         try:
-            save_image(path, result.primary)
+            save_image(path, image)
         except (ImageIOError, OSError) as exc:
             LOG.error("导出图像失败 %s：%s", path, exc)
             QMessageBox.critical(self, "导出失败", str(exc))
             return False
-        self.status_message.emit(f"已导出：{Path(path).name}")
+        suffix = f"（第 {index + 1}/{len(images)} 张）" if len(images) > 1 else ""
+        self.status_message.emit(f"已导出：{Path(path).name}{suffix}")
         return True
 
     def shutdown(self) -> None:
