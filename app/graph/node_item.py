@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+import math
+
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, QSizeF, Qt
 from PySide6.QtGui import (
@@ -31,7 +33,7 @@ from PySide6.QtGui import (
     QTextLayout,
     QTextOption,
 )
-from PySide6.QtWidgets import QGraphicsItem, QStyleOptionGraphicsItem, QWidget
+from PySide6.QtWidgets import QApplication, QGraphicsItem, QStyleOptionGraphicsItem, QWidget
 
 from app.core.constants import MATRIX_SUFFIXES
 from app.core.data_types import DataType, NumberValue, data_type_of, format_number
@@ -126,6 +128,8 @@ class NodeItem(QGraphicsItem):
         self._thumb_pixmap: QPixmap | None = None
         #: 图像矩阵网格（仅 _content_mode == "grid" 时非空）。
         self._grid_images: tuple[ImageData, ...] = ()
+        #: 单图节点当前显示的图像；使单图缩略图也能拖出副本。
+        self._single_image: ImageData | None = None
         self._grid_pixmaps: list[QPixmap | None] = []
         self._grid_rect = QRectF()
         self._image_tile_rects: list[QRectF] = []
@@ -133,6 +137,16 @@ class NodeItem(QGraphicsItem):
         self._matrix_image_count = 0
         self._selected_image_index = 0
         self._grid_press_active = False
+        #: 缩略图上按下 / 拖动的状态：超过系统拖拽阈值后启动 QDrag。
+        self._grid_press_index: int | None = None
+        self._grid_press_pos = QPointF()
+        self._grid_drag_started = False
+        #: 单图缩略图按下 / 拖动状态；点击仍选中节点，拖动超过阈值则拖出副本。
+        self._thumb_press_active = False
+        self._thumb_press_pos = QPointF()
+        self._thumb_drag_started = False
+        #: 图像拖拽 / 源节点合并时的高亮状态（虚线蓝框 + 浅色遮罩）。
+        self._image_drop_target = False
         self._content_mode = (
             "empty"  # empty | thumb | grid | matrix | number | numbers | array | note
         )
@@ -239,6 +253,21 @@ class NodeItem(QGraphicsItem):
         return self._selected_image_index
 
     @property
+    def image_drop_target(self) -> bool:
+        """当前节点是否被标记为拖入 / 合并目标。"""
+
+        return self._image_drop_target
+
+    def set_image_drop_target(self, active: bool) -> None:
+        """设置合并目标高亮：虚线蓝框 + 浅色遮罩。"""
+
+        active = bool(active)
+        if active == self._image_drop_target:
+            return
+        self._image_drop_target = active
+        self.update()
+
+    @property
     def is_stale(self) -> bool:
         """节点引用的算子未注册 / 已失效。"""
 
@@ -292,8 +321,54 @@ class NodeItem(QGraphicsItem):
 
     def image_at(self, index: int) -> ImageData | None:
         try:
-            return self._grid_images[int(index)]
-        except (IndexError, TypeError, ValueError):
+            index = int(index)
+        except (TypeError, ValueError):
+            return None
+        if 0 <= index < len(self._grid_images):
+            return self._grid_images[index]
+        if index == 0 and self._single_image is not None:
+            return self._single_image
+        return None
+
+    def image_pixmap(self, index: int) -> QPixmap | None:
+        """返回第 index 张图的缩略图，供 QDrag 图标使用；越界返回 None。"""
+
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            return None
+        if index < 0:
+            return None
+        if index < len(self._grid_pixmaps):
+            pixmap = self._grid_pixmaps[index]
+            if pixmap is not None and not pixmap.isNull():
+                return pixmap
+        if index == 0 and self._thumb_pixmap is not None and not self._thumb_pixmap.isNull():
+            # 单图节点虽然不走网格，也可以把当前缩略图作为拖动图标。
+            return self._thumb_pixmap
+        image = self.image_at(index)
+        if image is None:
+            image = self._source_image_at(index)
+        if image is None:
+            return None
+        return self._make_grid_pixmap(image)
+
+    def _source_image_at(self, index: int) -> ImageData | None:
+        """源节点即使还没有引擎结果，也能按 source_ids 顺序取到图像。"""
+
+        if not self.node.is_source:
+            return None
+        workspace = getattr(self._view, "workspace", None)
+        getter = getattr(workspace, "images_for_node", None)
+        if not callable(getter):
+            return None
+        try:
+            index = int(index)
+            if index < 0:
+                return None
+            images = getter(self.node)
+            return images[index]
+        except Exception:  # noqa: BLE001 - 取不到按无图处理
             return None
 
     def image_tile_rects(self) -> list[QRectF]:
@@ -652,6 +727,7 @@ class NodeItem(QGraphicsItem):
         """按结果类型决定节点中部显示缩略图、图像矩阵、数值、数组提示或便签文字。"""
 
         self._thumb_pixmap = None
+        self._single_image = None
         self._grid_images = ()
         self._grid_pixmaps = []
         self._matrix_image_count = 0
@@ -699,6 +775,8 @@ class NodeItem(QGraphicsItem):
             return
 
         self._selected_image_index = 0
+        if len(images) == 1:
+            self._single_image = images[0]
         if len(images) == 1 and self._thumbnails_enabled:
             try:
                 rgb = make_thumbnail(images[0], self._thumbnail_box)
@@ -1074,6 +1152,9 @@ class NodeItem(QGraphicsItem):
             footer_text,
         )
 
+        if self._image_drop_target:
+            self._paint_image_drop_target(painter, body)
+
     def _paint_canvas_text(self, painter: QPainter) -> None:
         """绘制便签文字；文字为空时显示「双击节点输入便签文字」占位。"""
 
@@ -1099,6 +1180,24 @@ class NodeItem(QGraphicsItem):
             painter.drawText(QPointF(text_rect.left(), y), line)
             y += self._canvas_line_spacing
         painter.restore()
+
+    def _paint_image_drop_target(self, painter: QPainter, body: QPainterPath) -> None:
+        """合并目标高亮：浅色遮罩 + 虚线蓝框，提示松开即可合并。"""
+
+        rect = QRectF(0.0, 0.0, self._width, self._height)
+        painter.save()
+        try:
+            painter.setClipPath(body)
+            painter.fillRect(rect, QColor(37, 99, 235, 30))
+        finally:
+            painter.restore()
+        pen = QPen(QColor("#2563eb"), 2.0, Qt.PenStyle.DashLine)
+        pen.setWidthF(2.0)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(pen)
+        painter.drawRoundedRect(
+            rect.adjusted(2.0, 2.0, -2.0, -2.0), self.CORNER, self.CORNER
+        )
 
     def _paint_image_grid(self, painter: QPainter) -> None:
         """绘制图像矩阵：方形单元格 + 居中缩略图 + 左上角序号徽标。"""
@@ -1163,28 +1262,100 @@ class NodeItem(QGraphicsItem):
             except Exception:  # noqa: BLE001 - 预览切换失败不能影响画布交互
                 pass
 
+    def _reset_grid_press(self) -> None:
+        self._grid_press_active = False
+        self._grid_press_index = None
+        self._grid_drag_started = False
+
+    def _reset_thumb_press(self) -> None:
+        self._thumb_press_active = False
+        self._thumb_drag_started = False
+
+    def _start_thumb_image_drag(self) -> None:
+        """单图缩略图拖动超过阈值后把图像副本交给视图启动 QDrag。"""
+
+        self._thumb_drag_started = True
+        starter = getattr(self._view, "start_image_drag", None)
+        if not callable(starter):
+            return
+        try:
+            starter(self, 0)
+        except Exception:  # noqa: BLE001 - 拖拽启动失败不能影响画布交互
+            return
+
+    def _start_grid_image_drag(self) -> None:
+        """超过系统拖拽阈值后把拖动交给视图启动 QDrag。"""
+
+        self._grid_drag_started = True
+        starter = getattr(self._view, "start_image_drag", None)
+        if not callable(starter):
+            return
+        index = self._grid_press_index
+        try:
+            starter(self, 0 if index is None else int(index))
+        except Exception:  # noqa: BLE001 - 拖拽启动失败不能影响画布交互
+            return
+
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt 接口
         if event.button() == Qt.MouseButton.LeftButton:
             index = self.image_index_at(event.pos())
             if index is not None:
                 # 缩略图点击只切换选中的图：不选中节点、不移动节点，也不清空其它选择。
+                self._reset_thumb_press()
                 self._grid_press_active = True
+                self._grid_press_index = index
+                self._grid_press_pos = QPointF(event.pos())
+                self._grid_drag_started = False
                 self._select_grid_image(index)
                 event.accept()
                 return
-        self._grid_press_active = False
+            if self._content_mode == "thumb" and self._thumb_rect.contains(event.pos()):
+                # 单图缩略图：先走默认按下逻辑（保持“点击选中节点”），拖动超过阈值时
+                # 由 mouseMoveEvent 改为拖出图像副本。
+                self._reset_grid_press()
+                self._thumb_press_active = True
+                self._thumb_press_pos = QPointF(event.pos())
+                self._thumb_drag_started = False
+                super().mousePressEvent(event)
+                return
+        self._reset_grid_press()
+        self._reset_thumb_press()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        left_pressed = bool(event.buttons() & Qt.MouseButton.LeftButton)
+        if self._thumb_press_active:
+            if not left_pressed:
+                self._reset_thumb_press()
+                super().mouseMoveEvent(event)
+                return
+            if not self._thumb_drag_started:
+                delta = event.pos() - self._thumb_press_pos
+                if math.hypot(delta.x(), delta.y()) >= QApplication.startDragDistance():
+                    self._start_thumb_image_drag()
+            event.accept()
+            return
         if self._grid_press_active:
-            # 从缩略图上拖动不应带动节点。
+            if not left_pressed:
+                self._reset_grid_press()
+                super().mouseMoveEvent(event)
+                return
+            # 从缩略图上拖动不应带动节点；超过阈值后改为拖出图像副本。
+            if not self._grid_drag_started:
+                delta = event.pos() - self._grid_press_pos
+                if math.hypot(delta.x(), delta.y()) >= QApplication.startDragDistance():
+                    self._start_grid_image_drag()
             event.accept()
             return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        if self._thumb_press_active:
+            self._reset_thumb_press()
+            event.accept()
+            return
         if self._grid_press_active:
-            self._grid_press_active = False
+            self._reset_grid_press()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -1194,10 +1365,12 @@ class NodeItem(QGraphicsItem):
             index = self.image_index_at(event.pos())
             if index is not None:
                 # 双击缩略图也只切换选中图，不触发参数面板。
-                self._grid_press_active = False
+                self._reset_grid_press()
+                self._reset_thumb_press()
                 self._select_grid_image(index)
                 event.accept()
                 return
+        self._reset_thumb_press()
         super().mouseDoubleClickEvent(event)
 
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value: Any) -> Any:  # noqa: N802 - Qt 接口

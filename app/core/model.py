@@ -914,6 +914,68 @@ class WorkspaceModel(QObject):
             self.image_added.emit(image_id)
         return node
 
+    def store_image(self, image: ImageData, path: str | None = None) -> str:
+        """把一张图像登记到工作区并返回新的 image id。
+
+        拖动图像副本到画布 / 合并到其它源节点时使用；登记后的图像即使暂时没有
+        节点引用也会保留在内存中，保存工程时由 prune_unused_images 统一清理。
+        """
+
+        image_id = new_id("img")
+        name = Path(path).name if path else image.name
+        image.name = name or image.name or "图像"
+        self.images[image_id] = image
+        self.image_paths[image_id] = path
+        self.image_added.emit(image_id)
+        return image_id
+
+    def set_source_image_ids(
+        self,
+        node_id: str,
+        image_ids: Iterable[str],
+        *,
+        touch: bool = True,
+    ) -> None:
+        """替换源节点引用的图像顺序；用于合并图像 / 撤销恢复。"""
+
+        node = self.graph.nodes.get(node_id)
+        if node is None:
+            raise GraphError(f"节点不存在：{node_id}")
+        if not node.is_source:
+            raise GraphError(f"节点不是原始图像节点：{node_id}")
+        ids: list[str] = []
+        for raw in image_ids:
+            image_id = str(raw)
+            if image_id and image_id not in ids:
+                ids.append(image_id)
+        for image_id in ids:
+            if image_id not in self.images:
+                raise GraphError(f"图像不存在：{image_id}")
+        node.source_image_ids = ids
+        node.source_image_id = ids[0] if ids else None
+        if touch:
+            node.touch()
+            self.graph.node_changed.emit(node_id)
+
+    def append_source_image_ids(
+        self,
+        node_id: str,
+        image_ids: Iterable[str],
+        *,
+        touch: bool = True,
+    ) -> None:
+        """把若干已有图像追加到源节点的图像矩阵末尾。"""
+
+        node = self.graph.nodes.get(node_id)
+        if node is None:
+            raise GraphError(f"节点不存在：{node_id}")
+        combined = list(node.source_ids)
+        for raw in image_ids:
+            image_id = str(raw)
+            if image_id and image_id not in combined:
+                combined.append(image_id)
+        self.set_source_image_ids(node_id, combined, touch=touch)
+
     def images_for_node(self, node: NodeModel) -> list[ImageData]:
         """按源节点声明的顺序返回其全部源图像。"""
 

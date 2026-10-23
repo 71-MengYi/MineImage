@@ -31,6 +31,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor,
     QCursor,
+    QDrag,
     QFont,
     QKeySequence,
     QMouseEvent,
@@ -43,9 +44,11 @@ from PySide6.QtWidgets import QApplication, QFrame, QGraphicsItem, QGraphicsView
 from app.config import AppSettings
 from app.core.constants import (
     GROUP_OP_ID,
+    MIME_IMAGE_ITEM,
     MIME_IMAGE_PATHS,
     MIME_OPERATOR,
     SINGLE_CLICK_DELAY_MS,
+    SOURCE_OP_ID,
     SOURCE_SUFFIXES,
 )
 from app.core.data_types import DataType
@@ -55,6 +58,7 @@ from app.graph.collapse_item import CollapseBadgeItem
 from app.graph.commands import (
     AddConnectionCommand,
     AddNodeCommand,
+    AppendSourceImagesCommand,
     DissolveGroupCommand,
     InsertNodeOnEdgeCommand,
     MoveNodeCommand,
@@ -62,6 +66,7 @@ from app.graph.commands import (
     RemoveConnectionCommand,
     RemoveNodeCommand,
     RemoveNodeTreeCommand,
+    RemoveSourceImageCommand,
     RenameNodeCommand,
     ReplaceOperatorCommand,
     SetParentGroupCommand,
@@ -74,6 +79,13 @@ from app.graph.group_item import (
     GROUP_PADDING_TOP,
     GROUP_PADDING_X,
     GroupItem,
+)
+from app.graph.image_drag import (
+    ImageDragPayload,
+    build_mime_data as build_image_drag_mime_data,
+    payload_from_mime as image_drag_payload_from_mime,
+    register as register_image_drag_payload,
+    release as release_image_drag_payload,
 )
 from app.graph.layout import compute_layout
 from app.graph.node_item import NodeItem
@@ -194,6 +206,8 @@ class GraphView(QGraphicsView):
 
     selection_changed = Signal(str)  # "" 表示取消选择
     node_image_selected = Signal(str, int)  # 节点 id, 图像矩阵中的序号（0 起）
+    #: 源节点图像矩阵被拖入 / 合并新图后发出，参数为目标节点 id。
+    source_images_changed = Signal(str)
     node_activated = Signal(str)  # 双击节点
     node_created = Signal(str)  # 画布内新增算子节点
     connection_changed = Signal(str)  # 目标节点 id
@@ -243,6 +257,13 @@ class GraphView(QGraphicsView):
         self._group_live_last: dict[str, QPointF] = {}
         self._suppress_move_events = False
         self._syncing_group_geometry = False
+        #: 拖拽图像 / 源节点时当前高亮的合并目标。
+        self._image_drop_target_item: NodeItem | None = None
+        self._node_merge_target: NodeItem | None = None
+        self._node_merge_refused: NodeItem | None = None
+        #: 当前通过点击缩略图选中的子图；Delete / Backspace 删除该子图而不是节点。
+        self._selected_subimage_node_id: str | None = None
+        self._selected_subimage_index = 0
 
         self._scene = GraphScene(self)
         self.setScene(self._scene)
@@ -306,8 +327,9 @@ class GraphView(QGraphicsView):
         return None
 
     def set_selected_node(self, node_id: str | None) -> None:
-        """程序化选中节点（不发出 ``selection_changed``，避免调用方循环）。"""
+        """程序化选中节点（不发出 selection_changed，避免调用方循环）。"""
 
+        self._clear_selected_subimage()
         self._selection_timer.stop()
         self._syncing_selection = True
         try:
@@ -341,7 +363,26 @@ class GraphView(QGraphicsView):
                 self._scene.clearSelection()
             finally:
                 self._syncing_selection = False
-        self.node_image_selected.emit(item.node_id, max(0, index))
+        index = max(0, index)
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._selected_subimage_node_id = item.node_id
+        self._selected_subimage_index = index
+        self.node_image_selected.emit(item.node_id, index)
+
+    def _clear_selected_subimage(self) -> None:
+        self._selected_subimage_node_id = None
+        self._selected_subimage_index = 0
+
+    def selected_subimage(self) -> tuple[str, int] | None:
+        """当前被点选、可被 Delete / Backspace 删除的子图（节点 id, 序号）。"""
+
+        node_id = self._selected_subimage_node_id
+        if not node_id:
+            return None
+        item = self._nodes.get(node_id)
+        if not isinstance(item, NodeItem) or not item.has_image_grid:
+            return None
+        return (node_id, item.selected_image_index)
 
     def selected_image_index(self, node_id: str) -> int:
         """节点卡片上当前选中的图像序号；单图 / 无结果 / 未知节点为 0。"""
@@ -355,6 +396,255 @@ class GraphView(QGraphicsView):
         item = self._nodes.get(node_id)
         if isinstance(item, NodeItem):
             item.set_selected_image_index(index)
+
+    # --------------------------------------------------- 图像拖出 / 拖入合并
+    def start_image_drag(self, item: NodeItem, index: int) -> bool:
+        """从节点图像矩阵拖出一张图像副本；返回是否成功发起拖拽。"""
+
+        if not isinstance(item, NodeItem):
+            self.status_message.emit("该节点没有可拖动的图像")
+            return False
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            index = 0
+        node = item.node
+        image = item.image_at(index) if index >= 0 else None
+        if image is None and node.is_source:
+            try:
+                images = self.workspace.images_for_node(node)
+            except Exception:  # noqa: BLE001 - 模型异常按无图处理
+                images = []
+            if 0 <= index < len(images):
+                image = images[index]
+        if image is None:
+            self.status_message.emit("该节点没有可拖动的图像")
+            return False
+
+        path: str | None = None
+        if node.is_source:
+            ids = node.source_ids
+            if 0 <= index < len(ids):
+                path = self.workspace.image_paths.get(ids[index])
+        title = node.display_title()
+        image_name = str(getattr(image, "name", "") or title)
+        payload = ImageDragPayload(
+            image=image.copy(),
+            name=image_name,
+            path=path,
+            source_node_id=node.id,
+            source_index=max(0, index),
+            source_title=title,
+        )
+
+        token = register_image_drag_payload(payload)
+        try:
+            drag = QDrag(self)
+            drag.setMimeData(build_image_drag_mime_data(token))
+            pixmap = item.image_pixmap(index)
+            if pixmap is not None and not pixmap.isNull():
+                drag.setPixmap(pixmap)
+                drag.setHotSpot(QPoint(pixmap.width() // 2, pixmap.height() // 2))
+            drag.exec(Qt.DropAction.CopyAction)
+        finally:
+            release_image_drag_payload(token)
+        return True
+
+    def _set_image_drop_target(self, item: NodeItem | None) -> None:
+        """高亮当前合并目标；同一时间最多一个节点处于目标状态。"""
+
+        if item is self._image_drop_target_item:
+            return
+        old = self._image_drop_target_item
+        self._image_drop_target_item = item
+        if old is not None:
+            old.set_image_drop_target(False)
+        if item is not None:
+            item.set_image_drop_target(True)
+
+    def _node_item_at_scene(self, scene_pos: QPointF) -> NodeItem | None:
+        """场景坐标下最上层的节点条目；不依赖视口滚动 / 缩放状态。"""
+
+        try:
+            point = QPointF(scene_pos)
+        except (TypeError, ValueError):
+            return None
+        for item in self._scene.items(point):
+            node_item = self._walk_to_node(item)
+            if node_item is not None:
+                return node_item
+        return None
+
+    def _source_item_at_scene(self, scene_pos: QPointF) -> NodeItem | None:
+        """落点最上层的原始图像节点；空白 / 非源节点返回 None。"""
+
+        item = self._node_item_at_scene(scene_pos)
+        if item is not None and item.node.is_source:
+            return item
+        return None
+
+    def _source_merge_target_for_item(self, item: NodeItem) -> NodeItem | None:
+        """源节点整体拖动时，被拖节点中心覆盖的另一个原始图像节点。"""
+
+        try:
+            center = item.sceneBoundingRect().center()
+        except Exception:  # noqa: BLE001 - 条目已失效时不做合并
+            return None
+        target: NodeItem | None = None
+        for other in self._nodes.values():
+            if other is item or not isinstance(other, NodeItem):
+                continue
+            if not other.isVisible() or not other.node.is_source:
+                continue
+            try:
+                if other.sceneBoundingRect().contains(center):
+                    target = other
+            except Exception:  # noqa: BLE001
+                continue
+        return target
+
+    def _update_source_merge_target(self, item: NodeItem) -> None:
+        """单次拖动源节点时更新合并目标与高亮；有下游连线时不提供合并。"""
+
+        node = self.graph.nodes.get(item.node_id)
+        candidate: NodeItem | None = None
+        refused: NodeItem | None = None
+        if node is not None and node.is_source:
+            candidate = self._source_merge_target_for_item(item)
+            if candidate is not None and self.graph.outgoing(node.id):
+                refused = candidate
+                candidate = None
+        self._node_merge_target = candidate
+        self._node_merge_refused = refused
+        self._set_image_drop_target(candidate)
+
+    def handle_image_drop(self, scene_pos: QPointF, payload: ImageDragPayload) -> bool:
+        """把拖出的图像副本放到画布：空白处新建源节点，源节点上追加合并。"""
+
+        if not isinstance(payload, ImageDragPayload) or payload.image is None:
+            self.status_message.emit("无法识别的图像拖拽数据")
+            return False
+        try:
+            scene_pos = QPointF(scene_pos)
+        except (TypeError, ValueError):
+            scene_pos = QPointF()
+        target_item = self._source_item_at_scene(scene_pos)
+
+        if target_item is not None:
+            target = self.graph.nodes.get(target_item.node_id)
+            if target is None:
+                return False
+            if payload.source_node_id == target.id:
+                self._select_nodes([target.id], target.id)
+                self.status_message.emit(
+                    f"该图像已位于“{target.display_title()}”，无需重复合并"
+                )
+                return False
+            try:
+                command = AppendSourceImagesCommand(
+                    self.workspace,
+                    self.graph,
+                    target.id,
+                    images=[payload.image.copy()],
+                    paths=[payload.path],
+                    text="合并图像",
+                )
+                self._undo_stack.push(command)
+            except GraphError as exc:
+                self.status_message.emit(f"合并图像失败：{exc}")
+                return False
+            self._sync_group_geometries()
+            self._select_nodes([target.id], target.id)
+            self.source_images_changed.emit(target.id)
+            self.status_message.emit(f"已合并到“{target.display_title()}”")
+            self._update_scene_rect()
+            return True
+
+        # 空白画布或非源节点：在落点创建一个只包含这张副本的源节点。
+        title = str(payload.name or "").strip()
+        if not title:
+            source_title = str(payload.source_title or "图像").strip() or "图像"
+            title = f"{source_title} · 第 {max(0, int(payload.source_index)) + 1} 张"
+        try:
+            image_id = self.workspace.store_image(payload.image.copy(), payload.path)
+            node = NodeModel(
+                id=new_id("n"),
+                op_id=SOURCE_OP_ID,
+                title=title,
+                pos=(round(scene_pos.x(), 2), round(scene_pos.y(), 2)),
+                source_image_id=image_id,
+                source_image_ids=[image_id],
+                source_path=payload.path,
+            )
+            self._undo_stack.push(AddNodeCommand(self.graph, node))
+        except GraphError as exc:
+            self.status_message.emit(f"创建图像节点失败：{exc}")
+            return False
+        self._sync_group_geometries()
+        self._select_nodes([node.id], node.id)
+        self.node_created.emit(node.id)
+        self.status_message.emit(f"已从图像矩阵拖出新图像节点“{title}”")
+        self._update_scene_rect()
+        return True
+
+    def merge_source_nodes(self, source_id: str, target_id: str) -> bool:
+        """把整个源节点的图像矩阵合并到另一个源节点，并删除被拖动的节点。"""
+
+        source = self.graph.nodes.get(str(source_id or ""))
+        target = self.graph.nodes.get(str(target_id or ""))
+        if source is None or target is None:
+            self.status_message.emit("合并失败：节点不存在")
+            return False
+        if not source.is_source or not target.is_source:
+            self.status_message.emit("只能合并原始图像节点")
+            return False
+        if source.id == target.id:
+            self.status_message.emit("不能把源节点合并到自身")
+            return False
+        if self.graph.outgoing(source.id):
+            self.status_message.emit("请先断开下游连线再合并")
+            return False
+        image_ids = list(source.source_ids)
+        if not image_ids:
+            self.status_message.emit("该源节点没有可合并的图像")
+            return False
+
+        source_title = source.display_title()
+        target_title = target.display_title()
+        self._set_image_drop_target(None)
+        self._node_merge_target = None
+        self._node_merge_refused = None
+        self._undo_stack.beginMacro("合并图像节点")
+        try:
+            self._undo_stack.push(
+                AppendSourceImagesCommand(
+                    self.workspace,
+                    self.graph,
+                    target.id,
+                    image_ids=image_ids,
+                    text="合并图像节点",
+                )
+            )
+            self._undo_stack.push(
+                RemoveNodeCommand(
+                    self.graph,
+                    source.id,
+                    text="合并图像节点",
+                )
+            )
+        except GraphError as exc:
+            self._undo_stack.endMacro()
+            self.status_message.emit(f"合并图像节点失败：{exc}")
+            return False
+        self._undo_stack.endMacro()
+        self._sync_group_geometries()
+        self._select_nodes([target.id], target.id)
+        self.source_images_changed.emit(target.id)
+        self.status_message.emit(
+            f"已将“{source_title}”的 {len(image_ids)} 张图像合并到“{target_title}”"
+        )
+        self._update_scene_rect()
+        return True
 
     # ------------------------------------------------------------ 复制 / 粘贴
     def copy_selected(self) -> bool:
@@ -533,6 +823,7 @@ class GraphView(QGraphicsView):
         return data
 
     def _select_nodes(self, node_ids: list[str], primary: str | None = None) -> None:
+        self._clear_selected_subimage()
         self._selection_timer.stop()
         self._syncing_selection = True
         try:
@@ -1807,7 +2098,62 @@ class GraphView(QGraphicsView):
         self._pending_move_reason = None
         self._clear_target_highlight()
 
+    def _delete_selected_subimage(self) -> bool:
+        """删除当前点选的子图；返回是否已处理本次 Delete / Backspace。
+
+        * 源节点图像矩阵：删除该张并保留节点，更新选中序号 / 预览并重算下游；
+        * 算子结果矩阵：图像由计算生成，提示后消费按键，不删除节点；
+        * 没有点选子图时返回 False，交回原来的节点 / 连线删除逻辑。
+        """
+
+        node_id = self._selected_subimage_node_id
+        if not node_id:
+            return False
+        node = self.graph.nodes.get(node_id)
+        item = self._nodes.get(node_id)
+        if node is None or not isinstance(item, NodeItem) or not item.has_image_grid:
+            self._clear_selected_subimage()
+            return False
+        if not node.is_source:
+            self.status_message.emit("结果图像由算子计算生成，不能直接删除；请调整上游节点")
+            return True
+        ids = list(node.source_ids)
+        index = max(0, min(item.selected_image_index, len(ids) - 1))
+        if not ids or index < 0 or index >= len(ids):
+            self._clear_selected_subimage()
+            return False
+        if len(ids) <= 1:
+            self.status_message.emit("图像矩阵至少需要保留一张图像")
+            self._clear_selected_subimage()
+            return True
+
+        removed_id = ids[index]
+        self._undo_stack.push(
+            RemoveSourceImageCommand(
+                self.workspace,
+                self.graph,
+                node_id,
+                removed_id,
+            )
+        )
+        remaining = len(node.source_ids)
+        if remaining > 1:
+            new_index = min(index, remaining - 1)
+            item.set_selected_image_index(new_index)
+            self._selected_subimage_node_id = node_id
+            self._selected_subimage_index = new_index
+            self.status_message.emit(f"已删除第 {index + 1} 张子图，剩余 {remaining} 张")
+        else:
+            # 只剩一张时退回单图缩略图模式：清理子图选中状态并选中节点。
+            self._clear_selected_subimage()
+            self._select_nodes([node_id], node_id)
+            self.status_message.emit(f"已删除第 {index + 1} 张子图，节点只剩一张图像")
+        self.source_images_changed.emit(node_id)
+        return True
+
     def delete_selected(self) -> None:
+        if self._delete_selected_subimage():
+            return
         self._clear_pending_interaction()
         node_items = [item for item in self._scene.selectedItems() if isinstance(item, NodeItem)]
         connection_items = [item for item in self._scene.selectedItems() if isinstance(item, ConnectionItem)]
@@ -2068,6 +2414,15 @@ class GraphView(QGraphicsView):
             self._sync_group_geometries()
 
     def _on_node_removed(self, node_id: str) -> None:
+        if (
+            self._image_drop_target_item is not None
+            and self._image_drop_target_item.node_id == node_id
+        ):
+            self._set_image_drop_target(None)
+        if self._node_merge_target is not None and self._node_merge_target.node_id == node_id:
+            self._node_merge_target = None
+        if self._node_merge_refused is not None and self._node_merge_refused.node_id == node_id:
+            self._node_merge_refused = None
         if any(port.node_item.node_id == node_id for port in self._highlighted_ports):
             self._clear_target_highlight()
         if self._pending_move_target is not None and node_id in (
@@ -2088,6 +2443,8 @@ class GraphView(QGraphicsView):
                 if connection.scene() is self._scene:
                     self._scene.removeItem(connection)
                 self._connections.pop(connection_id, None)
+        if node_id == self._selected_subimage_node_id:
+            self._clear_selected_subimage()
         self._collapsed.discard(node_id)
         badge = self._collapse_badges.pop(node_id, None)
         if badge is not None and badge.scene() is self._scene:
@@ -2181,6 +2538,9 @@ class GraphView(QGraphicsView):
             self._update_scene_rect()
         # 仅跟踪单节点拖动，多选整体移动时不做自动连接，避免歧义。
         if len(self._move_start) != 1 or item.node_id not in self._move_start:
+            self._node_merge_target = None
+            self._node_merge_refused = None
+            self._set_image_drop_target(None)
             return
         if item.node_id not in self.graph.nodes:
             return
@@ -2188,6 +2548,7 @@ class GraphView(QGraphicsView):
         self._pending_move_target = target
         self._pending_move_reason = reason if target is None else None
         self._set_target_highlight(target)
+        self._update_source_merge_target(item)
 
     # ------------------------------------------------------------ 自动连线检测
     def _reachable(self, start: str, target: str, ignore_connection: str | None = None) -> bool:
@@ -2362,6 +2723,7 @@ class GraphView(QGraphicsView):
             setter = getattr(connection, "set_highlight", None)
             if callable(setter):
                 setter(False)
+        self._set_image_drop_target(None)
 
     # ------------------------------------------------------------------ 连线
     def port_items(self, is_input: bool) -> Iterable[PortItem]:
@@ -2848,6 +3210,8 @@ class GraphView(QGraphicsView):
     def _on_scene_selection_changed(self) -> None:
         if self._syncing_selection:
             return
+        # 用户重新选中节点 / 清空选择后，不再保留子图删除目标。
+        self._clear_selected_subimage()
         # 单击后才延迟发出 selection_changed；双击会取消该定时器。
         self._selection_timer.start()
 
@@ -2885,11 +3249,34 @@ class GraphView(QGraphicsView):
         self._move_start = {}
         target = self._pending_move_target
         reason = self._pending_move_reason
+        merge_target = self._node_merge_target
+        merge_refused = self._node_merge_refused
+        self._node_merge_target = None
+        self._node_merge_refused = None
         self._pending_move_target = None
         self._pending_move_reason = None
         self._clear_target_highlight()
         if not starts:
             return
+
+        # 单个源节点拖到另一个源节点上：直接合并两个图像矩阵，不写移动命令。
+        merge_hint: str | None = None
+        if len(starts) == 1 and merge_target is not None:
+            merge_source = self.graph.nodes.get(next(iter(starts)))
+            merge_destination = self.graph.nodes.get(merge_target.node_id)
+            if (
+                merge_source is not None
+                and merge_destination is not None
+                and merge_source.is_source
+                and merge_destination.is_source
+                and merge_source.id != merge_destination.id
+            ):
+                if self.merge_source_nodes(merge_source.id, merge_destination.id):
+                    self._sync_group_geometries()
+                    self._update_scene_rect()
+                    return
+        elif len(starts) == 1 and merge_refused is not None:
+            merge_hint = "请先断开下游连线再合并"
         moves: dict[str, tuple[str, tuple[float, float], tuple[float, float]]] = {}
         for node_id, _start in starts.items():
             item = self._nodes.get(node_id)
@@ -3023,6 +3410,8 @@ class GraphView(QGraphicsView):
                     action_message += f"；{failed} 条连线无法重连，已丢弃"
         if action_message is not None:
             self.status_message.emit(action_message)
+        if merge_hint is not None:
+            self.status_message.emit(merge_hint)
         self._sync_group_geometries()
         self._update_scene_rect()
 
@@ -3096,6 +3485,7 @@ class GraphView(QGraphicsView):
             and self.itemAt(event.position().toPoint()) is None
         ):
             self.setFocus(Qt.FocusReason.MouseFocusReason)
+            self._clear_selected_subimage()
             self._panning = True
             self._pan_last = QPointF(event.position())
             self._pan_dragged = False
@@ -3138,6 +3528,7 @@ class GraphView(QGraphicsView):
             self._finish_canvas_pan()
             if not dragged:
                 # 空白处单击：保持“点击空白清空选择”的旧行为。
+                self._clear_selected_subimage()
                 self._scene.clearSelection()
             event.accept()
             return
@@ -3249,6 +3640,7 @@ class GraphView(QGraphicsView):
         if event.key() == Qt.Key.Key_Escape:
             self._pending_move_target = None
             self._pending_move_reason = None
+            self._clear_selected_subimage()
             self._clear_target_highlight()
             self._scene.cancel_connection_drag()
             self._scene.clearSelection()
@@ -3410,6 +3802,9 @@ class GraphView(QGraphicsView):
     def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt 接口
         self._clear_target_highlight()
         mime = event.mimeData()
+        if mime.hasFormat(MIME_IMAGE_ITEM):
+            event.acceptProposedAction()
+            return
         if mime.hasFormat(MIME_OPERATOR) or self._image_paths_from_mime(mime):
             event.acceptProposedAction()
             return
@@ -3417,6 +3812,18 @@ class GraphView(QGraphicsView):
 
     def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt 接口
         mime = event.mimeData()
+        if mime.hasFormat(MIME_IMAGE_ITEM):
+            self._clear_target_highlight()
+            payload = image_drag_payload_from_mime(mime)
+            if payload is None:
+                self.status_message.emit("无法识别拖入的图像数据")
+                event.acceptProposedAction()
+                return
+            scene_pos = self.mapToScene(event.position().toPoint())
+            target = self._source_item_at_scene(scene_pos)
+            self._set_image_drop_target(target)
+            event.acceptProposedAction()
+            return
         if mime.hasFormat(MIME_OPERATOR):
             raw = bytes(mime.data(MIME_OPERATOR)).decode("utf-8", "replace")
             op_id = self._parse_operator_payload(raw)
@@ -3440,6 +3847,16 @@ class GraphView(QGraphicsView):
     def dropEvent(self, event) -> None:  # noqa: N802 - Qt 接口
         self._clear_target_highlight()
         mime = event.mimeData()
+        if mime.hasFormat(MIME_IMAGE_ITEM):
+            payload = image_drag_payload_from_mime(mime)
+            if payload is None:
+                self.status_message.emit("拖入的图像数据已失效，请重新拖动")
+                event.acceptProposedAction()
+                return
+            scene_pos = self.mapToScene(event.position().toPoint())
+            self.handle_image_drop(scene_pos, payload)
+            event.acceptProposedAction()
+            return
         if mime.hasFormat(MIME_OPERATOR):
             raw = bytes(mime.data(MIME_OPERATOR)).decode("utf-8", "replace")
             op_id = self._parse_operator_payload(raw)
@@ -3518,6 +3935,7 @@ class GraphView(QGraphicsView):
             return 72
 
     def _clear_items(self) -> None:
+        self._clear_selected_subimage()
         self._selection_timer.stop()
         self._running_timer.stop()
         self._running_nodes.clear()
@@ -3527,6 +3945,9 @@ class GraphView(QGraphicsView):
         self._elapsed_flash_animations.clear()
         self._pending_move_target = None
         self._pending_move_reason = None
+        self._node_merge_target = None
+        self._node_merge_refused = None
+        self._image_drop_target_item = None
         self._clear_target_highlight()
         self._syncing_selection = True
         try:

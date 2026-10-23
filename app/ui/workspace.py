@@ -213,6 +213,9 @@ class WorkspaceWidget(QWidget):
         image_selected = getattr(self.graph_view, "node_image_selected", None)
         if image_selected is not None:
             image_selected.connect(self._on_node_image_selected)
+        source_images_changed = getattr(self.graph_view, "source_images_changed", None)
+        if source_images_changed is not None:
+            source_images_changed.connect(self._on_source_images_changed)
         self.graph_view.node_activated.connect(self.open_parameters)
         self.graph_view.node_created.connect(self._on_node_created)
         self.graph_view.node_removed.connect(self._on_node_removed)
@@ -549,7 +552,12 @@ class WorkspaceWidget(QWidget):
         self._mark_dirty()
         node = self.workspace.graph.nodes.get(node_id)
         if node:
-            self.status_message.emit(f"已添加算子：{node.display_title()}，连接输入后会自动计算")
+            if node.is_source:
+                self.status_message.emit(f"已添加图像节点：{node.display_title()}")
+            else:
+                self.status_message.emit(
+                    f"已添加算子：{node.display_title()}，连接输入后会自动计算"
+                )
         self.graph_view.fit_graph()
         self._emit_status()
 
@@ -582,6 +590,16 @@ class WorkspaceWidget(QWidget):
         if dst_node_id in self.workspace.graph.nodes:
             self.engine.invalidate(dst_node_id, downstream=True)
             self._pending_connection_roots.add(dst_node_id)
+            self._connection_update_timer.start()
+        self._emit_status()
+
+    def _on_source_images_changed(self, node_id: str) -> None:
+        """源节点图像矩阵被拖入新图后，让该节点与全部下游重新计算。"""
+
+        self._mark_dirty()
+        if node_id in self.workspace.graph.nodes:
+            self.engine.invalidate(node_id, downstream=True)
+            self._pending_connection_roots.add(node_id)
             self._connection_update_timer.start()
         self._emit_status()
 

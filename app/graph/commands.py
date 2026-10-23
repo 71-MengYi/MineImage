@@ -12,12 +12,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 from PySide6.QtGui import QUndoCommand
 
 from app.core.group import GroupPort
-from app.core.model import ConnectionModel, GraphError, GraphModel, NodeModel, new_id
+from app.core.model import ConnectionModel, GraphError, GraphModel, NodeModel, WorkspaceModel, new_id
 
 
 def _copy_node(node: NodeModel) -> NodeModel:
@@ -145,6 +145,107 @@ class RemoveNodeTreeCommand(QUndoCommand):
     def undo(self) -> None:
         for command in reversed(self._sub_commands):
             command.undo()
+
+
+class AppendSourceImagesCommand(QUndoCommand):
+    """把一张或多张图像追加到源节点的图像矩阵。
+
+    两种来源：
+    * 拖动缩略图副本：传入 images，首次 redo 时登记为新的工作区图像；
+    * 合并另一个源节点：传入已有的 image_ids，直接引用这些图像，不复制数组。
+
+    撤销只恢复源节点的图像 id 列表，工作区里的图像条目保留，保存工程时统一清理。
+    """
+
+    def __init__(
+        self,
+        workspace: WorkspaceModel,
+        graph: GraphModel,
+        node_id: str,
+        images: Sequence[Any] = (),
+        paths: Sequence[str | None] = (),
+        image_ids: Sequence[str] = (),
+        text: str = "合并图像",
+    ) -> None:
+        super().__init__(text)
+        self._workspace = workspace
+        self._graph = graph
+        self._node_id = node_id
+        node = graph.nodes.get(node_id)
+        self._old_ids = list(node.source_ids) if node is not None else []
+        self._images = [
+            image.copy() if hasattr(image, "copy") else image for image in images
+        ]
+        self._paths = list(paths)
+        if len(self._paths) < len(self._images):
+            self._paths.extend([None] * (len(self._images) - len(self._paths)))
+        self._new_ids = [str(image_id) for image_id in image_ids if image_id]
+
+    @property
+    def node_id(self) -> str:
+        return self._node_id
+
+    def redo(self) -> None:  # noqa: D401 - Qt 接口
+        node = self._graph.nodes.get(self._node_id)
+        if node is None or not node.is_source:
+            return
+        if not self._new_ids:
+            self._new_ids = [
+                self._workspace.store_image(image, self._paths[index])
+                for index, image in enumerate(self._images)
+            ]
+        elif self._images:
+            # 撤销后保存工程可能清理掉未被引用的图像；重做时按原顺序补登记。
+            for index, image in enumerate(self._images):
+                if index < len(self._new_ids) and self._new_ids[index] not in self._workspace.images:
+                    self._new_ids[index] = self._workspace.store_image(
+                        image.copy(), self._paths[index]
+                    )
+        if self._new_ids:
+            self._workspace.append_source_image_ids(self._node_id, self._new_ids)
+
+    def undo(self) -> None:
+        if self._node_id in self._graph.nodes:
+            self._workspace.set_source_image_ids(self._node_id, self._old_ids)
+
+
+class RemoveSourceImageCommand(QUndoCommand):
+    """从源节点的图像矩阵中删除一张子图（不删除工作区图像条目）。"""
+
+    def __init__(
+        self,
+        workspace: WorkspaceModel,
+        graph: GraphModel,
+        node_id: str,
+        image_id: str,
+        text: str = "删除子图",
+    ) -> None:
+        super().__init__(text)
+        self._workspace = workspace
+        self._graph = graph
+        self._node_id = node_id
+        node = graph.nodes.get(node_id)
+        self._old_ids = list(node.source_ids) if node is not None else []
+        self._new_ids = [item for item in self._old_ids if item != str(image_id)]
+
+    @property
+    def node_id(self) -> str:
+        return self._node_id
+
+    @property
+    def image_id(self) -> str:
+        return next(
+            (item for item in self._old_ids if item not in self._new_ids),
+            "",
+        )
+
+    def redo(self) -> None:  # noqa: D401 - Qt 接口
+        if self._node_id in self._graph.nodes and self._new_ids:
+            self._workspace.set_source_image_ids(self._node_id, self._new_ids)
+
+    def undo(self) -> None:
+        if self._node_id in self._graph.nodes and self._old_ids:
+            self._workspace.set_source_image_ids(self._node_id, self._old_ids)
 
 
 class AddConnectionCommand(QUndoCommand):
@@ -840,6 +941,7 @@ class DissolveGroupCommand(QUndoCommand):
 __all__ = [
     "AddConnectionCommand",
     "AddNodeCommand",
+    "AppendSourceImagesCommand",
     "DissolveGroupCommand",
     "InsertNodeOnEdgeCommand",
     "MoveNodeCommand",
@@ -847,6 +949,7 @@ __all__ = [
     "RemoveConnectionCommand",
     "RemoveNodeCommand",
     "RemoveNodeTreeCommand",
+    "RemoveSourceImageCommand",
     "RenameNodeCommand",
     "ReplaceOperatorCommand",
     "SetNodeParamsCommand",

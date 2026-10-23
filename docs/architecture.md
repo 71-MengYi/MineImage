@@ -75,7 +75,8 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   端口改为上输入 / 下输出，连线使用纵向三次贝塞尔曲线（`app/graph/curve.py`）；
   拖拽落点靠近端口时自动连线、落在连线上时自动插入节点，移动与连线命令合并为
   同一个撤销宏。`PortItem` 按 `DataType` 着色并过滤可连接端口：只有同类型端口
-  才能建立连线，图像端口还要求颜色空间有交集。
+  才能建立连线，图像端口还要求颜色空间有交集。缩略图拖出使用
+  `app/graph/image_drag.py` 的进程内 token 载荷，拖到源节点时追加其图像矩阵。
 * **界面**：`app/ui/*`，主窗口与工作区负责组装，其余控件保持可独立测试。
 * **ONNX 模型下载**：`app/core/models.py` 维护 OpenCV Zoo 模型清单（YuNet / SFace /
   MobileNetV2）、本地缓存目录与下载逻辑（进度 / 取消 / 原子落盘 / HTML 与 SHA-256
@@ -138,8 +139,10 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 * **工作区**：`WorkspaceModel.add_source_images(images, paths, ...)` 为每张图分配
   `img` id 并创建一个源节点；`add_source_image()` 委托给前者处理单图。
   `images_for_node(node)` 按 `source_ids` 顺序返回全部 `ImageData`，
-  `image_for_node()` 只返回第一张（兼容单图调用方）；`prune_unused_images()` 保留
-  所有被 `source_ids` 引用的图。
+  `image_for_node()` 只返回第一张（兼容单图调用方）。`store_image()` 登记拖动产生的
+  图像副本并返回新 id；`set_source_image_ids()` 校验并替换源节点图像列表，
+  `append_source_image_ids()` 去重追加，两者更新 revision 并发出 `node_changed`；
+  `prune_unused_images()` 保留所有被 `source_ids` 引用的图。
 * **工程格式**：`.mi` 的 `project.json` 记录源节点的 `source_image_ids`，图像仍逐张
   存为 `images/<image_id>.npz`；保存 / 打开不改变单图工程的文件结构，多图工程只是
   多几个 npz。`load_project()` 会校验每个源节点引用的图像都存在。
@@ -178,15 +181,18 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   `grid_columns()` 的列数规则为 1 张 1 列、2–4 张 2 列、5 张及以上 3 列（1 张实际
   仍走单图缩略图模式），单元格边长不超过缩略图设置，节点高度随行数增长。每格绘制
   缩略图、左上角序号与选中描边。
-* **命中测试**：`NodeItem.image_at(index)`、`image_tile_rects()` 暴露网格数据，
-  `image_index_at(QPointF)` 用单元格矩形返回序号（未命中 / 非网格返回 `None`）。
+* **命中测试与拖放 API**：`NodeItem.image_at(index)`、`image_tile_rects()`、
+  `image_pixmap(index)` 暴露网格数据；`image_index_at(QPointF)` 用单元格矩形返回
+  序号（未命中 / 非网格返回 `None`）。`image_drop_target` / `set_image_drop_target()`
+  控制合并目标的虚线蓝框与浅色遮罩。
 * **选中序号**：`_selected_image_index` 默认 0，`set_result()` 后按新张数 clamp，
   张数变少时尽量保留原索引；`set_selected_image_index(index)` 同样 clamp。
 * **点击语义**：`NodeItem.mousePressEvent` 先做 `image_index_at()`；命中时
   `_select_grid_image()` 只更新序号并经 `GraphView.on_node_image_selected()` 发射
   `node_image_selected(str, int)`，`accept()` 后直接返回，不经过 `QGraphicsItem`
   的选中 / 拖动逻辑。因此点缩略图不会选中节点、不会移动节点；双击缩略图也不会
-  打开参数面板。点击标题 / footer 等其它区域才交给基类选中节点。
+  打开参数面板。点击标题 / footer 等其它区域才交给基类选中节点。点选缩略图还会
+  记录子图目标并清空场景选择，以便 Delete / Backspace 删除该子图（见“子图删除”）。
 * **GraphView 接口**：`node_image_selected = Signal(str, int)`（节点 id、0 起序号）、
   `on_node_image_selected(item, index)`、`selected_image_index(node_id)`、
   `set_selected_image_index(node_id, index)`；`_recreate_node_item()` 重建条目时
@@ -198,6 +204,84 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   状态栏详情显示「图像矩阵 N 张 · 第 i/N 张 · 色彩空间 · dtype」。
   `_refresh_original()` 在结果节点上用结果节点的选中序号取源矩阵中的同一张（越界
   回退第一张），导出当前节点图像也取这一张。
+
+### 图像拖动与合并
+
+拖放实现主要在 `app/graph/image_drag.py`、`app/graph/node_item.py`、
+`app/graph/view.py`、`app/graph/commands.py` 与 `app/core/model.py`。
+
+* **载荷与 token**：`app/core/constants.py` 新增 `MIME_IMAGE_ITEM`；
+  `app/graph/image_drag.py` 定义不可变 `ImageDragPayload(image, name, path,
+  source_node_id, source_index, source_title)` 与模块级 token 注册表
+  `register / lookup / release / clear`。`QMimeData` 只携带
+  `{"token": "<id>"}`，拖入侧用 `token_from_mime()` / `payload_from_mime()`
+  查回完整载荷；解析同时兼容纯 token 与 `id` 字段。`GraphView.start_image_drag()`
+  在 `QDrag.exec()` 前登记 token、在 `finally` 中释放，因此 token 只覆盖一次拖放；
+  同一进程内的其它标签页 / 画布可以共享注册表。
+* **拖出图像副本**：`NodeItem` 在单图缩略图（`thumb`）和矩阵网格单元（`grid`）上
+  记录按下位置；移动距离达到 `QApplication.startDragDistance()` 后调用
+  `GraphView.start_image_drag(item, index)`。载荷中的 `image` 是
+  `ImageData.copy()` 的独立副本，QDrag 用 `NodeItem.image_pixmap(index)` 作为图标，
+  动作是 `CopyAction`。未超过阈值仍是原单击语义：矩阵格只选中该图，单图缩略图
+  选中节点。
+* **拖入空白 / 非源节点**：`dropEvent` 调用
+  `handle_image_drop(scene_pos, payload)`；落点不是原始图像节点（空白或普通算子 /
+  算子组）时，`workspace.store_image()` 登记副本，再用 `AddNodeCommand` 在落点
+  创建只引用该图的源节点，并发出 `node_created`。原节点不变；撤销一步删除新节点，
+  已登记但未被引用的图像条目保留到保存工程时由 `prune_unused_images()` 清理。
+* **拖入源节点追加**：落点是原始图像节点时，`handle_image_drop()` 用
+  `AppendSourceImagesCommand(images=[payload.image.copy()], paths=[payload.path])`
+  把副本追加到目标 `source_ids` 末尾（去重），原节点不变，目标节点被选中并发出
+  `source_images_changed(target_id)`。工作区 `_on_source_images_changed()` 使目标
+  节点与全部下游失效，并在 30ms 合并窗口后调用 `engine.update_nodes()` 重算。
+  若 `payload.source_node_id == target.id`（拖回来源源节点），不追加、只选中并提示。
+* **目标高亮**：`GraphView._source_item_at_scene()` 只把原始图像节点识别为拖入目标；
+  `_set_image_drop_target()` 保证同时只有一个目标，调用
+  `NodeItem.set_image_drop_target(True)` 绘制虚线蓝框 + 浅色遮罩，离开 / 松开 /
+  重建条目时清除。
+* **整体源节点合并**：一次只拖一个节点时，`_update_source_merge_target()` 用被拖
+  节点包围盒中心命中的另一个源节点作为候选；若被拖源节点存在 `outgoing` 连线，
+  候选转为“拒绝”状态且不高亮。`finish_move_tracking()` 在候选有效时调用
+  `merge_source_nodes(source_id, target_id)`：用
+  `beginMacro("合并图像节点")` 包住
+  `AppendSourceImagesCommand(image_ids=源节点 source_ids)` 与
+  `RemoveNodeCommand(源节点)`，目标按顺序引用已有图像条目（不复制数组、去重），
+  被拖节点删除，目标与下游重算；整次宏一步撤销可恢复两个节点和双方图像列表。源节点
+  有下游连线时拒绝合并，只做普通移动并提示「请先断开下游连线再合并」；多选拖动、
+  算子组拖动、非源节点目标都不触发整体合并。
+* **撤销与保存**：拖出副本到空白走 `AddNodeCommand`；追加 / 整体合并走
+  `AppendSourceImagesCommand`（`images` 参数首次 redo 时登记副本，`image_ids`
+  参数直接引用已有图），`undo()` 只恢复目标节点旧的 `source_image_ids`；因此
+  撤销后图像条目仍留在工作区，保存工程时由 `prune_unused_images()` 清理。
+* **限制**：`NodeItem` 只在 `thumb` / `grid` 内容模式下有可拖动缩略图；关闭节点
+  缩略图后不能从卡片拖出图像。拖动必须超过系统拖拽阈值；整体合并只对单个且无
+  下游连线的源节点生效。
+
+### 子图删除
+
+* **选中状态**：`GraphView.on_node_image_selected()` 在点选矩阵缩略图时清空画布
+  场景选择，并记录当前子图目标（节点 id / 序号）；`selected_subimage()` 返回
+  `(node_id, index)`，仅在节点仍为 `grid` 模式时有效。`set_selected_node()`、
+  单击空白、`Esc` 和场景选择变化都会 `_clear_selected_subimage()`，避免下一次
+  Delete 误删节点。
+* **删除路径**：`keyPressEvent()` 把 Delete / Backspace 交给 `delete_selected()`；
+  `_delete_selected_subimage()` 优先处理点选的子图。源节点图像矩阵构造
+  `RemoveSourceImageCommand(workspace, graph, node_id, image_id)`
+  （`app/graph/commands.py`）：`redo()` 通过
+  `WorkspaceModel.set_source_image_ids()` 写入删除后的列表（保留节点、其余图像
+  顺序不变），`undo()` 恢复旧列表；命令进入 `QUndoStack`，删除 / 撤销 / 重做都是
+  一步，工作区图像条目保留，保存工程时由 `prune_unused_images()` 清理。
+* **选中序号与预览**：删除后选中序号取 `min(old_index, remaining - 1)`（越界回退
+  最后一张），右侧预览和状态栏随工作区当前节点 / 序号更新；剩余多于 1 张时保留
+  子图选中状态，只剩 1 张时清除子图选中、选中节点并退回单图缩略图模式，之后再按
+  Delete 回到删除节点的原行为。
+* **结果节点**：`node.is_source` 为假时 `_delete_selected_subimage()` 只发出状态
+  提示「结果图像由算子计算生成，不能直接删除；请调整上游节点」并消费本次按键，
+  不删除结果、不写撤销栈。
+* **重算与回落**：删除完成后发出 `source_images_changed(node_id)`，工作区失效该源
+  节点与全部下游并在 30ms 合并窗口后重算；没有点选子图（或节点已不是 grid 模式）时
+  `_delete_selected_subimage()` 返回 `False`，`delete_selected()` 继续原来的节点 /
+  连线删除逻辑。
 
 ## 算子组节点与自定义算子
 
@@ -307,7 +391,10 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 | 操作 | 行为 |
 | --- | --- |
 | 单击节点 | `engine.preview_node(id)`：有同一 revision 快照立即回放；否则让该节点与全部下游失效，后台重算目标节点并递归重算全部下游 |
-| 单击矩阵缩略图 | 只切换当前显示的单图序号并刷新右侧预览；不改变节点选择、不触发重算，使用已有快照 |
+| 单击矩阵缩略图 | 只切换当前显示的单图序号并刷新右侧预览；不改变节点选择、不触发重算，使用已有快照；同时记录子图删除目标 |
+| 点选子图后 Delete / Backspace | `RemoveSourceImageCommand` 从源节点 `source_image_ids` 删除该张并保留节点；撤销恢复旧列表；`source_images_changed` 触发源节点与全部下游重算；结果节点只提示不能删 |
+| 拖出图像副本到空白 | `AddNodeCommand` 创建只含该副本的新源节点并选中；撤销删除节点，图像条目保留到保存时清理 |
+| 拖入源节点 / 整体合并源节点 | `AppendSourceImagesCommand` 更新目标 `source_image_ids`；`source_images_changed` 使目标与全部下游失效并在 30ms 合并窗口后重算；整体合并同时删除被拖节点，一步撤销可恢复 |
 | 参数拖动 | UI 防抖 120ms；更新模型参数后调用 `preview_node(id)`，实时重算当前节点并递归更新全部下游，不必先点“保存” |
 | 保存 | `engine.commit_node(id)`：强制使该节点与下游失效，并重算整棵下游子树（用于确认最终结果） |
 | 切换节点 | 与单击节点一致：有有效快照直接显示，否则 `preview_node(id)` 重算该节点与全部下游 |
@@ -357,6 +444,7 @@ GraphView(workspace: WorkspaceModel, registry: OperatorRegistry,
 
 selection_changed = Signal(str)       # "" 表示取消选择
 node_image_selected = Signal(str, int)  # 节点 id, 图像矩阵中的序号（0 起）
+source_images_changed = Signal(str)   # 源节点图像矩阵变化；参数为目标节点 id
 node_activated = Signal(str)          # 双击节点
 node_created = Signal(str)            # 画布内新增算子节点
 connection_changed = Signal(str)      # 目标节点 id；工作区失效其下游并在 30ms 内合并重算
@@ -374,6 +462,10 @@ selected_node_id() -> str | None
 set_selected_node(node_id: str) -> None
 selected_image_index(node_id: str) -> int     # 节点卡片当前选中的图像序号
 set_selected_image_index(node_id: str, index: int) -> None
+selected_subimage() -> tuple[str, int] | None  # 当前点选的子图（节点 id, 序号）
+start_image_drag(item: NodeItem, index: int) -> bool   # 从缩略图拖出图像副本
+handle_image_drop(scene_pos: QPointF, payload: ImageDragPayload) -> bool
+merge_source_nodes(source_id: str, target_id: str) -> bool
 copy_selected() -> bool              # Ctrl+C：复制选中节点及副本间连线；算子组会自动带上全部后代
 paste_nodes() -> list[str]           # Ctrl+V：粘贴并返回新节点 id，整次一步撤销
 auto_layout() -> None                # 顶层 + 各层算子组内部节点一起布局
@@ -572,9 +664,9 @@ apply_theme(app: QApplication) -> None
 
 | 范围 | 负责人 |
 | --- | --- |
-| `app/core/**`（含 `app/core/group.py`、`app/core/editor.py`、`app/core/operator_files.py`）, `app/operators/spec.py`, `app/operators/loader.py`, `app/operators/template.py`, `app/operators/group.py`, `app/config.py`, `app/ui/main_window.py`, `app/ui/workspace.py`, `app/main.py`, `pyproject.toml`, `tests/test_group.py`, `tests/test_group_integration.py`, `tests/test_image_matrix_core.py`, `tests/test_image_matrix_ui.py` | Lead |
+| `app/core/**`（含 `app/core/group.py`、`app/core/editor.py`、`app/core/operator_files.py`）, `app/operators/spec.py`, `app/operators/loader.py`, `app/operators/template.py`, `app/operators/group.py`, `app/config.py`, `app/ui/main_window.py`, `app/ui/workspace.py`, `app/main.py`, `pyproject.toml`, `tests/test_group.py`, `tests/test_group_integration.py`, `tests/test_image_matrix_core.py`, `tests/test_image_matrix_ui.py`, `tests/test_image_drag_core.py`, `tests/test_image_drag_ui.py`, `tests/test_image_delete.py` | Lead |
 | `app/engine/**`, `app/operators/builtin/**`, `tests/test_engine.py`, `tests/test_operators.py`, `tests/test_group_engine.py`, `tests/test_image_matrix_engine.py` | engine-ops |
-| `app/graph/**`（含 `app/graph/group_item.py`）, `tests/test_graph.py`, `tests/test_image_matrix_grid.py` | graph-ui |
+| `app/graph/**`（含 `app/graph/group_item.py`、`app/graph/image_drag.py`）, `tests/test_graph.py`, `tests/test_image_matrix_grid.py`, `tests/test_image_drag.py` | graph-ui |
 | `app/ui/preview.py`, `app/ui/display_modes.py`, `app/ui/library.py`, `app/ui/replace_operator.py`, `app/ui/params.py`, `app/ui/settings_dialog.py`, `app/ui/theme.py`, `tests/test_widgets.py` | shell-ui |
 | `docs/**`, `README.md`, `packaging/**`, `examples/**` | qa-docs |
 

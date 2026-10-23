@@ -10,6 +10,8 @@ APP_VERSION = "0.1.0"
 MIME_OPERATOR = "application/x-mineimage-operator"
 #: 从外部拖入图像文件时使用
 MIME_IMAGE_PATHS = "application/x-mineimage-image-paths"
+#: 从节点内部的图像矩阵缩略图拖出时使用，payload 为 UTF-8 JSON: {"token": "<临时载荷>"}
+MIME_IMAGE_ITEM = "application/x-mineimage-image-item"
 
 #: 源图像节点的 pseudo operator id
 SOURCE_OP_ID = "__source__"
