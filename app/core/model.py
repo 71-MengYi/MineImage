@@ -14,7 +14,12 @@ from typing import Any, Callable, Iterable
 
 from PySide6.QtCore import QObject, Signal
 
-from app.core.constants import GROUP_OP_ID, SOURCE_OP_ID
+from app.core.constants import (
+    DEFAULT_IMAGE_DISPLAY_MODE,
+    GROUP_OP_ID,
+    IMAGE_DISPLAY_MODES,
+    SOURCE_OP_ID,
+)
 from app.core.group import INVALID_LEVEL, GroupModel, GroupPort
 from app.core.types import ImageData
 
@@ -807,6 +812,7 @@ class WorkspaceModel(QObject):
         self.graph = GraphModel(self)
         self.images: "OrderedDict[str, ImageData]" = OrderedDict()
         self.image_paths: dict[str, str | None] = {}
+        self._display_mode = DEFAULT_IMAGE_DISPLAY_MODE
 
     @property
     def name(self) -> str:
@@ -818,6 +824,19 @@ class WorkspaceModel(QObject):
         if value != self._name:
             self._name = value
             self.name_changed.emit(value)
+
+    @property
+    def display_mode(self) -> str:
+        """预览显示模式；每个工作区独立保存，切换节点不会改变。"""
+
+        return self._display_mode
+
+    @display_mode.setter
+    def display_mode(self, mode: str) -> None:
+        normalized = str(mode or "").strip().lower()
+        if normalized not in IMAGE_DISPLAY_MODES:
+            normalized = DEFAULT_IMAGE_DISPLAY_MODE
+        self._display_mode = normalized
 
     def add_source_image(
         self,
@@ -854,6 +873,7 @@ class WorkspaceModel(QObject):
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
+            "display_mode": self.display_mode,
             "graph": self.graph.to_dict(),
             "images": [
                 {

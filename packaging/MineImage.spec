@@ -43,6 +43,7 @@ a = Analysis(
     hiddenimports=[
         "cv2",
         "PySide6.QtSvg",
+        "PySide6.QtOpenGL",
         # 目录算子在运行时按文件路径加载，但共享工具通过包导入访问。
         "app.operators.builtin.catalog",
         "app.operators.builtin.catalog._cv",

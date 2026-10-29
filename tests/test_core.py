@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -14,7 +16,15 @@ import numpy as np
 from app.core.imageio import load_image, save_image
 from app.core.model import GraphError, GraphModel, NodeModel, WorkspaceModel
 from app.core.project import ProjectFormatError, load_project, save_project
-from app.core.types import ImageData, PixelSample, sample_pixel, to_display_rgb
+from app.core.types import (
+    ImageData,
+    PixelSample,
+    image_intensity,
+    intensity_grid,
+    sample_pixel,
+    to_display_rgb,
+    to_scaled_rgb,
+)
 from app.operators.spec import (
     OperatorError,
     OperatorSpec,
@@ -197,6 +207,47 @@ class TestWorkspaceProject(TempDirMixin, unittest.TestCase):
         self.assertTrue(any(array.shape == (8, 9, 4) for array in arrays))
         self.assertEqual(len(loaded.images), 2)
 
+    def test_project_roundtrip_preserves_display_mode(self) -> None:
+        workspace = self._workspace()
+        self.assertEqual(workspace.display_mode, "imshow")
+        workspace.display_mode = "mesh"
+        path = save_project(self.unique("display_mode"), workspace)
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        loaded = load_project(path)
+        self.assertEqual(loaded.display_mode, "mesh")
+
+        data = workspace.to_dict()
+        self.assertEqual(data["display_mode"], "mesh")
+
+    def test_display_mode_validation(self) -> None:
+        workspace = WorkspaceModel("显示模式")
+        self.assertEqual(workspace.display_mode, "imshow")
+        workspace.display_mode = "MESH"
+        self.assertEqual(workspace.display_mode, "mesh")
+        workspace.display_mode = "imagesc"
+        self.assertEqual(workspace.display_mode, "imagesc")
+        workspace.display_mode = "unknown-mode"
+        self.assertEqual(workspace.display_mode, "imshow")
+        workspace.display_mode = ""
+        self.assertEqual(workspace.display_mode, "imshow")
+
+    def test_legacy_project_without_display_mode_defaults_to_imshow(self) -> None:
+        legacy = self.unique("legacy_display_mode.mi")
+        self.addCleanup(lambda: legacy.unlink(missing_ok=True))
+        document = {
+            "format": "mineimage-project",
+            "format_version": 1,
+            "workspace": {
+                "name": "旧工程",
+                "graph": {"nodes": [], "connections": []},
+                "images": [],
+            },
+        }
+        with zipfile.ZipFile(legacy, "w") as archive:
+            archive.writestr("project.json", json.dumps(document, ensure_ascii=False))
+        loaded = load_project(legacy)
+        self.assertEqual(loaded.display_mode, "imshow")
+
     def test_invalid_project(self) -> None:
         bad = self.unique("bad.mi")
         bad.write_bytes(b"not a zip")
@@ -263,6 +314,47 @@ class TestOperatorSpec(unittest.TestCase):
         )
         with self.assertRaises(OperatorError):
             validate_inputs(gray_spec, {"image": ImageData(np.zeros((2, 2, 3), np.uint8))})
+
+
+class TestDisplayMapping(unittest.TestCase):
+    """imagesc 伪彩色 / mesh 强度图的数值语义。"""
+
+    def test_imagesc_stretches_narrow_float_range(self) -> None:
+        value = np.linspace(1000.0, 1002.0, 32 * 24, dtype=np.float32).reshape(32, 24)
+        rgb = to_scaled_rgb(ImageData(value, "窄范围浮点"))
+        self.assertEqual(rgb.shape, (32, 24, 3))
+        self.assertEqual(rgb.dtype, np.uint8)
+        # 拉伸后应覆盖色带两端（而不是显示成近乎纯色的图）
+        first = rgb[0, 0].astype(int)
+        last = rgb[-1, -1].astype(int)
+        self.assertGreater(int(np.abs(first - last).sum()), 80)
+
+    def test_imagesc_constant_image_and_tiny_shapes_are_safe(self) -> None:
+        flat = to_scaled_rgb(ImageData(np.full((4, 5), 7, np.uint8)))
+        self.assertEqual(flat.shape, (4, 5, 3))
+        self.assertEqual(flat.dtype, np.uint8)
+        # 1×1 图与空图也不能抛异常
+        self.assertEqual(to_scaled_rgb(ImageData(np.zeros((1, 1, 3), np.uint8))).shape, (1, 1, 3))
+        self.assertEqual(to_scaled_rgb(ImageData(np.zeros((0, 0), np.uint8))).shape, (0, 0, 3))
+
+    def test_image_intensity_uses_bgr_luminance(self) -> None:
+        array = np.zeros((2, 2, 3), np.uint8)
+        array[:, :, 2] = 255  # BGR：R 通道
+        intensity = image_intensity(ImageData(array, "红"))
+        self.assertAlmostEqual(float(intensity[0, 0]), 0.299 * 255, delta=0.5)
+        gray = image_intensity(ImageData(np.full((2, 2), 42, np.uint8)))
+        self.assertAlmostEqual(float(gray[0, 0]), 42.0, places=3)
+        with self.assertRaises(ValueError):
+            image_intensity(np.zeros((2, 2, 2, 2), np.uint8))
+
+    def test_intensity_grid_downsamples_and_preserves_flat_values(self) -> None:
+        big = np.tile(np.linspace(0, 255, 256, dtype=np.float32), (256, 1))
+        grid = intensity_grid(ImageData(big), 48)
+        self.assertEqual(max(grid.shape), 48)
+        flat = intensity_grid(ImageData(np.full((100, 100), 33, np.uint8)), 16)
+        self.assertTrue(np.allclose(flat, 33.0))
+        small = intensity_grid(ImageData(np.arange(12, dtype=np.float32).reshape(3, 4)), 48)
+        self.assertEqual(small.shape, (3, 4))
 
 
 if __name__ == "__main__":

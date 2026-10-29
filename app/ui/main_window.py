@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QDialog,
     QDialogButtonBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -36,11 +37,16 @@ from app.config import (
     default_user_operator_dir,
     resource_root,
 )
-from app.core.constants import IMAGE_FILTER, PROJECT_FILTER
+from app.core.constants import (
+    DEFAULT_IMAGE_DISPLAY_MODE,
+    IMAGE_FILTER,
+    PROJECT_FILTER,
+)
 from app.core.logstore import LogStore
 from app.core.model import WorkspaceModel
 from app.core.project import ProjectFormatError, load_project
 from app.operators.loader import OperatorRegistry
+from app.ui.display_modes import DISPLAY_MODE_SPECS, display_mode_icon
 from app.ui.log_dialog import LogDialog
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.workspace import WorkspaceWidget
@@ -187,6 +193,27 @@ class MainWindow(QMainWindow):
             self.compare_group.addAction(action)
         self.act_compare_single.setChecked(True)
 
+        # 显示模式：Imshow / Imagesc / Mesh，按工作区保存；工具栏右侧为图标按钮组。
+        self.display_group = QActionGroup(self)
+        self.display_group.setExclusive(True)
+        self.display_actions: dict[str, QAction] = {}
+        for mode, title, tooltip in DISPLAY_MODE_SPECS:
+            action = QAction(title, self)
+            action.setIcon(display_mode_icon(mode))
+            action.setToolTip(tooltip)
+            action.setStatusTip(tooltip)
+            action.setCheckable(True)
+            action.setData(mode)
+            action.triggered.connect(
+                lambda _checked=False, target=mode: self._set_display_mode(target)
+            )
+            self.display_group.addAction(action)
+            self.display_actions[mode] = action
+        self.act_display_imshow = self.display_actions["imshow"]
+        self.act_display_imagesc = self.display_actions["imagesc"]
+        self.act_display_mesh = self.display_actions["mesh"]
+        self.act_display_imshow.setChecked(True)
+
         self.act_fit = self._action("适应窗口", self.fit_preview, "Ctrl+9", QStyle.StandardPixmap.SP_TitleBarMaxButton)
         self.act_actual = self._action("100% 显示", self.reset_preview_zoom, "Ctrl+0")
         self.act_thumbnails = self._action(
@@ -317,6 +344,10 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.act_compare_side)
         view_menu.addAction(self.act_compare_swipe)
         view_menu.addSeparator()
+        display_menu = view_menu.addMenu("显示模式")
+        for mode, _title, _tooltip in DISPLAY_MODE_SPECS:
+            display_menu.addAction(self.display_actions[mode])
+        view_menu.addSeparator()
         view_menu.addAction(self.act_fit)
         view_menu.addAction(self.act_actual)
         view_menu.addSeparator()
@@ -358,6 +389,27 @@ class MainWindow(QMainWindow):
                 toolbar.addSeparator()
             else:
                 toolbar.addAction(action)
+
+        # 右侧：显示模式按钮组（图标按钮，按工作区独立保存）。
+        spacer = QWidget(toolbar)
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        spacer.setMinimumWidth(12)
+        spacer.setAccessibleName("工具栏弹性占位")
+        toolbar.addWidget(spacer)
+        toolbar.addSeparator()
+        hint = QLabel("显示模式", toolbar)
+        hint.setObjectName("toolbarHintLabel")
+        hint.setToolTip("图像显示模式：Imshow / Imagesc / Mesh（每个工作区独立保存）")
+        toolbar.addWidget(hint)
+        for mode, title, tooltip in DISPLAY_MODE_SPECS:
+            action = self.display_actions[mode]
+            toolbar.addAction(action)
+            button = toolbar.widgetForAction(action)
+            if isinstance(button, QToolButton):
+                button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+                button.setObjectName("displayModeButton")
+                button.setAccessibleName(f"{title} 显示模式")
+                button.setToolTip(tooltip)
 
     def _create_statusbar(self) -> None:
         bar = self.statusBar()
@@ -413,6 +465,7 @@ class MainWindow(QMainWindow):
 
         self._workspaces.append(widget)
         self.tabs.setCurrentWidget(widget)
+        self._sync_display_mode_actions(widget)
         self._update_central()
         return widget
 
@@ -427,6 +480,8 @@ class MainWindow(QMainWindow):
         self.act_save.setEnabled(has_tabs)
         self.act_save_as.setEnabled(has_tabs)
         self.act_export.setEnabled(has_tabs)
+        for action in self.display_actions.values():
+            action.setEnabled(has_tabs)
         self._update_window_title()
 
     def _update_window_title(self) -> None:
@@ -461,6 +516,7 @@ class MainWindow(QMainWindow):
         widget = self._active_workspace()
         if widget is None:
             self._reset_status()
+            self._sync_display_mode_actions(None)
             self._update_window_title()
             self._refresh_edit_actions()
             return
@@ -470,6 +526,7 @@ class MainWindow(QMainWindow):
             "swipe": self.act_compare_swipe,
         }.get(widget.compare_mode, self.act_compare_single)
         action.setChecked(True)
+        self._sync_display_mode_actions(widget)
         widget.refresh_status()
         self._update_window_title()
         self._refresh_edit_actions()
@@ -484,6 +541,18 @@ class MainWindow(QMainWindow):
         widget = self._active_workspace()
         if widget is not None:
             widget.set_compare_mode(mode)
+
+    def _set_display_mode(self, mode: str) -> None:
+        widget = self._active_workspace()
+        if widget is None:
+            self._sync_display_mode_actions(None)
+            return
+        widget.set_display_mode(mode)
+
+    def _sync_display_mode_actions(self, widget: WorkspaceWidget | None) -> None:
+        mode = widget.display_mode if widget is not None else DEFAULT_IMAGE_DISPLAY_MODE
+        action = self.display_actions.get(mode, self.act_display_imshow)
+        action.setChecked(True)
 
     # ------------------------------------------------------------------ 文件操作
     def new_workspace(self) -> WorkspaceWidget:

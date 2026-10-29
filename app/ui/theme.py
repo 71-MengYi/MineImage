@@ -178,6 +178,29 @@ QToolButton:hover {{
 QToolButton:pressed {{
     background-color: #e2e8f0;
 }}
+/* 工具栏右侧的显示模式按钮组：图标按钮，选中态用浅蓝底强调。 */
+QToolButton#displayModeButton {{
+    padding: 5px 6px;
+    margin: 0 1px;
+    border-radius: 6px;
+}}
+QToolButton#displayModeButton:hover {{
+    background-color: #eef2f8;
+    border-color: {BORDER_SOFT};
+}}
+QToolButton#displayModeButton:checked {{
+    background-color: {ACCENT_SOFT};
+    border-color: #93c5fd;
+}}
+QToolButton#displayModeButton:checked:hover {{
+    background-color: #cfe0fb;
+    border-color: #60a5fa;
+}}
+QLabel#toolbarHintLabel {{
+    color: {TEXT_MUTED};
+    padding: 0 2px 0 5px;
+    font-size: 9pt;
+}}
 /* 算子库手风琴树：一级分类行由 item 背景色区分，叶子保持简洁。
    行底色统一由 _OperatorTree.drawRow 整行绘制，这里关掉 Qt 自带的
    “分支区 + 各列分别高亮”，避免缩进区出现多余的选中方框。 */

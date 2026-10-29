@@ -84,6 +84,7 @@ def save_project(path: str | Path, workspace: WorkspaceModel) -> Path:
         "app_version": APP_VERSION,
         "workspace": {
             "name": workspace.name,
+            "display_mode": workspace.display_mode,
             "graph": _jsonable(workspace.graph.to_dict()),
             "images": images_payload,
         },
@@ -138,6 +139,8 @@ def load_project(path: str | Path) -> WorkspaceModel:
 
         workspace_data = document.get("workspace") or {}
         workspace = WorkspaceModel(str(workspace_data.get("name") or source.stem))
+        # 旧工程没有 display_mode 字段，回退到默认 imshow。
+        workspace.display_mode = workspace_data.get("display_mode")
         for image_meta in workspace_data.get("images") or []:
             image_id = str(image_meta.get("id") or "")
             if not image_id:

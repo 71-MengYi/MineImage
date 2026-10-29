@@ -46,6 +46,14 @@ CATEGORY_ORDER = (
     "其他",
 )
 
+#: 预览图像显示模式：对应 MATLAB 的 imshow / imagesc / mesh。
+#: * imshow：按原始颜色 / 灰度显示；
+#: * imagesc：把数值范围映射到色带（伪彩色）；
+#: * mesh：以像素强度为高度绘制三维网格。
+IMAGE_DISPLAY_MODES = ("imshow", "imagesc", "mesh")
+#: 新工作区的默认显示模式。
+DEFAULT_IMAGE_DISPLAY_MODE = "imshow"
+
 #: 参数变更预览的默认防抖时长（毫秒）
 PARAM_DEBOUNCE_MS = 120
 #: 单击节点预览与双击进入参数面板的判定延迟（毫秒）

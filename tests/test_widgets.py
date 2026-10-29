@@ -27,6 +27,11 @@ from app.core.model import NodeModel
 from app.core.types import ImageData
 from app.operators.loader import OperatorRegistry
 from app.operators.spec import Operator, OperatorSpec, ParamSpec
+from app.ui.display_modes import (
+    DISPLAY_MODE_SPECS,
+    display_mode_icon,
+    display_mode_title,
+)
 from app.ui.library import OperatorLibrary
 from app.ui.params import ParamPanel
 from app.ui.preview import PreviewWidget
@@ -109,6 +114,26 @@ def _send_key(widget: QWidget, key: Qt.Key) -> None:
         widget,
         QKeyEvent(QEvent.Type.KeyPress, key, Qt.KeyboardModifier.NoModifier),
     )
+
+
+def _send_wheel(
+    widget: QWidget,
+    position: QPointF,
+    *,
+    delta_y: int = 120,
+    modifiers: Qt.KeyboardModifier = Qt.KeyboardModifier.NoModifier,
+) -> None:
+    event = QWheelEvent(
+        position,
+        widget.mapToGlobal(position),
+        QPoint(0, 0),
+        QPoint(0, delta_y),
+        Qt.MouseButton.NoButton,
+        modifiers,
+        Qt.ScrollPhase.NoScrollPhase,
+        False,
+    )
+    QApplication.sendEvent(widget, event)
 
 
 def _make_color_image(width: int = 200, height: int = 100, b: int = 10) -> ImageData:
@@ -316,11 +341,111 @@ class PreviewWidgetTests(unittest.TestCase):
         self.assertEqual(right_sample.values[2], 255.0)
         self.widget.grab()
 
+    def test_display_modes_switch_and_render(self) -> None:
+        self.widget.set_original_image(_make_color_image(b=0), "原始图像")
+        for mode in ("imagesc", "mesh"):
+            self.widget.set_display_mode(mode)
+            self.assertEqual(self.widget.display_mode(), mode)
+            self.widget.fit_to_window()
+            self.assertFalse(self.widget.grab().isNull())
+            for compare in ("side_by_side", "swipe"):
+                self.widget.set_compare_mode(compare)
+                self.assertFalse(self.widget.grab().isNull())
+            self.widget.set_compare_mode("single")
+        # 切换节点（重新 set_image）不重置显示模式
+        self.widget.set_display_mode("imagesc")
+        self.widget.set_image(_make_color_image(b=90))
+        self.assertEqual(self.widget.display_mode(), "imagesc")
+        # 非法值回退到 imshow
+        self.widget.set_display_mode("未知模式")
+        self.assertEqual(self.widget.display_mode(), "imshow")
+
+    def test_mesh_mode_disables_pixel_sampling_and_picking(self) -> None:
+        self.widget.fit_to_window()
+        spy = QSignalSpy(self.widget.pixel_info)
+        center = QPointF(self.widget.width() / 2.0, self.widget.height() / 2.0)
+        _mouse_event(self.widget, QEvent.Type.MouseMove, center)
+        self.assertIsNotNone(spy.at(spy.count() - 1)[0])
+        self.widget.set_display_mode("mesh")
+        self.assertIsNone(spy.at(spy.count() - 1)[0])
+        with self.assertRaises(ValueError):
+            self.widget.begin_pick("rect")
+        self.assertFalse(self.widget.is_picking())
+
+    def test_mesh_rotation_zoom_and_double_click_reset(self) -> None:
+        self.widget.set_display_mode("mesh")
+        self.widget.fit_to_window()
+        azimuth, elevation = self.widget.mesh_camera()
+        self.assertAlmostEqual(azimuth, -37.5, places=3)
+        self.assertAlmostEqual(elevation, 30.0, places=3)
+
+        start = QPointF(self.widget.width() / 2.0, self.widget.height() / 2.0)
+        _mouse_event(self.widget, QEvent.Type.MouseButtonPress, start)
+        _mouse_event(
+            self.widget,
+            QEvent.Type.MouseMove,
+            start + QPointF(80.0, 40.0),
+        )
+        _mouse_event(
+            self.widget,
+            QEvent.Type.MouseButtonRelease,
+            start + QPointF(80.0, 40.0),
+            buttons=Qt.MouseButton.NoButton,
+        )
+        rotated = self.widget.mesh_camera()
+        self.assertNotAlmostEqual(rotated[0], azimuth, places=2)
+        self.assertNotAlmostEqual(rotated[1], elevation, places=2)
+
+        zoom_before = self.widget.zoom_percent()
+        _send_wheel(self.widget, start)
+        self.assertGreater(self.widget.zoom_percent(), zoom_before)
+
+        double_click = QMouseEvent(
+            QEvent.Type.MouseButtonDblClick,
+            start,
+            self.widget.mapToGlobal(start),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(self.widget, double_click)
+        self.assertAlmostEqual(self.widget.mesh_camera()[0], -37.5, places=3)
+        self.assertAlmostEqual(self.widget.mesh_camera()[1], 30.0, places=3)
+
+    def test_mouse_wheel_without_ctrl_only_zooms_mesh(self) -> None:
+        center = QPointF(self.widget.width() / 2.0, self.widget.height() / 2.0)
+        zoom_before = self.widget.zoom_percent()
+        _send_wheel(self.widget, center)
+        self.assertAlmostEqual(self.widget.zoom_percent(), zoom_before, places=3)
+
+        self.widget.set_display_mode("mesh")
+        _send_wheel(self.widget, center)
+        self.assertGreater(self.widget.zoom_percent(), zoom_before)
+
     def test_empty_state_paints(self) -> None:
         self.widget.set_image(None)
         self.assertIsNone(self.widget.image_size())
         pixmap = self.widget.grab()
         self.assertFalse(pixmap.isNull())
+
+
+# ---------------------------------------------------------------------------
+# 显示模式图标
+# ---------------------------------------------------------------------------
+class DisplayModeIconTests(unittest.TestCase):
+    def test_three_modes_have_icons_and_titles(self) -> None:
+        modes = [mode for mode, _title, _tip in DISPLAY_MODE_SPECS]
+        self.assertEqual(modes, ["imshow", "imagesc", "mesh"])
+        for mode, title, tip in DISPLAY_MODE_SPECS:
+            icon = display_mode_icon(mode)
+            self.assertFalse(icon.isNull())
+            self.assertFalse(icon.pixmap(18, 18).isNull())
+            self.assertEqual(display_mode_title(mode), title)
+            self.assertTrue(tip)
+
+    def test_unknown_mode_falls_back_to_imshow(self) -> None:
+        self.assertEqual(display_mode_title("not-a-mode"), "Imshow")
+        self.assertFalse(display_mode_icon("not-a-mode").isNull())
 
 
 # ---------------------------------------------------------------------------

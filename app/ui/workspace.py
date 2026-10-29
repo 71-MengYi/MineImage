@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import AppSettings
+from app.core.constants import IMAGE_DISPLAY_MODES
 from app.core.imageio import ImageIOError, load_image, save_image
 from app.core.model import NodeModel, WorkspaceModel
 from app.core.project import save_project
@@ -24,6 +25,7 @@ from app.engine.engine import ExecutionEngine, NodeResult
 from app.graph.commands import MoveNodeCommand, SetNodeParamsCommand
 from app.graph.view import GraphView
 from app.operators.loader import OperatorRegistry
+from app.ui.display_modes import display_mode_title
 from app.ui.library import OperatorLibrary
 from app.ui.params import ParamPanel
 from app.ui.preview import PreviewWidget
@@ -142,6 +144,7 @@ class WorkspaceWidget(QWidget):
         center_layout.addWidget(self.center_stack)
 
         self.preview = PreviewWidget(self.splitter)
+        self.preview.set_display_mode(self.workspace.display_mode)
 
         self.splitter.addWidget(self.library)
         self.splitter.addWidget(self.center)
@@ -548,6 +551,9 @@ class WorkspaceWidget(QWidget):
         entry = self.registry.entry(node.op_id) if node else None
         if node is None or entry is None:
             return
+        if self.preview.display_mode() == "mesh":
+            self.status_message.emit("三维网格（mesh）模式下不支持拾取，请先切换到 Imshow / Imagesc")
+            return
         try:
             param = entry.spec.param(param_key)
         except KeyError:
@@ -677,6 +683,7 @@ class WorkspaceWidget(QWidget):
             "elapsed": f"{self._last_elapsed_ms:.1f} ms" if self._last_elapsed_ms is not None else "--",
             "busy": self.engine.busy,
             "mode": self._compare_mode,
+            "display": self.workspace.display_mode,
         }
         self.status_info.emit(info)
 
@@ -725,6 +732,28 @@ class WorkspaceWidget(QWidget):
     @property
     def compare_mode(self) -> str:
         return self._compare_mode
+
+    def set_display_mode(self, mode: str) -> None:
+        """切换当前工作区的预览显示模式（Imshow / Imagesc / Mesh）。
+
+        模式保存在 :class:`WorkspaceModel` 上，切换节点或对比布局都不会改变；
+        修改会标记工作区为已修改，以便随 ``.mi`` 工程一起保存。
+        """
+        normalized = str(mode or "").strip().lower()
+        if normalized not in IMAGE_DISPLAY_MODES:
+            return
+        if normalized == self.workspace.display_mode:
+            self.preview.set_display_mode(normalized)
+            return
+        self.workspace.display_mode = normalized
+        self.preview.set_display_mode(normalized)
+        self._mark_dirty()
+        self.status_message.emit(f"显示模式：{display_mode_title(normalized)}")
+        self._emit_status()
+
+    @property
+    def display_mode(self) -> str:
+        return self.workspace.display_mode
 
     def fit_preview(self) -> None:
         self.preview.fit_to_window()

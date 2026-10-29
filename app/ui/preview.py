@@ -3,7 +3,8 @@
 职责
 ----
 * 绘制 :class:`~app.core.types.ImageData`（BGR/BGRA/灰度 → 显示 RGB）；
-* 缩放 / 平移：``Ctrl + 滚轮`` 以光标为中心缩放，左键拖动平移；
+* 缩放 / 平移：二维模式下 ``Ctrl + 滚轮`` 缩放，左键拖动平移；
+* 显示模式：Imshow / Imagesc / Mesh；Mesh 支持拖动旋转、滚轮缩放、双击重置；
 * 对比：单图、左右对比、滑动对比（分割线以图像坐标保存，随缩放/平移对齐）；
 * 交互拾取：点集、矩形 ROI、直线，屏幕坐标与图像坐标双向映射；
 * 像素采样：通过 :func:`app.core.types.sample_pixel` 返回左上原点的行/列与原始值。
@@ -13,26 +14,53 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
+    QBrush,
     QColor,
     QFont,
     QFontMetrics,
+    QGuiApplication,
     QImage,
     QKeyEvent,
+    QLinearGradient,
     QMouseEvent,
+    QOffscreenSurface,
+    QOpenGLContext,
     QPainter,
+    QPainterPath,
     QPen,
+    QPolygonF,
+    QSurfaceFormat,
     QWheelEvent,
+)
+from PySide6.QtOpenGL import (
+    QOpenGLBuffer,
+    QOpenGLFramebufferObject,
+    QOpenGLFramebufferObjectFormat,
+    QOpenGLShader,
+    QOpenGLShaderProgram,
+    QOpenGLVertexArrayObject,
 )
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
-from app.core.types import ImageData, PixelSample, sample_pixel, to_display_rgb
+from app.core.constants import DEFAULT_IMAGE_DISPLAY_MODE, IMAGE_DISPLAY_MODES
+from app.core.types import (
+    ImageData,
+    PixelSample,
+    display_colormap_rgb,
+    intensity_grid,
+    sample_pixel,
+    to_display_rgb,
+    to_scaled_rgb,
+)
+from app.ui.display_modes import display_mode_title
 
 _MODES = ("single", "side_by_side", "swipe")
 _MODE_ALIASES = {
@@ -59,6 +87,92 @@ _TOOL_HINTS = {
     "line": "拖动拾取直线",
 }
 _PICK_TOOL_NAMES = {"points", "rect", "line"}
+_DISPLAY_MODE_ALIASES = {
+    "image": "imshow",
+    "2d": "imshow",
+    "二维": "imshow",
+    "colormap": "imagesc",
+    "伪彩色": "imagesc",
+    "3d": "mesh",
+    "网格": "mesh",
+}
+#: mesh 高度场的最长边采样数；块平均后再做平滑着色，避免出现明显多边形。
+_MESH_MAX_SIDE = 320
+#: 初始视角与 MATLAB `view(-37.5, 30)` 一致。
+_MESH_AZIMUTH = math.radians(-37.5)
+_MESH_ELEVATION = math.radians(30.0)
+#: 交互时允许的仰角范围（弧度）。
+_MESH_ELEVATION_MIN = math.radians(8.0)
+_MESH_ELEVATION_MAX = math.radians(82.0)
+#: 拖动旋转的灵敏度（弧度 / 屏幕像素）。
+_MESH_ROTATE_SPEED_X = math.radians(0.55)
+_MESH_ROTATE_SPEED_Y = math.radians(0.4)
+#: 曲面高度（相对图像宽高比）。
+_MESH_HEIGHT = 0.42
+#: 投影后内容占虚拟图像框的比例，留一点边距。
+_MESH_PADDING = 0.92
+#: 网格线目标数量（按数据网格固定间隔，缩放时线条间距随之放大）。
+_MESH_GRID_LINES = 30
+#: OpenGL FBO 超采样倍数上限与最大边长。
+_MESH_GL_SUPERSAMPLE = 2.0
+_MESH_GL_MAX_SIDE = 2400
+#: 软件回退时的采样上限（无 GL 环境下控制旋转 / 缩放的重绘耗时）。
+_MESH_SOFTWARE_MAX_SIDE = 160
+
+LOG = logging.getLogger(__name__)
+
+_GL_FLOAT = 0x1406
+_GL_TRIANGLE_STRIP = 0x0005
+_GL_DEPTH_TEST = 0x0B71
+_GL_LESS = 0x0201
+_GL_COLOR_BUFFER_BIT = 0x4000
+_GL_DEPTH_BUFFER_BIT = 0x0100
+
+#: mesh 曲面着色器：顶点直接输出屏幕 NDC；片元按插值的网格坐标画网格线，
+#: 网格线在片元阶段生成，天然具备深度消隐。
+_MESH_GL_VERTEX_SHADER = """
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aColor;
+layout(location = 2) in vec2 aCell;
+out vec3 vColor;
+out vec2 vCell;
+void main() {
+    vColor = aColor;
+    vCell = aCell;
+    gl_Position = vec4(aPos, 1.0);
+}
+"""
+
+_MESH_GL_FRAGMENT_SHADER = """
+#version 330 core
+in vec3 vColor;
+in vec2 vCell;
+uniform float uGridStep;
+uniform float uLineHalf;
+out vec4 fragColor;
+float lineMask(float value, float step, float halfWidth) {
+    float distance = abs(mod(value + step * 0.5, step) - step * 0.5);
+    return 1.0 - smoothstep(halfWidth * 0.5, halfWidth, distance);
+}
+void main() {
+    float line = max(lineMask(vCell.x, uGridStep, uLineHalf),
+                     lineMask(vCell.y, uGridStep, uLineHalf));
+    float luminance = dot(vColor, vec3(0.299, 0.587, 0.114));
+    // 深色曲面上用浅色网格线，浅色曲面上用深色网格线，保证两者都清晰。
+    vec3 gridColor = luminance > 0.42
+        ? vec3(0.10, 0.14, 0.20)
+        : vec3(0.84, 0.90, 0.97);
+    vec3 color = mix(vColor, gridColor, line * 0.55);
+    fragColor = vec4(color, 1.0);
+}
+"""
+
+
+def _normalize_display_mode(mode: str) -> str:
+    normalized = str(mode or "").strip().lower()
+    normalized = _DISPLAY_MODE_ALIASES.get(normalized, normalized)
+    return normalized if normalized in IMAGE_DISPLAY_MODES else DEFAULT_IMAGE_DISPLAY_MODE
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -80,6 +194,25 @@ class _Pane:
     qimage: QImage | None
     title: str
     kind: str  # current | original
+
+
+@dataclass
+class _MeshField:
+    """与相机无关的 mesh 数据：归一化高度场 + 已做明暗的色带颜色。"""
+
+    grid: np.ndarray  # (rows, cols) float32，0–1
+    colors: np.ndarray  # (rows, cols, 3) float32，0–255
+    width: int
+    height: int
+
+
+@dataclass
+class _MeshGeometry:
+    """mesh 模式下按当前视角预计算的投影网格。"""
+
+    points: np.ndarray  # (rows, cols, 2) float32
+    colors: np.ndarray  # (rows, cols, 3) float32
+    depth: np.ndarray  # (rows, cols) float32，视图方向深度（用于 GL 消隐）
 
 
 class PreviewWidget(QWidget):
@@ -119,6 +252,7 @@ class PreviewWidget(QWidget):
         self._info = ""
         self._original_title = "原始图像"
         self._mode = "single"
+        self._display_mode = DEFAULT_IMAGE_DISPLAY_MODE
         self._zoom = 1.0
         self._offset = QPointF(0.0, 0.0)
         self._auto_fit = True
@@ -128,6 +262,27 @@ class PreviewWidget(QWidget):
         self._quality_max_dim = 2048
         self._image_qimage: QImage | None = None
         self._original_qimage: QImage | None = None
+        # mesh 相机：方位角 / 仰角，初始与 MATLAB view(-37.5, 30) 一致。
+        self._mesh_azimuth = _MESH_AZIMUTH
+        self._mesh_elevation = _MESH_ELEVATION
+        self._mesh_rotating = False
+        self._mesh_rotate_last = QPointF()
+        # id(ImageData) -> (ImageData, _MeshField)；保留图像引用，避免 id 复用。
+        self._mesh_field_cache: dict[int, tuple[ImageData, _MeshField]] = {}
+        # (id(ImageData), 方位角, 仰角) -> (ImageData, _MeshGeometry)
+        self._mesh_cache: dict[tuple[int, float, float], tuple[ImageData, _MeshGeometry]] = {}
+        # OpenGL 离屏曲面渲染（懒初始化；失败时回退到软件条带渲染）。
+        self._gl_ready = False
+        self._gl_failed = False
+        self._gl_context: QOpenGLContext | None = None
+        self._gl_surface: QOffscreenSurface | None = None
+        self._gl_program: QOpenGLShaderProgram | None = None
+        self._gl_vbo: QOpenGLBuffer | None = None
+        self._gl_vao: QOpenGLVertexArrayObject | None = None
+        self._gl_fbo: QOpenGLFramebufferObject | None = None
+        self._gl_fbo_size = QSize(0, 0)
+        self._gl_grid_uniform = -1
+        self._gl_line_uniform = -1
 
         self._panning = False
         self._pan_last = QPointF()
@@ -206,6 +361,42 @@ class PreviewWidget(QWidget):
         if self._last_view_pos is not None:
             self._emit_pixel_info_at(self._last_view_pos)
 
+    def set_display_mode(self, mode: str) -> None:
+        """切换图像显示模式：``imshow`` / ``imagesc`` / ``mesh``。
+
+        与 :meth:`set_compare_mode`（单图 / 对比布局）相互独立：显示模式只
+        决定每幅图如何渲染，切换节点或对比布局都不会重置它。
+        """
+        normalized = _normalize_display_mode(mode)
+        if normalized == self._display_mode:
+            return
+        self._display_mode = normalized
+        self._image_qimage = self._build_qimage(self._image)
+        self._original_qimage = self._build_qimage(self._original)
+        self._mesh_rotating = False
+        if self._display_mode == "mesh" and self._pick_tool is not None:
+            self.cancel_pick()
+        self.update()
+        if self._last_view_pos is not None:
+            self._emit_pixel_info_at(self._last_view_pos)
+
+    def display_mode(self) -> str:
+        return self._display_mode
+
+    def mesh_camera(self) -> tuple[float, float]:
+        """返回 mesh 当前视角（方位角, 仰角），单位度。"""
+
+        return (math.degrees(self._mesh_azimuth), math.degrees(self._mesh_elevation))
+
+    def reset_mesh_view(self) -> None:
+        """恢复 mesh 默认视角并适应窗口。"""
+
+        self._mesh_azimuth = _MESH_AZIMUTH
+        self._mesh_elevation = _MESH_ELEVATION
+        self._mesh_rotating = False
+        self.fit_to_window()
+        self.update()
+
     def set_preview_quality(self, enabled: bool, max_dim: int) -> None:
         """仅影响显示分辨率的降采样设置，不改变引擎缓存。"""
         max_dim = max(32, int(max_dim or 2048))
@@ -227,6 +418,8 @@ class PreviewWidget(QWidget):
         normalized = _TOOL_ALIASES.get(str(tool), str(tool))
         if normalized not in _PICK_TOOL_NAMES:
             raise ValueError(f"不支持的拾取工具：{tool!r}")
+        if self._display_mode == "mesh":
+            raise ValueError("三维网格（mesh）模式下不支持拾取，请先切换到 Imshow / Imagesc")
         if self._pick_tool is not None:
             self.cancel_pick()
         self._pick_tool = normalized
@@ -347,6 +540,8 @@ class PreviewWidget(QWidget):
         else:
             self._paint_single(painter)
         self._paint_info_caption(painter)
+        if self._display_mode == "mesh":
+            self._paint_mesh_hint(painter)
         self._paint_pick_overlay(painter)
         painter.end()
 
@@ -387,7 +582,7 @@ class PreviewWidget(QWidget):
         if pane is None:
             return
         self._paint_pane_background(painter, QRectF(self.rect()).adjusted(4, 4, -4, -4))
-        if pane.image is not None and pane.qimage is not None:
+        if pane.image is not None:
             self._draw_pane_image(painter, pane)
 
     def _paint_side_by_side(self, painter: QPainter) -> None:
@@ -398,7 +593,7 @@ class PreviewWidget(QWidget):
                 seam = pane.rect.left() - 5.0
                 painter.drawLine(QPointF(seam, 8.0), QPointF(seam, self.height() - 8.0))
             self._paint_pane_background(painter, pane.rect)
-            if pane.image is not None and pane.qimage is not None:
+            if pane.image is not None:
                 self._draw_pane_image(painter, pane)
             title = pane.title or ("原始图像" if pane.kind == "original" else "当前结果")
             lines = [title]
@@ -420,24 +615,31 @@ class PreviewWidget(QWidget):
             return
         pane = panes[0]
         self._paint_pane_background(painter, QRectF(self.rect()).adjusted(4, 4, -4, -4))
-        if pane.image is not None and pane.qimage is not None:
+        if pane.image is not None:
             self._draw_pane_image(painter, pane)
 
         both = self._original is not None and self._image is not None
-        if both and self._original_qimage is not None:
-            divider = self._divider_view_x()
-            clip_left = QRectF(pane.rect.left(), pane.rect.top(), max(0.0, divider - pane.rect.left()), pane.rect.height())
-            painter.save()
-            painter.setClipRect(clip_left)
+        if both:
             original = self._original
             assert original is not None
-            target = QRectF(
-                pane.offset.x(),
-                pane.offset.y(),
-                original.width * self._zoom,
-                original.height * self._zoom,
+            divider = self._divider_view_x()
+            clip_left = QRectF(
+                pane.rect.left(),
+                pane.rect.top(),
+                max(0.0, divider - pane.rect.left()),
+                pane.rect.height(),
             )
-            painter.drawImage(target, self._original_qimage)
+            painter.save()
+            painter.setClipRect(clip_left)
+            original_pane = _Pane(
+                rect=pane.rect,
+                offset=QPointF(pane.offset),
+                image=original,
+                qimage=self._original_qimage,
+                title=self._original_title,
+                kind="original",
+            )
+            self._draw_pane_image(painter, original_pane)
             painter.restore()
 
             # 分割线 + 手柄
@@ -506,8 +708,13 @@ class PreviewWidget(QWidget):
 
     def _draw_pane_image(self, painter: QPainter, pane: _Pane) -> None:
         image = pane.image
+        if image is None:
+            return
+        if self._display_mode == "mesh":
+            self._draw_mesh(painter, pane)
+            return
         qimage = pane.qimage
-        if image is None or qimage is None:
+        if qimage is None:
             return
         target = QRectF(
             pane.offset.x(),
@@ -528,6 +735,567 @@ class PreviewWidget(QWidget):
         painter.drawRect(target)
         painter.restore()
 
+    # ------------------------------------------------------------ 三维网格
+    def _mesh_field_for(self, image: ImageData | None) -> _MeshField | None:
+        """缓存与相机无关的高度场 / 颜色；旋转时不会重复降采样原图。"""
+
+        if image is None or image.width <= 0 or image.height <= 0:
+            return None
+        key = id(image)
+        cached = self._mesh_field_cache.get(key)
+        if cached is not None and cached[0] is image:
+            return cached[1]
+        field = self._build_mesh_field(image)
+        if field is None:
+            return None
+        self._mesh_field_cache[key] = (image, field)
+        while len(self._mesh_field_cache) > 4:
+            self._mesh_field_cache.pop(next(iter(self._mesh_field_cache)))
+        return field
+
+    def _build_mesh_field(self, image: ImageData) -> _MeshField | None:
+        grid = intensity_grid(image, _MESH_MAX_SIDE).astype(np.float32)
+        if grid.size == 0:
+            return None
+        low = float(np.min(grid))
+        high = float(np.max(grid))
+        if high > low:
+            normalized = (grid - low) / (high - low)
+        else:
+            normalized = np.zeros_like(grid)
+        colors = self._shade_mesh_colors(normalized)
+        return _MeshField(normalized, colors, image.width, image.height)
+
+    @staticmethod
+    def _shade_mesh_colors(normalized: np.ndarray) -> np.ndarray:
+        """按高度梯度做简单的漫反射着色，让曲面看起来连续而不是平坦多边形。"""
+
+        colors = display_colormap_rgb(normalized).astype(np.float32)
+        gradient_y, gradient_x = np.gradient(normalized.astype(np.float32))
+        rows, cols = normalized.shape
+        slope_x = gradient_x * max(1, cols) * 0.55
+        slope_y = gradient_y * max(1, rows) * 0.55
+        normal_x = -slope_x
+        normal_y = -slope_y
+        normal_z = np.ones_like(normalized)
+        length = np.sqrt(normal_x * normal_x + normal_y * normal_y + normal_z * normal_z)
+        light = np.asarray([-0.42, -0.52, 0.74], dtype=np.float32)
+        light /= float(np.linalg.norm(light))
+        diffuse = (
+            normal_x * light[0] + normal_y * light[1] + normal_z * light[2]
+        ) / np.maximum(length, 1e-6)
+        shade = 0.68 + 0.32 * np.clip(diffuse, 0.0, 1.0)
+        return np.clip(colors * shade[:, :, None], 0.0, 255.0)
+
+    def _mesh_geometry_for(self, image: ImageData | None) -> _MeshGeometry | None:
+        """按（图像, 方位角, 仰角）缓存投影网格。"""
+
+        field = self._mesh_field_for(image)
+        if field is None or image is None:
+            return None
+        key = (id(image), round(self._mesh_azimuth, 5), round(self._mesh_elevation, 5))
+        cached = self._mesh_cache.get(key)
+        if cached is not None and cached[0] is image:
+            return cached[1]
+        geometry = self._project_mesh_field(field)
+        if geometry is None:
+            return None
+        self._mesh_cache[key] = (image, geometry)
+        while len(self._mesh_cache) > 8:
+            self._mesh_cache.pop(next(iter(self._mesh_cache)))
+        return geometry
+
+    def _project_mesh_field(self, field: _MeshField) -> _MeshGeometry | None:
+        grid = field.grid
+        row_count, col_count = grid.shape
+        if row_count <= 0 or col_count <= 0:
+            return None
+        xs = np.linspace(-0.5, 0.5, col_count, dtype=np.float32)
+        ys = np.linspace(-0.5, 0.5, row_count, dtype=np.float32)
+        grid_x, grid_y = np.meshgrid(xs, ys)
+        grid_z = (grid - 0.5) * _MESH_HEIGHT
+
+        cos_az = math.cos(self._mesh_azimuth)
+        sin_az = math.sin(self._mesh_azimuth)
+        cos_el = math.cos(self._mesh_elevation)
+        sin_el = math.sin(self._mesh_elevation)
+        projected_x = grid_x * cos_az - grid_y * sin_az
+        rotated_y = grid_x * sin_az + grid_y * cos_az
+        projected_y = rotated_y * sin_el - grid_z * cos_el
+        view_depth = rotated_y * cos_el + grid_z * sin_el
+
+        span_x = max(1e-6, float(projected_x.max() - projected_x.min()))
+        span_y = max(1e-6, float(projected_y.max() - projected_y.min()))
+        scale = min(
+            (float(field.width) * _MESH_PADDING) / span_x,
+            (float(field.height) * _MESH_PADDING) / span_y,
+        )
+        points = np.empty((row_count, col_count, 2), dtype=np.float32)
+        points[:, :, 0] = (projected_x - projected_x.min()) * scale + (
+            float(field.width) - span_x * scale
+        ) / 2.0
+        points[:, :, 1] = (projected_y - projected_y.min()) * scale + (
+            float(field.height) - span_y * scale
+        ) / 2.0
+        return _MeshGeometry(
+            points=points,
+            colors=field.colors,
+            depth=view_depth.astype(np.float32),
+        )
+
+    def _draw_mesh(self, painter: QPainter, pane: _Pane) -> None:
+        geometry = self._mesh_geometry_for(pane.image)
+        if geometry is None:
+            return
+        if self._render_mesh_gl(painter, pane, geometry):
+            return
+        self._draw_mesh_software(painter, pane, geometry)
+
+    # -------------------------------------------------------- OpenGL 曲面
+    def _ensure_mesh_gl(self) -> bool:
+        """懒初始化离屏 OpenGL；不可用时静默回退到软件渲染。"""
+
+        if self._gl_ready:
+            return True
+        if self._gl_failed:
+            return False
+        app = QGuiApplication.instance()
+        if app is not None and app.platformName().lower() in {"offscreen", "minimal"}:
+            # 离屏平台没有 GL 上下文，直接使用软件回退，避免无意义的警告。
+            self._gl_failed = True
+            return False
+        context: QOpenGLContext | None = None
+        try:
+            fmt = QSurfaceFormat()
+            fmt.setVersion(3, 3)
+            fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
+            fmt.setDepthBufferSize(24)
+            fmt.setSamples(0)
+            context = QOpenGLContext(self)
+            context.setFormat(fmt)
+            if not context.create():
+                raise RuntimeError("无法创建 OpenGL 3.3 上下文")
+            surface = QOffscreenSurface(None, self)
+            surface.setFormat(context.format())
+            surface.create()
+            if not surface.isValid():
+                raise RuntimeError("无法创建 OpenGL 离屏表面")
+            if not context.makeCurrent(surface):
+                raise RuntimeError("无法激活 OpenGL 上下文")
+
+            program = QOpenGLShaderProgram(self)
+            if not program.addShaderFromSourceCode(
+                QOpenGLShader.ShaderTypeBit.Vertex, _MESH_GL_VERTEX_SHADER
+            ):
+                raise RuntimeError(program.log())
+            if not program.addShaderFromSourceCode(
+                QOpenGLShader.ShaderTypeBit.Fragment, _MESH_GL_FRAGMENT_SHADER
+            ):
+                raise RuntimeError(program.log())
+            if not program.link():
+                raise RuntimeError(program.log())
+            vbo = QOpenGLBuffer(QOpenGLBuffer.Type.VertexBuffer)
+            if not vbo.create():
+                raise RuntimeError("无法创建顶点缓冲")
+            vao = QOpenGLVertexArrayObject(self)
+            if not vao.create():
+                raise RuntimeError("无法创建顶点数组对象")
+            vao.bind()
+            vbo.bind()
+            program.bind()
+            program.enableAttributeArray(0)
+            program.setAttributeBuffer(0, _GL_FLOAT, 0, 3, 8 * 4)
+            program.enableAttributeArray(1)
+            program.setAttributeBuffer(1, _GL_FLOAT, 3 * 4, 3, 8 * 4)
+            program.enableAttributeArray(2)
+            program.setAttributeBuffer(2, _GL_FLOAT, 6 * 4, 2, 8 * 4)
+            vao.release()
+            program.release()
+
+            self._gl_context = context
+            self._gl_surface = surface
+            self._gl_program = program
+            self._gl_vbo = vbo
+            self._gl_vao = vao
+            self._gl_grid_uniform = program.uniformLocation(b"uGridStep")
+            self._gl_line_uniform = program.uniformLocation(b"uLineHalf")
+            self._gl_ready = True
+            self._gl_failed = False
+            return True
+        except Exception as exc:  # noqa: BLE001 - GL 不可用时必须安静回退
+            LOG.info("mesh OpenGL 渲染不可用，改用软件渲染：%s", exc)
+            self._gl_failed = True
+            self._gl_ready = False
+            return False
+        finally:
+            if context is not None:
+                try:
+                    context.doneCurrent()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _render_mesh_gl(
+        self, painter: QPainter, pane: _Pane, geometry: _MeshGeometry
+    ) -> bool:
+        """用离屏 GL 渲染曲面，返回是否成功（失败后本控件永久回退软件渲染）。"""
+
+        if not self._ensure_mesh_gl():
+            return False
+        context = self._gl_context
+        surface = self._gl_surface
+        program = self._gl_program
+        vbo = self._gl_vbo
+        vao = self._gl_vao
+        if context is None or surface is None or program is None or vbo is None or vao is None:
+            return False
+        width = float(pane.rect.width())
+        height = float(pane.rect.height())
+        if width < 2.0 or height < 2.0:
+            return False
+        try:
+            if not context.makeCurrent(surface):
+                raise RuntimeError("无法激活 OpenGL 上下文")
+            scale = min(
+                _MESH_GL_SUPERSAMPLE,
+                max(0.5, _MESH_GL_MAX_SIDE / max(width, height)),
+            )
+            fbo_size = QSize(
+                max(1, int(round(width * scale))),
+                max(1, int(round(height * scale))),
+            )
+            if self._gl_fbo is None or self._gl_fbo_size != fbo_size:
+                fbo_format = QOpenGLFramebufferObjectFormat()
+                fbo_format.setAttachment(QOpenGLFramebufferObject.Attachment.Depth)
+                fbo_format.setSamples(4)
+                framebuffer = QOpenGLFramebufferObject(fbo_size, fbo_format)
+                if not framebuffer.isValid():
+                    raise RuntimeError("无法创建 OpenGL 帧缓冲")
+                self._gl_fbo = framebuffer
+                self._gl_fbo_size = fbo_size
+            framebuffer = self._gl_fbo
+            if framebuffer is None:
+                return False
+            framebuffer.bind()
+
+            data, row_count, col_count = self._build_mesh_gl_vertices(
+                geometry, pane, width, height
+            )
+            line_half = _clamp(0.45 / max(1.0, self._zoom), 0.12, 0.5)
+            grid_step = float(
+                max(1, int(round(max(row_count, col_count) / float(_MESH_GRID_LINES))))
+            )
+
+            gl = context.functions()
+            gl.glViewport(0, 0, fbo_size.width(), fbo_size.height())
+            gl.glClearColor(0.0, 0.0, 0.0, 0.0)
+            gl.glEnable(_GL_DEPTH_TEST)
+            gl.glDepthFunc(_GL_LESS)
+            gl.glClear(_GL_COLOR_BUFFER_BIT | _GL_DEPTH_BUFFER_BIT)
+            program.bind()
+            gl.glUniform1f(self._gl_grid_uniform, grid_step)
+            gl.glUniform1f(self._gl_line_uniform, float(line_half))
+            raw = data.tobytes()
+            vbo.bind()
+            vbo.allocate(raw, len(raw))
+            vao.bind()
+            vertices_per_strip = 2 * col_count
+            offset = 0
+            for _ in range(row_count - 1):
+                gl.glDrawArrays(_GL_TRIANGLE_STRIP, offset, vertices_per_strip)
+                offset += vertices_per_strip
+            vao.release()
+            program.release()
+            vbo.release()
+            image = framebuffer.toImage()
+            framebuffer.release()
+            context.doneCurrent()
+            if image.isNull():
+                raise RuntimeError("OpenGL 帧缓冲读回失败")
+            painter.save()
+            painter.setClipRect(pane.rect)
+            painter.drawImage(QRectF(pane.rect), image)
+            painter.restore()
+            return True
+        except Exception as exc:  # noqa: BLE001 - 回退软件渲染
+            LOG.info("mesh OpenGL 渲染失败，改用软件渲染：%s", exc)
+            self._gl_failed = True
+            self._gl_ready = False
+            try:
+                context.doneCurrent()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+
+    def _build_mesh_gl_vertices(
+        self, geometry: _MeshGeometry, pane: _Pane, width: float, height: float
+    ) -> tuple[np.ndarray, int, int]:
+        """把投影网格组装成 GL 三角形条带顶点（位置 NDC + 颜色 + 网格坐标）。"""
+
+        points = geometry.points
+        colors = geometry.colors
+        depth = geometry.depth
+        row_count, col_count = points.shape[:2]
+        if row_count < 2 or col_count < 2:
+            return np.zeros((0, 8), dtype=np.float32), row_count, col_count
+        zoom = self._zoom
+        local_x = (
+            points[:, :, 0] * zoom + pane.offset.x() - float(pane.rect.left())
+        ) / max(1.0, float(width))
+        local_y = (
+            points[:, :, 1] * zoom + pane.offset.y() - float(pane.rect.top())
+        ) / max(1.0, float(height))
+        low = float(np.min(depth))
+        high = float(np.max(depth))
+        if high > low:
+            # OpenGL 的窗口深度越小越靠近相机；view_depth 越大越靠近相机，
+            # 因此这里做一次翻转，保证 GL_LESS 消隐的是背面。
+            depth_ndc = 1.0 - (depth - low) / (high - low) * 2.0
+        else:
+            depth_ndc = np.zeros_like(depth)
+        full = np.empty((row_count, col_count, 8), dtype=np.float32)
+        full[:, :, 0] = local_x * 2.0 - 1.0
+        full[:, :, 1] = 1.0 - local_y * 2.0
+        full[:, :, 2] = depth_ndc
+        full[:, :, 3:6] = colors * (1.0 / 255.0)
+        full[:, :, 6] = np.arange(col_count, dtype=np.float32)[None, :]
+        full[:, :, 7] = np.arange(row_count, dtype=np.float32)[:, None]
+        strips = np.empty((row_count - 1, 2 * col_count, 8), dtype=np.float32)
+        strips[:, 0::2, :] = full[:-1]
+        strips[:, 1::2, :] = full[1:]
+        return np.ascontiguousarray(strips), row_count, col_count
+
+    # ------------------------------------------------------ 软件回退渲染
+    def _draw_mesh_software(
+        self, painter: QPainter, pane: _Pane, geometry: _MeshGeometry
+    ) -> None:
+        points = geometry.points
+        colors = geometry.colors
+        row_count, col_count = points.shape[:2]
+        if row_count < 2 or col_count < 2:
+            self._draw_mesh_fallback(painter, pane, points, colors)
+            return
+        stride = max(
+            1,
+            int(math.ceil(max(row_count, col_count) / float(_MESH_SOFTWARE_MAX_SIDE))),
+        )
+        if stride > 1:
+            points = points[::stride, ::stride]
+            colors = colors[::stride, ::stride]
+            row_count, col_count = points.shape[:2]
+            if row_count < 2 or col_count < 2:
+                self._draw_mesh_fallback(painter, pane, points, colors)
+                return
+        zoom = self._zoom
+        screen = np.empty_like(points)
+        screen[:, :, 0] = points[:, :, 0] * zoom + pane.offset.x()
+        screen[:, :, 1] = points[:, :, 1] * zoom + pane.offset.y()
+        step = max(1, int(round(max(row_count, col_count) / float(_MESH_GRID_LINES))))
+        line_width = _clamp(zoom * 0.55, 0.55, 1.35)
+        cos_az = math.cos(self._mesh_azimuth)
+        sin_az = math.sin(self._mesh_azimuth)
+        painter.save()
+        painter.setClipRect(pane.rect)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if abs(sin_az) <= abs(cos_az):
+            order = range(row_count - 1) if cos_az >= 0 else range(row_count - 2, -1, -1)
+            for index in order:
+                self._draw_mesh_strip(
+                    painter,
+                    pane,
+                    screen[index, :, :],
+                    screen[index + 1, :, :],
+                    colors[index, :, :],
+                    colors[index + 1, :, :],
+                    index,
+                    step,
+                    line_width,
+                )
+        else:
+            order = range(col_count - 1) if sin_az >= 0 else range(col_count - 2, -1, -1)
+            for index in order:
+                self._draw_mesh_strip(
+                    painter,
+                    pane,
+                    screen[:, index, :],
+                    screen[:, index + 1, :],
+                    colors[:, index, :],
+                    colors[:, index + 1, :],
+                    index,
+                    step,
+                    line_width,
+                )
+        painter.restore()
+
+    def _draw_mesh_strip(
+        self,
+        painter: QPainter,
+        pane: _Pane,
+        line_a: np.ndarray,
+        line_b: np.ndarray,
+        colors_a: np.ndarray,
+        colors_b: np.ndarray,
+        secondary_index: int,
+        step: int,
+        line_width: float,
+    ) -> None:
+        """画一条连续的曲面条带（两排高度点之间），再叠加网格线。"""
+
+        point_count = len(line_a)
+        if point_count < 2:
+            return
+        xs = np.concatenate((line_a[:, 0], line_b[:, 0]))
+        ys = np.concatenate((line_a[:, 1], line_b[:, 1]))
+        if (
+            float(xs.max()) < pane.rect.left()
+            or float(xs.min()) > pane.rect.right()
+            or float(ys.max()) < pane.rect.top()
+            or float(ys.min()) > pane.rect.bottom()
+        ):
+            return
+
+        polygon = QPolygonF(
+            [QPointF(float(x), float(y)) for x, y in line_a]
+            + [QPointF(float(x), float(y)) for x, y in line_b[::-1]]
+        )
+        first = QPointF(float(line_a[0, 0]), float(line_a[0, 1]))
+        last = QPointF(float(line_a[-1, 0]), float(line_a[-1, 1]))
+        if first == last:
+            mean = (colors_a.mean(axis=0) + colors_b.mean(axis=0)) / 2.0
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(int(mean[0]), int(mean[1]), int(mean[2])))
+        else:
+            gradient = QLinearGradient(first, last)
+            stride = max(1, point_count // 64)
+            last_index = max(1, point_count - 1)
+            for index in range(0, point_count, stride):
+                color = (colors_a[index] + colors_b[index]) * 0.5
+                gradient.setColorAt(
+                    index / last_index,
+                    QColor(int(color[0]), int(color[1]), int(color[2])),
+                )
+            color = (colors_a[-1] + colors_b[-1]) * 0.5
+            gradient.setColorAt(1.0, QColor(int(color[0]), int(color[1]), int(color[2])))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(gradient))
+        painter.drawPolygon(polygon)
+
+        path = QPainterPath()
+        if secondary_index % step == 0:
+            path.moveTo(first)
+            for x, y in line_a[1:]:
+                path.lineTo(QPointF(float(x), float(y)))
+        for index in range(0, point_count, step):
+            path.moveTo(QPointF(float(line_a[index, 0]), float(line_a[index, 1])))
+            path.lineTo(QPointF(float(line_b[index, 0]), float(line_b[index, 1])))
+        if not path.isEmpty():
+            painter.setPen(QPen(QColor(30, 41, 59, 80), line_width))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(path)
+
+    def _draw_mesh_fallback(
+        self,
+        painter: QPainter,
+        pane: _Pane,
+        points: np.ndarray,
+        colors: np.ndarray,
+    ) -> None:
+        """退化网格（单行 / 单列）无法构面片时，仍按折线绘制。"""
+
+        painter.save()
+        painter.setClipRect(pane.rect)
+        line_width = _clamp(self._zoom * 0.9, 0.6, 2.0)
+        if points.shape[0] >= 2:
+            for col in range(points.shape[1]):
+                self._draw_mesh_line(
+                    painter, pane, points[:, col, :], colors[:, col, :], line_width
+                )
+        elif points.shape[1] >= 2:
+            for row in range(points.shape[0]):
+                self._draw_mesh_line(
+                    painter, pane, points[row, :, :], colors[row, :, :], line_width
+                )
+        else:
+            self._draw_mesh_line(painter, pane, points[0, :, :], colors[0, :, :], line_width)
+        painter.restore()
+
+    def _draw_mesh_line(
+        self,
+        painter: QPainter,
+        pane: _Pane,
+        points: np.ndarray,
+        colors: np.ndarray,
+        width: float,
+    ) -> None:
+        if len(points) < 1:
+            return
+        if len(points) == 1:
+            point = points[0]
+            color = colors[0]
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(int(color[0]), int(color[1]), int(color[2])))
+            radius = max(1.5, width * 1.4)
+            painter.drawEllipse(
+                QPointF(
+                    pane.offset.x() + float(point[0]) * self._zoom,
+                    pane.offset.y() + float(point[1]) * self._zoom,
+                ),
+                radius,
+                radius,
+            )
+            return
+        polygon = QPolygonF(
+            [
+                QPointF(
+                    pane.offset.x() + float(point[0]) * self._zoom,
+                    pane.offset.y() + float(point[1]) * self._zoom,
+                )
+                for point in points
+            ]
+        )
+        first = polygon.at(0)
+        last = polygon.at(len(polygon) - 1)
+        if first == last:
+            pen = QPen(QColor(int(colors[0][0]), int(colors[0][1]), int(colors[0][2])), width)
+        else:
+            gradient = QLinearGradient(first, last)
+            last_index = max(1, len(colors) - 1)
+            for index, color in enumerate(colors):
+                gradient.setColorAt(
+                    index / last_index,
+                    QColor(int(color[0]), int(color[1]), int(color[2])),
+                )
+            pen = QPen(QBrush(gradient), width)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPolyline(polygon)
+
+    def _paint_mesh_hint(self, painter: QPainter) -> None:
+        """mesh 模式左下角的操作提示与当前视角。"""
+
+        if self._image is None and self._original is None:
+            return
+        azimuth = math.degrees(self._mesh_azimuth) % 360.0
+        if azimuth > 180.0:
+            azimuth -= 360.0
+        lines = [
+            "Mesh · 左键拖动旋转 · 滚轮缩放",
+            (
+                f"Shift/右键拖动平移 · 双击重置 · "
+                f"方位 {azimuth:.0f}° / 仰角 {math.degrees(self._mesh_elevation):.0f}°"
+            ),
+        ]
+        max_width = max(120.0, self.width() * 0.62)
+        rect = self._chip_rect(painter, lines, max_width=max_width)
+        self._paint_chip(
+            painter,
+            rect,
+            lines,
+            12.0,
+            self.height() - 12.0,
+            align_bottom=True,
+        )
+
     def _paint_info_caption(self, painter: QPainter) -> None:
         lines: list[str] = []
         title = self._node_title or (
@@ -540,10 +1308,12 @@ class PreviewWidget(QWidget):
         image = self._image or self._original
         if image is not None:
             zoom_text = f"{self.zoom_percent():.0f}%"
+            mode_text = display_mode_title(self._display_mode)
+            suffix = f" · {mode_text}" if self._display_mode != "imshow" else ""
             if len(lines) < 2:
-                lines.append(f"{image.width}×{image.height} · {zoom_text}")
+                lines.append(f"{image.width}×{image.height} · {zoom_text}{suffix}")
             else:
-                lines.append(f"{zoom_text} · {image.width}×{image.height}")
+                lines.append(f"{zoom_text} · {image.width}×{image.height}{suffix}")
         if not lines:
             return
         max_width = max(120.0, self.width() - 24.0)
@@ -801,10 +1571,13 @@ class PreviewWidget(QWidget):
         return pane.offset.x() + value * self._zoom
 
     def _build_qimage(self, image: ImageData | None) -> QImage | None:
-        if image is None:
+        if image is None or self._display_mode == "mesh":
             return None
         max_dim = self._quality_max_dim if self._quality_enabled else None
-        rgb = to_display_rgb(image, max_dim=max_dim)
+        if self._display_mode == "imagesc":
+            rgb = to_scaled_rgb(image, max_dim=max_dim)
+        else:
+            rgb = to_display_rgb(image, max_dim=max_dim)
         height, width = rgb.shape[:2]
         if height <= 0 or width <= 0:
             return None
@@ -828,7 +1601,11 @@ class PreviewWidget(QWidget):
         if self._image is None and self._original is None:
             event.ignore()
             return
-        if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+        # mesh 是三维视图：滚轮直接缩放；二维模式仍保持 Ctrl+滚轮，避免误触。
+        mesh_mode = self._display_mode == "mesh"
+        if not mesh_mode and not (
+            event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
             event.ignore()
             return
         steps = event.angleDelta().y() / 120.0
@@ -860,6 +1637,28 @@ class PreviewWidget(QWidget):
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt 命名
         self.setFocus(Qt.FocusReason.MouseFocusReason)
         position = event.position()
+        if self._display_mode == "mesh" and (
+            self._image is not None or self._original is not None
+        ):
+            # mesh：左键拖动旋转，Shift+左键或右键拖动平移。
+            if event.button() == Qt.MouseButton.LeftButton:
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    self._panning = True
+                    self._pan_last = position
+                    self._auto_fit = False
+                else:
+                    self._mesh_rotating = True
+                    self._mesh_rotate_last = position
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+            if event.button() in (Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton):
+                self._panning = True
+                self._pan_last = position
+                self._auto_fit = False
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
         if event.button() == Qt.MouseButton.RightButton:
             if self._pick_tool is not None:
                 if self._pick_tool == "points":
@@ -913,6 +1712,17 @@ class PreviewWidget(QWidget):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt 命名
         position = event.position()
         self._last_view_pos = QPointF(position)
+        if self._mesh_rotating:
+            delta = position - self._mesh_rotate_last
+            self._mesh_rotate_last = position
+            self._mesh_azimuth -= delta.x() * _MESH_ROTATE_SPEED_X
+            self._mesh_elevation = _clamp(
+                self._mesh_elevation + delta.y() * _MESH_ROTATE_SPEED_Y,
+                _MESH_ELEVATION_MIN,
+                _MESH_ELEVATION_MAX,
+            )
+            self.update()
+            return
         if self._dragging_divider:
             pane = self._panes()[0] if self._panes() else None
             image = self._image or self._original
@@ -935,6 +1745,11 @@ class PreviewWidget(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt 命名
         position = event.position()
+        if self._mesh_rotating and event.button() == Qt.MouseButton.LeftButton:
+            self._mesh_rotating = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             if self._dragging_divider:
                 self._dragging_divider = False
@@ -955,7 +1770,27 @@ class PreviewWidget(QWidget):
                 )
                 event.accept()
                 return
+        elif event.button() in (
+            Qt.MouseButton.RightButton,
+            Qt.MouseButton.MiddleButton,
+        ) and self._panning:
+            self._panning = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt 命名
+        # mesh：双击恢复默认视角与适应窗口，方便旋转/缩放后快速回到初始状态。
+        if (
+            self._display_mode == "mesh"
+            and event.button() == Qt.MouseButton.LeftButton
+            and (self._image is not None or self._original is not None)
+        ):
+            self.reset_mesh_view()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def leaveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         self._last_view_pos = None
@@ -1085,6 +1920,9 @@ class PreviewWidget(QWidget):
 
     def _sample_at(self, position: QPointF) -> PixelSample | None:
         if self._image is None and self._original is None:
+            return None
+        # 三维网格是投影视图，屏幕坐标不再对应图像行列，不做像素采样。
+        if self._display_mode == "mesh":
             return None
         if (
             self._mode == "swipe"

@@ -10,7 +10,7 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
                                   ├── OperatorLibrary  左侧算子库（搜索/整行折叠一级分类/多级折叠树/拖拽/说明浮层）
                                   ├── GraphView        中间节点画布  ←→ GraphModel
                                   ├── ParamPanel       中间叠层（双击节点进入）
-                                  ├── PreviewWidget    右侧预览（缩放/平移/对比/交互拾取）
+                                  ├── PreviewWidget    右侧预览（缩放/平移/对比/拾取、Imshow/Imagesc/Mesh）
                                   └── ExecutionEngine  后台计算 + 节点快照
                                            ↑
                                   OperatorRegistry（自动扫描 app/operators/builtin + 用户目录）
@@ -18,7 +18,8 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 
 * **模型**：`app/core/model.py`。`WorkspaceModel` 持有 `GraphModel` 与源图像
   `images: dict[str, ImageData]`。节点参数变化通过 `NodeModel.touch()` 增加
-  `revision`。引擎用 revision 丢弃过期结果。
+  `revision`。引擎用 revision 丢弃过期结果。`WorkspaceModel.display_mode` 保存
+  工作区级预览显示模式（`imshow` / `imagesc` / `mesh`），随 `.mi` 工程持久化。
 * **端口数据类型**：`app/core/data_types.py` 是端口类型的唯一来源。`DataType`
   定义 `image / number / edges / contours / components` 五种类型；
   `NumberValue / EdgesData / ContoursData / ComponentsData` 是结构化值的运行时
@@ -356,6 +357,10 @@ operator_ids() -> list[str]        # 列表中的算子 id（已排除算子组�
 set_image(image: ImageData | None, node_title: str = "", info: str = "") -> None
 set_original_image(image: ImageData | None, title: str = "原始图像") -> None
 set_compare_mode(mode: str) -> None          # single | side_by_side | swipe
+set_display_mode(mode: str) -> None          # imshow | imagesc | mesh
+display_mode() -> str
+mesh_camera() -> tuple[float, float]          # 方位角, 仰角（度）
+reset_mesh_view() -> None                     # 恢复默认视角并 fit
 set_preview_quality(enabled: bool, max_dim: int) -> None
 set_auto_fit_on_open(enabled: bool) -> None  # 首次/尺寸变化时是否 fit
 begin_pick(tool: str, count: int = 1, initial=None) -> None
@@ -370,6 +375,19 @@ zoom_changed = Signal(float)
 pick_finished = Signal(str, object)          # tool, points/roi/line payload
 pick_cancelled = Signal(str)
 ```
+
+显示模式与对比布局相互独立：`imshow` 按原始颜色 / 灰度显示；`imagesc` 用
+`app.core.types.to_scaled_rgb()` 把数据 min/max 拉伸后套用 parula 色带；`mesh`
+用 `app.core.types.intensity_grid()` 把强度降采样（最长边 320）成高度场，按
+方位角 / 仰角投影成平滑着色曲面，网格线在片元着色器中生成，天然带深度消隐。
+
+* mesh 优先用**离屏 OpenGL 3.3** 渲染（2× 超采样 + 4× MSAA FBO，MSAA 读回后
+  缩放回面板）；上下文不可用时自动回退到软件条带渲染（降采样到 160 边）。
+* 交互：左键拖动旋转、滚轮直接缩放、`Shift+左键` / 右键拖动平移、双击恢复
+  默认视角并适应窗口；二维模式仍是 `Ctrl+滚轮` 缩放、左键平移。
+* mesh 的投影坐标仍落在图像宽高组成的虚拟框内，因此复用同一套
+  `fit_to_window` / 缩放 / 平移逻辑；像素采样与交互拾取在 mesh 模式下不适用
+  （采样返回 `None`，`begin_pick` 抛 `ValueError`，由工作区提示用户切回前两种模式）。
 
 交互拾取数据：
 
@@ -413,7 +431,7 @@ apply_theme(app: QApplication) -> None
 | `app/core/**`（含 `app/core/group.py`）, `app/operators/spec.py`, `app/operators/loader.py`, `app/operators/group.py`, `app/config.py`, `app/ui/main_window.py`, `app/ui/workspace.py`, `app/main.py`, `pyproject.toml`, `tests/test_group.py`, `tests/test_group_integration.py` | Lead |
 | `app/engine/**`, `app/operators/builtin/**`, `tests/test_engine.py`, `tests/test_operators.py`, `tests/test_group_engine.py` | engine-ops |
 | `app/graph/**`（含 `app/graph/group_item.py`）, `tests/test_graph.py` | graph-ui |
-| `app/ui/preview.py`, `app/ui/library.py`, `app/ui/replace_operator.py`, `app/ui/params.py`, `app/ui/settings_dialog.py`, `app/ui/theme.py`, `tests/test_widgets.py` | shell-ui |
+| `app/ui/preview.py`, `app/ui/display_modes.py`, `app/ui/library.py`, `app/ui/replace_operator.py`, `app/ui/params.py`, `app/ui/settings_dialog.py`, `app/ui/theme.py`, `tests/test_widgets.py` | shell-ui |
 | `docs/**`, `README.md`, `packaging/**`, `examples/**` | qa-docs |
 
 禁止跨范围修改；需要改别人的文件时先给 Lead 发消息。

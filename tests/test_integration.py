@@ -107,6 +107,65 @@ class MainWindowIntegrationTests(unittest.TestCase):
         self.assertGreater(sizes[1], sizes[0] * 1.5)
         self.assertGreater(sizes[2], sizes[1] * 1.5)
 
+    def test_display_mode_toolbar_and_workspace_isolation(self) -> None:
+        toolbar = self.win.findChild(QToolBar, "mainToolBar")
+        self.assertIsNotNone(toolbar)
+        assert toolbar is not None
+        toolbar_actions = [action for action in toolbar.actions() if not action.isSeparator()]
+        for mode in ("imshow", "imagesc", "mesh"):
+            action = self.win.display_actions[mode]
+            self.assertIn(action, toolbar_actions)
+            self.assertFalse(action.icon().isNull())
+
+        widget = self._open()
+        self.assertEqual(widget.display_mode, "imshow")
+        self.assertTrue(self.win.act_display_imshow.isChecked())
+
+        # 切换到 mesh：工作区 + 预览都生效，并标记为未保存修改
+        self.win.act_display_mesh.trigger()
+        _APP.processEvents()
+        self.assertEqual(widget.display_mode, "mesh")
+        self.assertEqual(widget.preview.display_mode(), "mesh")
+        self.assertTrue(self.win.act_display_mesh.isChecked())
+        self.assertTrue(widget.dirty)
+
+        # 切换节点不改变当前工作区的显示模式
+        gray_id = widget.graph_view.add_operator_at("basic.grayscale")
+        self.assertIsNotNone(gray_id)
+        widget._on_node_selected(gray_id)
+        self.assertEqual(widget.display_mode, "mesh")
+        self.assertEqual(widget.preview.display_mode(), "mesh")
+
+        # 新工作区使用默认 imshow，两个工作区分别保存
+        second = self.win.new_workspace()
+        self.assertEqual(second.display_mode, "imshow")
+        self.assertTrue(self.win.act_display_imshow.isChecked())
+        self.win.act_display_imagesc.trigger()
+        _APP.processEvents()
+        self.assertEqual(second.display_mode, "imagesc")
+        self.assertEqual(widget.display_mode, "mesh")
+
+        self.win.tabs.setCurrentWidget(widget)
+        _APP.processEvents()
+        self.assertTrue(self.win.act_display_mesh.isChecked())
+        self.win.tabs.setCurrentWidget(second)
+        _APP.processEvents()
+        self.assertTrue(self.win.act_display_imagesc.isChecked())
+
+        # 显示模式随 .mi 工程保存与恢复
+        path = _TMP / f"display_mode_{uuid.uuid4().hex[:8]}.mi"
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        widget.mark_clean()
+        widget.save_to(path)
+        self.win.open_project_path(path)
+        _APP.processEvents()
+        loaded = self.win._active_workspace()
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded.display_mode, "mesh")
+        self.assertEqual(loaded.preview.display_mode(), "mesh")
+        self.assertTrue(self.win.act_display_mesh.isChecked())
+
     def test_copy_paste_nodes_in_workspace(self) -> None:
         widget = self._open()
         graph = widget.workspace.graph

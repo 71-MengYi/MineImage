@@ -201,6 +201,95 @@ def to_display_rgb(image: ImageData | np.ndarray, max_dim: int | None = None) ->
     return np.ascontiguousarray(rgb)
 
 
+#: imagesc 显示模式使用的色带；优先 MATLAB 默认的 parula。
+_DISPLAY_COLORMAP = getattr(cv2, "COLORMAP_PARULA", cv2.COLORMAP_JET)
+
+
+def image_intensity(image: ImageData | np.ndarray) -> np.ndarray:
+    """返回单通道 ``float32`` 强度图，供 imagesc / mesh 显示模式使用。
+
+    彩色按 BGR 亮度权重（0.114 B + 0.587 G + 0.299 R）折算；alpha 忽略；
+    NaN / Inf 归零，避免归一化时污染整幅图。
+    """
+
+    array = image.array if isinstance(image, ImageData) else np.asarray(image)
+    if array.ndim == 3 and array.shape[2] == 1:
+        array = array[:, :, 0]
+    if array.ndim == 2:
+        work = array.astype(np.float32)
+    elif array.ndim == 3:
+        if array.shape[2] >= 3:
+            blue = array[:, :, 0].astype(np.float32)
+            green = array[:, :, 1].astype(np.float32)
+            red = array[:, :, 2].astype(np.float32)
+            work = blue * 0.114 + green * 0.587 + red * 0.299
+        else:
+            work = array[:, :, 0].astype(np.float32)
+    else:
+        raise ValueError(f"无法解析形状为 {array.shape} 的图像强度")
+    return np.nan_to_num(work, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def display_colormap_rgb(values: np.ndarray) -> np.ndarray:
+    """把 0–1 的强度数组映射为 RGB uint8（imagesc / mesh 共用色带）。"""
+
+    normalized = np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+    scaled = np.clip(normalized * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    colored = cv2.applyColorMap(scaled, _DISPLAY_COLORMAP)
+    return np.ascontiguousarray(colored[:, :, ::-1])
+
+
+def intensity_grid(image: ImageData | np.ndarray, max_side: int = 64) -> np.ndarray:
+    """把强度图按块平均降采样，最长边不超过 ``max_side``。
+
+    mesh 模式用它生成高度场：块平均能压住单像素噪声 / 高光造成的尖刺，
+    比直接抽点更接近 MATLAB ``mesh`` 在平滑数据上的观感。
+    """
+
+    work = image_intensity(image)
+    height, width = work.shape[:2]
+    if height <= 0 or width <= 0:
+        return work
+    limit = max(2, int(max_side))
+    longest = max(height, width)
+    if longest <= limit:
+        return work
+    scale = limit / float(longest)
+    target = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+    return cv2.resize(work, target, interpolation=cv2.INTER_AREA)
+
+
+
+def to_scaled_rgb(image: ImageData | np.ndarray, max_dim: int | None = None) -> np.ndarray:
+    """生成 imagesc 模式使用的伪彩色 RGB uint8 数组 ``(H, W, 3)``。
+
+    与 :func:`to_display_rgb` 不同，这里把整幅图的强度按 **数据 min/max**
+    拉伸到 0–255 后再套用色带（对应 MATLAB ``imagesc`` + colorbar 的语义），
+    因此数值范围很窄的浮点图也能看清结构。``max_dim`` 只影响显示分辨率。
+    """
+
+    work = image_intensity(image)
+    if work.size == 0:
+        height = 0 if work.ndim < 1 else int(work.shape[0])
+        width = 0 if work.ndim < 2 else int(work.shape[1])
+        return np.zeros((max(0, height), max(0, width), 3), dtype=np.uint8)
+    low = float(np.min(work))
+    high = float(np.max(work))
+    if high > low:
+        work = (work - low) / (high - low)
+    else:
+        work = np.zeros_like(work)
+    work = np.clip(work, 0.0, 1.0)
+    if max_dim and max_dim > 0:
+        height, width = work.shape[:2]
+        longest = max(height, width)
+        if longest > max_dim:
+            scale = max_dim / float(longest)
+            new_size = (max(1, int(round(width * scale))), max(1, int(round(height * scale))))
+            work = cv2.resize(work, new_size, interpolation=cv2.INTER_AREA)
+    return display_colormap_rgb(work)
+
+
 def make_thumbnail(image: ImageData | np.ndarray, box: int = 72) -> np.ndarray:
     """生成缩略图 RGB uint8，保持比例，最长边不超过 ``box``。"""
     rgb = to_display_rgb(image)
