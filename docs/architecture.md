@@ -53,9 +53,12 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   `params['key']`，**不支持** `params.key` 属性访问；表达式异常时按 True 处理。
 * **引擎**：`app/engine/engine.py`。每次请求在主线程抓取一份不可变的图快照，再在
   后台线程池中按 DAG 拓扑序提交节点任务：兄弟分支并行执行，有依赖的节点等待上游
-  future 完成；`update_nodes` / `preview_node` / `commit_node` 递归重算目标节点与
-  全部下游，`refresh_node` 只重算单个节点。结果按 `generation + revision` 双重
-  校验丢弃过期写回，节点错误按分支隔离。算子 `process()` 会被多个线程并发调用，
+  future 完成；拓扑排序用 FIFO Kahn 展开，按“到源节点的层数”逐层向下（广度优先）。
+  `update_nodes` / `preview_node` / `commit_node` 递归重算目标节点与全部下游，
+  `refresh_node` 只重算单个节点；`precompute_all` 在打开工程后以全部节点为根、一次
+  算完整张图（含未接线节点与算子组容器），`chain_finished` 只按末端节点报告。结果
+  按 `generation + revision` 双重校验丢弃过期写回，节点错误按分支隔离。算子
+  `process()` 会被多个线程并发调用，
   必须线程安全（无实例可变状态、不原地修改输入）。默认并行度为
   `min(4, CPU 核数)`（1–16，`execution/workers` 可调）。发出
   `node_started/node_finished/node_failed/chain_finished/busy_changed`。
@@ -223,14 +226,15 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 | 断开算子组端口 | 若端口内外两侧都已无连线，回收已定类型端口并让空闲待定端口顶替其 key；撤销删除连线会恢复端口快照 |
 | 拖动节点进 / 出算子组 | 跨层连线自动改接组边界端口：优先复用空闲端口（待定端口 / 旧版本遗留的已定类型空闲端口），并按节点输入 / 输出声明顺序分配端口；整次拖动一步撤销 |
 | 复制粘贴节点 | 新节点与副本间连线一步入栈；连线事件按 30ms 合并后重算新节点及相关下游 |
-| 打开工程 | 重新创建引擎并清空缓存 |
+| 打开工程 | 重新创建引擎并清空缓存；随后 `precompute_all()` 以全部节点为根、按广度优先层序一次算完每个子树（含未接线节点与算子组容器），结果与缩略图不再需要手动点击触发；`chain_finished` 只对每个末端节点报告一次 |
 | 并行 worker 配置 | `execution/workers`（设置 → 常规 → 后台计算 → 并行线程数）：默认 `min(4, CPU 核数)`，范围 1–16；只影响后续请求，不打断正在运行的任务 |
 
 后台任务由 generation 编号；新请求会取消旧任务，旧结果不得写入界面。一次请求内部
 按 DAG 拓扑序把互不依赖的分支并行提交到多线程执行器：兄弟分支真正同时运行，有
 依赖的节点等待上游 future；错误按分支隔离，某分支失败不会中断其它分支，上游失败
-的下游节点显示“上游节点执行失败”。正在执行的算子不可中断：取消后当前算子会跑完，
-但其结果由 generation 丢弃。
+的下游节点显示“上游节点执行失败”。拓扑排序使用 FIFO Kahn，出队顺序按到源节点的
+层数分层，即广度优先；打开工程时的整图预计算同样按该层序提交。正在执行的算子不可
+中断：取消后当前算子会跑完，但其结果由 generation 丢弃。
 
 ## 应用日志
 
@@ -309,6 +313,7 @@ preview_node(node_id) -> None          # 快照命中直接回放；否则递归
 commit_node(node_id) -> None           # 失效该节点与下游并强制重算整棵子树
 refresh_node(node_id) -> None          # 只重算单个节点（上游按需补齐）
 update_nodes(node_ids) -> None         # 批量根节点：一次快照、一次请求重算各自子树
+precompute_all() -> None               # 打开工程后：作废旧快照，按广度优先算完整张图
 invalidate(node_id, *, downstream=True) -> None
 invalidate_all() -> None
 set_workers(count: int) -> None        # 1..16，只影响后续请求

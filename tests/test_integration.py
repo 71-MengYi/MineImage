@@ -273,6 +273,41 @@ class MainWindowIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(loaded.engine.result(loaded._current_node_id))
         loaded.mark_clean()
 
+    def test_open_project_precomputes_every_subtree(self) -> None:
+        widget = self._open()
+        graph = widget.workspace.graph
+        source = graph.source_nodes()[0]
+        gray = widget.graph_view.add_operator_at("basic.grayscale")
+        self.assertIsNotNone(gray)
+        graph.add_connection(source.id, "image", gray, "image")
+        invert = widget.graph_view.add_operator_at("basic.invert")
+        self.assertIsNotNone(invert)
+        graph.add_connection(source.id, "image", invert, "image")
+        blur = widget.graph_view.add_operator_at("filter.gaussian_blur")
+        self.assertIsNotNone(blur)
+        graph.add_connection(gray, "image", blur, "image")
+
+        project = _TMP / f"precompute_{uuid.uuid4().hex[:8]}.mi"
+        self.addCleanup(lambda: project.unlink(missing_ok=True))
+        widget.save_to(project)
+        self.win.open_project_path(project)
+        loaded = self.win._active_workspace()
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self._wait_idle(loaded)
+
+        nodes = list(loaded.workspace.graph.nodes.values())
+        self.assertEqual(len(nodes), 4)
+        # 打开工程后每个子树的所有节点都已有结果，包括没有默认选中的反相
+        # 分支；结果 / 缩略图不需要再靠手动点击触发。
+        for node in nodes:
+            self.assertIsNotNone(
+                loaded.engine.result(node.id),
+                f"打开工程后节点未预计算：{node.display_title()}",
+            )
+        self.assertEqual(loaded._current_node_id, blur)
+        self.assertIsNotNone(loaded.preview.image_size())
+
     def test_interactive_roi_pick_updates_params_and_preview(self) -> None:
         from PySide6.QtCore import QPoint, Qt
         from PySide6.QtWidgets import QPushButton

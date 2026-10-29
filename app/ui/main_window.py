@@ -642,14 +642,15 @@ class MainWindow(QMainWindow):
         self.settings.add_recent_file(str(path))
         self.status_message_label.setText(f"已打开工程：{Path(path).name}")
         self.tabs.setCurrentWidget(widget)
-        # 打开工程后自动定位到一个终止节点，避免右侧预览停留在空白状态。
+        # 打开工程后自动定位到一个终止节点，避免右侧预览停留在空白状态；
+        # 并按广度优先顺序完整预计算每个子树的所有节点，结果 / 缩略图不再
+        # 等待用户手动点击。
         sinks = [
             node
             for node in workspace.graph.nodes.values()
             if not workspace.graph.outgoing(node.id)
         ]
-        if sinks:
-            widget.select_node_and_preview(sinks[-1].id)
+        widget.precompute_project(sinks[-1].id if sinks else None)
         # 标签页/分隔条布局完成后才能得到正确 viewport，延迟一帧再 fit。
         QTimer.singleShot(0, widget.graph_view.fit_graph)
         self._update_window_title()

@@ -213,6 +213,21 @@ class GroupExecutionTests(GroupEngineTestCase):
         self.assertIn(invert.id, finished_ids)
         self.assertFalse(self.engine.busy)
 
+    def test_precompute_all_includes_group_container_nodes(self) -> None:
+        # 外部消费者直接依赖组内真实来源节点，算子组容器本身不是任何 sink
+        # 的祖先；整图预计算必须把组节点也纳入，否则组预览仍要手动点击。
+        source, group, gray, invert = self.build_group_chain()
+        self.assertTrue(self.workspace.graph.outgoing(group.id))
+
+        self.engine.precompute_all()
+        self.assertTrue(
+            self.pump(lambda: not self.engine.busy and len(self.finished) >= 4, timeout=15.0),
+            f"预计算未完成：{[result.node_id for result in self.finished]}",
+        )
+        for node in (source, group, gray, invert):
+            self.assertIsNotNone(self.engine.result(node.id), node.title)
+        self.assertEqual(self.chain_events, [(invert.id, True)])
+
     def test_group_without_internal_source_allows_empty_outputs(self) -> None:
         group = self.add_group("空算子组", output_types=(None,))
         self.engine.preview_node(group.id)

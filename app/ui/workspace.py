@@ -283,13 +283,33 @@ class WorkspaceWidget(QWidget):
 
     # ------------------------------------------------------------------ 选择
     def select_node_and_preview(self, node_id: str) -> None:
-        """程序化选中并预览一个节点（用于打开工程后定位到终止节点）。"""
+        """程序化选中并预览一个节点（有有效快照直接回放，否则后台重算）。"""
         if node_id not in self.workspace.graph.nodes:
             return
         self.graph_view.set_selected_node(node_id)
         self._on_node_selected(node_id)
 
-    def _on_node_selected(self, node_id: str) -> None:
+    def precompute_project(self, preview_node_id: str | None = None) -> None:
+        """打开工程后完整预计算：定位预览节点，再计算每个子树的所有节点。
+
+        引擎用一次请求覆盖整张图（根为全部节点），并按广度优先的拓扑层序
+        执行。因此这里不再单独调用 ``preview_node``，避免两次请求互相取消；
+        预览节点会在引擎回填 ``node_finished`` 时自动刷新，未选中的节点与
+        缩略图也会在后台算完后直接显示，不需要再手动点击。
+        """
+
+        if not self.workspace.graph.nodes:
+            return
+        if preview_node_id and preview_node_id in self.workspace.graph.nodes:
+            self.graph_view.set_selected_node(preview_node_id)
+            # 预计算请求会覆盖整张图，选中节点只需等待结果回填。
+            self._on_node_selected(preview_node_id, request_preview=False)
+        self.engine.precompute_all()
+        self.status_message.emit(
+            f"正在按广度优先顺序预计算全部 {len(self.workspace.graph.nodes)} 个节点…"
+        )
+
+    def _on_node_selected(self, node_id: str, *, request_preview: bool = True) -> None:
         if not node_id:
             self._current_node_id = None
             self._current_image = None
@@ -318,7 +338,8 @@ class WorkspaceWidget(QWidget):
             self._show_result(result, node)
         else:
             self.preview.set_image(None, node.display_title(), "正在计算…")
-            self.engine.preview_node(node_id)
+            if request_preview:
+                self.engine.preview_node(node_id)
         self._emit_status()
 
     def _refresh_original(self, node: NodeModel) -> None:

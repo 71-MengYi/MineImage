@@ -190,6 +190,7 @@ class _EvalJob(QRunnable):
         snapshot: _GraphSnapshot,
         token: _CancelToken,
         max_workers: int,
+        report_roots: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__()
         self.engine = engine
@@ -198,6 +199,8 @@ class _EvalJob(QRunnable):
         self.snapshot = snapshot
         self.token = token
         self.max_workers = max_workers
+        #: 请求完成时对外报告的根节点；None 表示与计算根相同。
+        self.report_roots = report_roots
         self.setAutoDelete(True)
 
     def run(self) -> None:  # pragma: no cover - 后台线程
@@ -207,6 +210,7 @@ class _EvalJob(QRunnable):
             self.snapshot,
             self.token,
             self.max_workers,
+            self.report_roots,
         )
 
 
@@ -339,7 +343,40 @@ class ExecutionEngine(QObject):
             self._clear_cached(root, downstream=True)
         self._start(tuple(roots), compute_downstream=True)
 
-    def _start(self, roots: Sequence[str], *, compute_downstream: bool = False) -> None:
+    def precompute_all(self) -> None:
+        """按广度优先顺序完整计算整张图（打开工程后调用）。
+
+        以全部节点为根发起一次请求，保证每个子树（含未接线的节点与算子组
+        容器）都得到结果；已有快照全部作废后重新计算。拓扑顺序由 FIFO Kahn
+        给出：从源节点逐层向下推进，即广度优先。``chain_finished`` 只对每个
+        末端节点（sink）各发一次，避免逐节点刷状态栏。
+        """
+
+        if self._shutting_down:
+            return
+        node_ids = list(self.workspace.graph.nodes)
+        if not node_ids:
+            return
+        sinks = [
+            node_id
+            for node_id in node_ids
+            if not self.workspace.graph.outgoing(node_id)
+        ]
+        self._results.clear()
+        self._errors.clear()
+        self._start(
+            tuple(node_ids),
+            compute_downstream=False,
+            report_roots=tuple(sinks or node_ids),
+        )
+
+    def _start(
+        self,
+        roots: Sequence[str],
+        *,
+        compute_downstream: bool = False,
+        report_roots: Sequence[str] | None = None,
+    ) -> None:
         if self._shutting_down:
             return
         roots = tuple(dict.fromkeys(roots))
@@ -349,6 +386,11 @@ class ExecutionEngine(QObject):
             roots = tuple(root for root in roots if root in self.workspace.graph.nodes)
             if not roots:
                 return
+        reported = tuple(
+            root
+            for root in dict.fromkeys(report_roots or ())
+            if root in self.workspace.graph.nodes
+        )
         # 先让 generation 失效，再取消旧任务：即使旧任务正在执行且无法立刻
         # 停止，它后续发出的排队信号也会在主线程被丢弃。
         self._generation += 1
@@ -369,7 +411,15 @@ class ExecutionEngine(QObject):
         snapshot.compute_downstream = compute_downstream
         self._token = token
         self._set_busy(True)
-        job = _EvalJob(self, roots, generation, snapshot, token, self._workers)
+        job = _EvalJob(
+            self,
+            roots,
+            generation,
+            snapshot,
+            token,
+            self._workers,
+            reported or None,
+        )
         self._pool.start(job)
 
     def _clear_cached(self, node_id: str, *, downstream: bool) -> None:
@@ -542,6 +592,7 @@ class ExecutionEngine(QObject):
         snapshot: _GraphSnapshot,
         token: _CancelToken,
         max_workers: int,
+        report_roots: Sequence[str] | None = None,
     ) -> None:
         state = _EvalState(self, snapshot, generation, token, max_workers)
         try:
@@ -550,7 +601,8 @@ class ExecutionEngine(QObject):
             fallback = roots[0] if roots else ""
             state.record_failure(fallback, f"执行失败：{exc}", traceback.format_exc())
         finally:
-            self._finished.emit(generation, list(roots), state.success)
+            # 整图预计算会用全部节点作为计算根，但只按末端节点报告结果。
+            self._finished.emit(generation, list(report_roots or roots), state.success)
 
     def record_immediate_failure(self, node_id: str, message: str, details: str = "") -> None:
         """主线程侧的失败通知（例如快照创建失败）。"""
@@ -714,7 +766,12 @@ class _EvalState:
         return {node_id for node_id in selected if node_id in self.snapshot.nodes}
 
     def _topological_order(self, selected: set[str]) -> list[str]:
-        """Kahn 拓扑排序；同一对节点的多条端口连线只算一条边。"""
+        """Kahn 拓扑排序；FIFO 队列保证兄弟分支逐层推进（广度优先）。
+
+        所有源节点先入队，某个节点的前驱全部完成后才会入队，因此出队顺序按
+        「到源节点的层数」分层：第 1 层的节点全部排在第 2 层之前。同一对节点
+        的多条端口连线只算一条边。
+        """
         indegree: dict[str, int] = {}
         for node_id in selected:
             indegree[node_id] = sum(

@@ -711,6 +711,60 @@ class ExecutionEngineTests(EngineTestCase):
         self.assertEqual(delivered.count(second.id), 1, self.chain_events)
         self.assertTrue(all(ok for _node_id, ok in self.chain_events))
 
+    def test_precompute_all_computes_every_node_breadth_first(self) -> None:
+        # 单 worker 时启动顺序就是拓扑提交顺序，可据此验证广度优先分层。
+        engine = self.new_engine(workers=1)
+        events = self.attach_events(engine)
+        source = self.add_source(_image())
+        first = self.add_op("basic.grayscale", "分支一", {"mode": "weighted"})
+        second = self.add_op("basic.invert", "分支二")
+        downstream = self.add_op(
+            "filter.gaussian_blur",
+            "分支一下游",
+            {"ksize": 3, "sigma": 0.0, "border": "replicate"},
+        )
+        isolated = self.add_source(_image(20, 24, 3), "独立源图")
+        self.connect(source, first)
+        self.connect(source, second)
+        self.connect(first, downstream)
+
+        engine.precompute_all()
+        self.assertTrue(
+            self.pump(
+                lambda: not engine.busy and len(events["chain"]) >= 3,
+                timeout=15.0,
+            ),
+            f"预计算未完成：chain={events['chain']} started={events['started']}",
+        )
+
+        # 两个源节点（第 0 层）都先于它们的分支下游；灰度、反相（第 1 层）
+        # 先于模糊（第 2 层）。即按层推进，而不是先算完整条分支再算兄弟。
+        ordered = [source.id, isolated.id, first.id, second.id, downstream.id]
+        self.assertEqual(events["started"], ordered)
+        for node_id in ordered:
+            self.assertIsNotNone(engine.result(node_id), node_id)
+            self.assertEqual(events["started"].count(node_id), 1, events["started"])
+        # chain_finished 只报告末端节点，不用每个节点都刷一遍状态栏。
+        self.assertEqual(
+            {node_id for node_id, _ok in events["chain"]},
+            {second.id, downstream.id, isolated.id},
+        )
+        self.assertTrue(all(ok for _node_id, ok in events["chain"]))
+
+        # 再次预计算会作废旧快照并完整重算（不是命中缓存直接回放）。
+        previous = engine.result(first.id)
+        events["started"].clear()
+        events["chain"].clear()
+        engine.precompute_all()
+        self.assertTrue(
+            self.pump(
+                lambda: not engine.busy and len(events["chain"]) >= 3,
+                timeout=15.0,
+            )
+        )
+        self.assertIsNot(engine.result(first.id), previous)
+        self.assertEqual(events["started"], ordered)
+
     # ------------------------------------------------------------------ 取消 / 过期
     def _slow_registry(self) -> OperatorRegistry:
         return OperatorRegistry.build([OPS_FIXTURES])
