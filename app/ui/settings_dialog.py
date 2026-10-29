@@ -369,7 +369,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(options)
 
         rescan_hint = QLabel(
-            "修改后请回到主界面，点击左侧算子库的「刷新」（或按 F5）重新扫描。",
+            "修改后请回到主界面，点击左侧算子库右上角的刷新按钮（或按 F5）重新扫描。",
             page,
         )
         rescan_hint.setObjectName("hintLabel")

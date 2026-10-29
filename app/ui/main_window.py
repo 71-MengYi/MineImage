@@ -353,8 +353,6 @@ class MainWindow(QMainWindow):
             None,
             self.act_fit,
             self.act_actual,
-            None,
-            self.act_refresh_ops,
         ):
             if action is None:
                 toolbar.addSeparator()

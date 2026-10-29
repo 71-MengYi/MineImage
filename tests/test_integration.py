@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QToolBar
 
 from app.config import AppSettings
 from app.core.imageio import save_image
@@ -83,6 +83,14 @@ class MainWindowIntegrationTests(unittest.TestCase):
             if not widget.engine.busy:
                 return
         self.fail("后台计算超时")
+
+    def test_toolbar_omits_refresh_action(self) -> None:
+        # 刷新入口只保留在算子库和「算子」菜单，工具栏不再重复放一个。
+        toolbar = self.win.findChild(QToolBar, "mainToolBar")
+        self.assertIsNotNone(toolbar)
+        texts = [action.text() for action in toolbar.actions() if not action.isSeparator()]
+        self.assertNotIn("刷新算子库", texts)
+        self.assertEqual(self.win.act_refresh_ops.shortcut().toString(), "F5")
 
     def test_open_image_creates_workspace_and_preview(self) -> None:
         widget = self._open()

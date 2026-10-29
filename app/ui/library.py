@@ -311,9 +311,15 @@ class OperatorLibrary(QWidget):
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setToolTip("跨所有分类搜索算子；命中项会自动展开并在列表中定位。")
         self.search_edit.textChanged.connect(self._on_search_changed)
+        # 刷新按钮与工具栏一致：只显示图标，不显示文字。
         self.refresh_button = QToolButton(self)
-        self.refresh_button.setText("刷新")
+        self.refresh_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
+        )
+        self.refresh_button.setIconSize(QSize(16, 16))
+        self.refresh_button.setAccessibleName("刷新算子库")
         self.refresh_button.setToolTip("重新扫描算子目录（F5）")
+        self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_button.clicked.connect(self._on_refresh_clicked)
         header.addWidget(self.search_edit, 1)
         header.addWidget(self.refresh_button)
@@ -356,7 +362,7 @@ class OperatorLibrary(QWidget):
         empty_title.setObjectName("sectionTitle")
         empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_hint = QLabel(
-            "请检查「设置 → 算子目录」，\n然后点击右上角「刷新」重新扫描。",
+            "请检查「设置 → 算子目录」，\n然后点击右上角的刷新按钮重新扫描。",
             self.empty_page,
         )
         empty_hint.setObjectName("hintLabel")

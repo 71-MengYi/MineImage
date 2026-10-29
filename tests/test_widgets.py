@@ -738,6 +738,10 @@ class OperatorLibraryTests(unittest.TestCase):
         )
 
     def test_refresh_button_emits(self) -> None:
+        # 刷新按钮只显示图标（与工具栏一致），不显示文字。
+        self.assertEqual(self.library.refresh_button.text(), "")
+        self.assertFalse(self.library.refresh_button.icon().isNull())
+        self.assertEqual(self.library.refresh_button.accessibleName(), "刷新算子库")
         spy = QSignalSpy(self.library.refresh_requested)
         self.library.refresh_button.click()
         self.assertEqual(spy.count(), 1)
