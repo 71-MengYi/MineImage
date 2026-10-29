@@ -2,11 +2,11 @@
 
 > 面向 AI 编码代理的 MineImage 工作手册。**先读本文件，再按「Agent 行为映射表」只打开目标文件**；不要用全仓扫描代替定位。
 >
-> 最后核对：2026-10-29 · 项目版本 0.1.0 · 如与代码/测试冲突，以代码和测试为准，并修正本文件。
+> 最后核对：2026-10-30 · 项目版本 0.1.0 · 如与代码/测试冲突，以代码和测试为准，并修正本文件。
 
 ## 1. 项目速览
 
-- **是什么**：PySide6 + OpenCV 的节点式图像处理实验工作台。左侧算子库、中间 DAG 画布、右侧实时预览；支持算子组、自定义算子、`.mi` 工程。
+- **是什么**：PySide6 + OpenCV 的节点式图像处理实验工作台。左侧算子库、中间 DAG 画布、右侧实时预览；支持算子组、自定义算子、`.mi` 工程、图像 / CSV 文本矩阵导入。
 - **技术栈**：Python ≥3.10（开发验证 3.13）、PySide6 ≥6.6、NumPy、opencv-python ≥4.8、Pillow。Windows/PowerShell 是主要开发环境。
 - **OpenCV**：目录算子按 OpenCV 5.0 API 设计，同时兼容 4.x；Haar / HOG 仅在 4.x 可用，5.x 人脸检测走 YuNet ONNX。
 - **入口**：`python -m app`（`app/__main__.py` → `app/main.py`）。
@@ -120,7 +120,7 @@ powershell -ExecutionPolicy Bypass -File packaging/build_exe.ps1
 | 改连线曲线 / 端口几何 / 吸附 | `app/graph/curve.py`、`app/graph/port_item.py` 相关方法；`docs/architecture.md`「总体数据流」画布条 | `app/graph/curve.py`、`app/graph/port_item.py`、`app/graph/connection_item.py` | `tests.test_port_geometry`、`tests.test_graph` |
 | 改撤销 / 重做 / 图编辑命令 | `docs/architecture.md`「总体数据流」画布条；`app/graph/commands.py` 相关命令 | `app/graph/commands.py`；`app/graph/view.py` 调用点 | `tests.test_graph`（undo 相关） |
 | 改图模型 / 节点 / 连线 / 序列化 | `docs/architecture.md`「总体数据流」模型条、「端口数据类型系统」；`app/core/model.py` 相关类 | `app/core/model.py`、`app/core/project.py`、`app/core/group.py`（涉及组时） | `tests.test_core`、`tests.test_group`、`tests.test_group_integration`；注意旧 `.mi` 兼容与悬空 `parent_group` 修复 |
-| 改 `.mi` 工程 / 图像 IO / 导出 | `docs/user_guide.md` §13；`app/core/project.py`、`app/core/imageio.py` | `app/core/project.py`、`app/core/imageio.py`、`app/core/types.py` | `tests.test_core`（roundtrip / uint16 / alpha） |
+| 改 `.mi` 工程 / 图像 IO / 矩阵导入导出 | `docs/user_guide.md` §13；`app/core/project.py`、`app/core/imageio.py`、`app/core/matrixio.py` | `app/core/project.py`、`app/core/imageio.py`、`app/core/matrixio.py`、`app/core/types.py` | `tests.test_core`（roundtrip / uint16 / alpha / `TestMatrixIO`） |
 | 改执行引擎 / 并发 / 缓存 / 失效 | `docs/architecture.md`「时间与缓存语义」「ExecutionEngine」；`app/engine/engine.py` 顶部 | `app/engine/engine.py` | `tests.test_engine`；组相关 `tests.test_group_engine`；保持 generation/revision 与线程安全 |
 | 改端口类型 / 结构化数据 / 连线校验 | `docs/architecture.md`「端口数据类型系统」；`app/core/data_types.py` | `app/core/data_types.py`、`app/operators/spec.py`（声明/校验部分） | `tests.test_data_types`、`tests.test_catalog_all` |
 | 新增 / 修改内置算子 | `docs/operator_guide.md` §1–5、§10–11；同类 `app/operators/builtin/catalog/<module>.py` 的 `OPERATORS` 模式 | 对应 `app/operators/builtin/catalog/*.py`（优先）；单文件旧模式用 `app/operators/builtin/*.py`；新一级分类才改 `app/core/constants.py` | 对应 `tests.test_catalog_*.py`；新 id 补进 `tests/test_catalog_all.py` 的 `REQUIRED_IDS`；跑 `python scripts/gen_opencv_catalog_doc.py`；用 `app/operators/builtin/catalog/_cv.py` 做输入/dtype/输出，默认参数可运行，不原地改输入 |
@@ -165,7 +165,7 @@ powershell -ExecutionPolicy Bypass -File packaging/build_exe.ps1
 | --- | --- |
 | `app/main.py`、`app/__main__.py` | 启动、日志/异常钩子；`main()` |
 | `app/config.py` | `AppSettings`、配置路径、`MINEIMAGE_*` 环境变量 |
-| `app/core/` | `model.py` 图/工作区、`data_types.py` 端口类型、`types.py` `ImageData`、`group.py` 算子组、`project.py` `.mi`、`imageio.py`、`models.py` ONNX、`logstore.py`、`constants.py` |
+| `app/core/` | `model.py` 图/工作区、`data_types.py` 端口类型、`types.py` `ImageData`、`group.py` 算子组、`project.py` `.mi`、`imageio.py` 图像 IO、`matrixio.py` CSV/文本矩阵、`models.py` ONNX、`logstore.py`、`constants.py` |
 | `app/operators/` | `spec.py` 算子/参数/端口声明、`loader.py` 扫描注册、`group.py` 算子组保存/展开、`builtin/catalog/*.py` 目录算子、`builtin/*.py` 单文件算子、共享工具 `builtin/_utils.py` / `catalog/_cv.py` |
 | `app/engine/engine.py` | `ExecutionEngine`：快照 / 拓扑并行 / 缓存 / generation |
 | `app/graph/` | `view.py` 画布交互、`scene.py`、`commands.py` 撤销命令、`layout.py` 自动布局、`group_item.py`、`node_item.py`、`port_item.py`、`connection_item.py`、`curve.py`、`collapse_item.py` |
@@ -183,7 +183,7 @@ powershell -ExecutionPolicy Bypass -File packaging/build_exe.ps1
 
 | 领域 | 测试文件 |
 | --- | --- |
-| 核心模型 / 工程 / 算子规范 | `test_core.py` |
+| 核心模型 / 工程 / 矩阵 IO / 算子规范 | `test_core.py` |
 | 端口类型 / 结构化数据 / 连线校验 | `test_data_types.py` |
 | 目录算子分组 | `test_catalog_filter_geom.py`、`test_catalog_segment_feature.py`、`test_catalog_arithmetic_color.py`、`test_catalog_enhance_draw.py`、`test_catalog_video_analysis.py` |
 | 目录算子全量门禁 | `test_catalog_all.py` |

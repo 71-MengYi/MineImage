@@ -1,4 +1,9 @@
-"""图像文件读写（支持 Unicode 路径，尽量保持原始 dtype 与通道）。"""
+"""图像 / 矩阵文件读写（支持 Unicode 路径，尽量保持原始 dtype 与通道）。
+
+* 图像：优先 OpenCV ``IMREAD_UNCHANGED``，失败回退 Pillow；``.npy`` 直接读数组。
+* 矩阵：``.csv`` / ``.tsv`` / ``.tab`` / ``.txt`` / ``.dat`` 交给
+  :mod:`app.core.matrixio` 解析，统一转换为二维单通道图像；导出时反向写回。
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from app.core.constants import MATRIX_SUFFIXES
+from app.core.matrixio import MatrixIOError, is_matrix_file, read_matrix_file, write_matrix_file
 from app.core.types import ImageData, infer_color_space
 
 
@@ -15,14 +22,21 @@ class ImageIOError(RuntimeError):
 
 
 def load_image(path: str | Path) -> ImageData:
-    """读取图像文件为 :class:`ImageData`。
+    """读取图像或矩阵文件为 :class:`ImageData`。
 
-    优先使用 OpenCV（``IMREAD_UNCHANGED``，保留 16bit / alpha），失败后回退 Pillow。
-    ``.npy`` 文件会直接读取数组，便于 float32 数据交换。
+    图像优先使用 OpenCV（``IMREAD_UNCHANGED``，保留 16bit / alpha），失败后回退
+    Pillow；``.npy`` 文件会直接读取数组；CSV / 文本矩阵由
+    :func:`app.core.matrixio.read_matrix_file` 解析为二维单通道数组。
     """
     file_path = Path(path)
     if not file_path.exists():
         raise ImageIOError(f"文件不存在：{file_path}")
+    if is_matrix_file(file_path):
+        try:
+            matrix = read_matrix_file(file_path)
+        except MatrixIOError as exc:
+            raise ImageIOError(str(exc)) from exc
+        return ImageData(matrix.array, file_path.name, "L")
     if file_path.suffix.lower() == ".npy":
         try:
             array = np.load(str(file_path), allow_pickle=False)
@@ -81,11 +95,20 @@ def _load_with_pillow_bgr(path: Path) -> np.ndarray | None:
 
 
 def save_image(path: str | Path, image: ImageData) -> None:
-    """导出图像；扩展名决定编码格式。``.npy`` 保存原始数组。"""
+    """导出图像或矩阵；扩展名决定编码格式。
+
+    ``.npy`` 保存原始数组；CSV / TSV / TXT / DAT 保存二维单通道矩阵。
+    """
     file_path = Path(path)
     suffix = file_path.suffix.lower()
     if suffix == ".npy":
         np.save(str(file_path), image.array)
+        return
+    if suffix in MATRIX_SUFFIXES:
+        try:
+            write_matrix_file(file_path, image)
+        except MatrixIOError as exc:
+            raise ImageIOError(str(exc)) from exc
         return
     encode_ext = suffix if suffix else ".png"
     success, buffer = cv2.imencode(encode_ext, image.array)

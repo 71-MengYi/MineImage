@@ -36,6 +36,7 @@ from app.core.constants import (
     MIME_IMAGE_PATHS,
     MIME_OPERATOR,
     SINGLE_CLICK_DELAY_MS,
+    SOURCE_SUFFIXES,
 )
 from app.core.data_types import DataType
 from app.core.group import INVALID_LEVEL, GroupModel
@@ -131,19 +132,6 @@ def _ensure_replace_dialog():
     ReplaceOperatorDialog = _ReplaceOperatorDialog
     return ReplaceOperatorDialog
 
-_IMAGE_SUFFIXES = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".bmp",
-    ".tif",
-    ".tiff",
-    ".webp",
-    ".ppm",
-    ".pgm",
-    ".npy",
-}
-
 #: 拖动时吸附到端口 / 连线的场景半径（像素）。
 SNAP_RADIUS = 26.0
 #: 自动连线时新节点端口与目标端口之间的垂直间距。
@@ -195,7 +183,7 @@ class GraphView(QGraphicsView):
     node_created = Signal(str)  # 画布内新增算子节点
     connection_changed = Signal(str)  # 目标节点 id
     node_removed = Signal(str)
-    images_dropped = Signal(list)  # list[str]，拖入的图像路径
+    images_dropped = Signal(list)  # list[str]，拖入的源文件路径（图像 / 矩阵）
     status_message = Signal(str)
     operators_changed = Signal()  # 保存新的算子组自定义算子后通知主窗口刷新算子库
 
@@ -3169,7 +3157,7 @@ class GraphView(QGraphicsView):
         font.setPointSizeF(11.0)
         painter.setFont(font)
         viewport_rect = self.viewport().rect()
-        hint = "画布为空\n从左侧算子库拖入算子开始搭建\n也可以直接拖入图像文件创建原始图像节点"
+        hint = "画布为空\n从左侧算子库拖入算子开始搭建\n也可以直接拖入图像 / CSV 矩阵文件创建源节点"
         painter.drawText(
             viewport_rect,
             int(Qt.AlignmentFlag.AlignCenter),
@@ -3350,7 +3338,7 @@ class GraphView(QGraphicsView):
                 if not url.isLocalFile():
                     continue
                 path = url.toLocalFile()
-                if path and Path(path).suffix.lower() in _IMAGE_SUFFIXES:
+                if path and Path(path).suffix.lower() in SOURCE_SUFFIXES:
                     paths.append(path)
         if not paths and mime.hasFormat(MIME_IMAGE_PATHS):
             raw = bytes(mime.data(MIME_IMAGE_PATHS)).decode("utf-8", "replace")

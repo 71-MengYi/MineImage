@@ -422,6 +422,39 @@ class PreviewWidgetTests(unittest.TestCase):
         _send_wheel(self.widget, center)
         self.assertGreater(self.widget.zoom_percent(), zoom_before)
 
+    def test_mesh_degenerate_matrices_render(self) -> None:
+        """单行 / 单列 / 单像素矩阵在 mesh 模式下补齐为 2×2，不再因 np.gradient 崩溃。"""
+
+        for shape in ((3, 1), (1, 3), (1, 1)):
+            with self.subTest(shape=shape):
+                matrix = ImageData(
+                    np.arange(int(np.prod(shape)), dtype=np.uint8).reshape(shape), "矩阵"
+                )
+                self.widget.set_display_mode("mesh")
+                self.widget.set_image(matrix)
+                self.widget.fit_to_window()
+                self.assertEqual(self.widget.image_size(), (shape[1], shape[0]))
+                field = self.widget._mesh_field_for(matrix)
+                self.assertIsNotNone(field)
+                # 退化维度被复制到至少 2，网格可以计算梯度并三角化。
+                self.assertGreaterEqual(field.grid.shape[0], 2)
+                self.assertGreaterEqual(field.grid.shape[1], 2)
+                self.assertEqual(field.colors.shape, field.grid.shape + (3,))
+                # 布局宽高仍来自原始图像，缩放不受补齐影响。
+                self.assertEqual((field.width, field.height), (shape[1], shape[0]))
+                self.assertFalse(self.widget.grab().isNull())
+
+    def test_mesh_regular_matrix_keeps_grid_shape(self) -> None:
+        """普通 2×2 矩阵的网格保持原尺寸，不被退化补齐逻辑改动。"""
+
+        matrix = ImageData(np.arange(4, dtype=np.uint8).reshape(2, 2), "矩阵")
+        self.widget.set_display_mode("mesh")
+        self.widget.set_image(matrix)
+        field = self.widget._mesh_field_for(matrix)
+        self.assertIsNotNone(field)
+        self.assertEqual(field.grid.shape, (2, 2))
+        self.assertFalse(self.widget.grab().isNull())
+
     def test_empty_state_paints(self) -> None:
         self.widget.set_image(None)
         self.assertIsNone(self.widget.image_size())

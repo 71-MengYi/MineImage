@@ -733,6 +733,14 @@ class PreviewWidget(QWidget):
         grid = intensity_grid(image, _MESH_MAX_SIDE).astype(np.float32)
         if grid.size == 0:
             return None
+        # 单行 / 单列矩阵（例如 CSV 导入的一维序列）没有成对的行或列，
+        # np.gradient 与三角化都要求至少 2×2，因此把退化维度复制一份；
+        # 缩放仍使用原始图像宽高，普通图像（≥2×2）的网格不受影响。
+        rows, cols = grid.shape
+        if rows < 2:
+            grid = np.repeat(grid, 2, axis=0)
+        if cols < 2:
+            grid = np.repeat(grid, 2, axis=1)
         low = float(np.min(grid))
         high = float(np.max(grid))
         if high > low:

@@ -22,9 +22,46 @@ CUSTOM_OPERATOR_CATEGORY = "用户自定义算子"
 PROJECT_EXTENSION = ".mi"
 PROJECT_FILTER = "MineImage 工程 (*.mi)"
 
-IMAGE_FILTER = (
-    "图像文件 (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.ppm *.pgm *.npy);;"
+#: 可作为源节点导入的图像扩展名（含 NumPy 数组）。
+IMAGE_SUFFIXES = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".webp",
+    ".ppm",
+    ".pgm",
+    ".npy",
+)
+#: 可导入为单通道数值矩阵的表格 / 文本扩展名。
+MATRIX_SUFFIXES = (".csv", ".tsv", ".tab", ".txt", ".dat")
+#: 画布拖拽与「打开 / 添加」对话框共用的源文件扩展名。
+SOURCE_SUFFIXES = IMAGE_SUFFIXES + MATRIX_SUFFIXES
+
+
+def _suffix_pattern(suffixes: tuple[str, ...]) -> str:
+    """把扩展名元组拼成 Qt 文件对话框的匹配模式（``*.png *.jpg``）。"""
+
+    return " ".join(f"*{suffix}" for suffix in suffixes)
+
+
+#: 图像文件过滤器（参数面板选择模型 / 图像路径时复用）。
+IMAGE_FILTER = f"图像文件 ({_suffix_pattern(IMAGE_SUFFIXES)});;所有文件 (*)"
+#: 矩阵文件过滤器：CSV / TSV / 文本矩阵。
+MATRIX_FILTER = f"矩阵数据 ({_suffix_pattern(MATRIX_SUFFIXES)});;所有文件 (*)"
+#: 打开 / 添加源文件时使用的过滤器：图像与矩阵。
+SOURCE_FILTER = (
+    f"图像 / 矩阵文件 ({_suffix_pattern(SOURCE_SUFFIXES)});;"
+    f"图像文件 ({_suffix_pattern(IMAGE_SUFFIXES)});;"
+    f"矩阵数据 ({_suffix_pattern(MATRIX_SUFFIXES)});;"
     "所有文件 (*)"
+)
+#: 导出当前节点结果时可选的格式；矩阵格式只支持二维单通道数据。
+EXPORT_FILTER = (
+    "PNG 图像 (*.png);;TIFF 图像 (*.tif *.tiff);;NumPy 数组 (*.npy);;"
+    "CSV 矩阵 (*.csv);;文本矩阵 (*.tsv *.txt *.dat);;所有文件 (*)"
 )
 
 #: 一级分类的默认顺序；扫描到的未知分类排在后面（按名称排序）。

@@ -39,10 +39,12 @@ from app.config import (
 )
 from app.core.constants import (
     DEFAULT_IMAGE_DISPLAY_MODE,
-    IMAGE_FILTER,
+    EXPORT_FILTER,
     PROJECT_FILTER,
+    SOURCE_FILTER,
 )
 from app.core.logstore import LogStore
+from app.core.matrixio import is_matrix_file
 from app.core.model import WorkspaceModel
 from app.core.project import ProjectFormatError, load_project
 from app.operators.loader import OperatorRegistry
@@ -124,7 +126,7 @@ class MainWindow(QMainWindow):
         if errors:
             self.statusBar().showMessage(f"已加载 {count} 个算子，{errors} 个加载失败（算子 → 查看加载日志）", 8000)
         else:
-            self.statusBar().showMessage(f"已加载 {count} 个算子 · 打开图像开始实验", 6000)
+            self.statusBar().showMessage(f"已加载 {count} 个算子 · 打开图像 / 矩阵开始实验", 6000)
 
     # ------------------------------------------------------------------ 动作
     def _icon(self, pixmap: QStyle.StandardPixmap):
@@ -152,10 +154,11 @@ class MainWindow(QMainWindow):
     def _create_actions(self) -> None:
         self.act_new = self._action("新建工作区", self.new_workspace, "Ctrl+N")
         self.act_open = self._action(
-            "打开图像…", self.open_image, "Ctrl+O", QStyle.StandardPixmap.SP_DialogOpenButton
+            "打开图像 / 矩阵…", self.open_image, "Ctrl+O", QStyle.StandardPixmap.SP_DialogOpenButton
         )
         self.act_add_image = self._action(
-            "添加图像…", self.add_image, "Ctrl+Shift+O", QStyle.StandardPixmap.SP_FileDialogNewFolder
+            "添加图像 / 矩阵…", self.add_image, "Ctrl+Shift+O",
+            QStyle.StandardPixmap.SP_FileDialogNewFolder,
         )
         self.act_open_project = self._action(
             "打开工程…", self.open_project, "Ctrl+Alt+O", QStyle.StandardPixmap.SP_DirOpenIcon
@@ -165,7 +168,7 @@ class MainWindow(QMainWindow):
         )
         self.act_save_as = self._action("工程另存为…", self.save_workspace_as, "Ctrl+Shift+S")
         self.act_export = self._action(
-            "导出当前节点图像…", self.export_current_image, "Ctrl+E",
+            "导出当前节点结果…", self.export_current_image, "Ctrl+E",
             QStyle.StandardPixmap.SP_DialogSaveButton,
         )
         self.act_close_tab = self._action("关闭当前标签", self.close_current_tab, "Ctrl+W")
@@ -288,7 +291,7 @@ class MainWindow(QMainWindow):
 
         buttons = QHBoxLayout()
         buttons.setSpacing(10)
-        open_btn = QPushButton("打开图像…", card)
+        open_btn = QPushButton("打开图像 / 矩阵…", card)
         open_btn.setObjectName("primaryButton")
         open_btn.clicked.connect(self.open_image)
         project_btn = QPushButton("打开工程…", card)
@@ -559,7 +562,7 @@ class MainWindow(QMainWindow):
         self._workspace_counter += 1
         workspace = WorkspaceModel(f"未命名工作区 {self._workspace_counter}")
         widget = self._add_workspace(workspace)
-        widget.status_message.emit("空白工作区：打开/添加图像，或从左侧拖入算子")
+        widget.status_message.emit("空白工作区：打开/添加图像或矩阵，或从左侧拖入算子")
         return widget
 
     def _populate_recent_menu(self) -> None:
@@ -586,7 +589,7 @@ class MainWindow(QMainWindow):
             self.open_image_path(path)
 
     def open_image(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "打开图像", "", IMAGE_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "打开图像 / 矩阵", "", SOURCE_FILTER)
         if not path:
             return
         self.open_image_path(path)
@@ -605,15 +608,16 @@ class MainWindow(QMainWindow):
             widget.deleteLater()
             self._update_central()
             return
+        kind = "矩阵" if is_matrix_file(path) else "图像"
         self.settings.add_recent_file(str(path))
-        self.status_message_label.setText(f"已打开图像：{Path(path).name}")
+        self.status_message_label.setText(f"已打开{kind}：{Path(path).name}")
         self._update_window_title()
 
     def add_image(self) -> None:
         widget = self._active_workspace()
         if widget is None:
             widget = self.new_workspace()
-        path, _ = QFileDialog.getOpenFileName(self, "添加图像到当前流程", "", IMAGE_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "添加图像 / 矩阵到当前流程", "", SOURCE_FILTER)
         if not path:
             return
         if widget.add_image(path):
@@ -709,9 +713,9 @@ class MainWindow(QMainWindow):
         default_path.parent.mkdir(parents=True, exist_ok=True)
         chosen, _selected_filter = QFileDialog.getSaveFileName(
             self,
-            "导出当前节点图像",
+            "导出当前节点结果",
             str(default_path),
-            "PNG 图像 (*.png);;TIFF 图像 (*.tif *.tiff);;NumPy 数组 (*.npy)",
+            EXPORT_FILTER,
         )
         if not chosen:
             return

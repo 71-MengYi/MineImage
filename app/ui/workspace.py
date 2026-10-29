@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 from app.config import AppSettings
 from app.core.constants import IMAGE_DISPLAY_MODES
 from app.core.imageio import ImageIOError, load_image, save_image
+from app.core.matrixio import is_matrix_file
 from app.core.model import NodeModel, WorkspaceModel
 from app.core.project import save_project
 from app.engine.engine import ExecutionEngine, NodeResult
@@ -256,16 +257,18 @@ class WorkspaceWidget(QWidget):
 
     # ------------------------------------------------------------------ 图像
     def add_image(self, path: str | Path) -> bool:
+        is_matrix = is_matrix_file(path)
+        kind = "矩阵" if is_matrix else "图像"
         try:
             image = load_image(path)
         except ImageIOError as exc:
-            LOG.error("无法打开图像 %s：%s", path, exc)
-            QMessageBox.critical(self, "无法打开图像", str(exc))
+            LOG.error("无法打开%s %s：%s", kind, path, exc)
+            QMessageBox.critical(self, f"无法打开{kind}", str(exc))
             self.status_message.emit(str(exc))
             return False
         except Exception as exc:  # noqa: BLE001
-            LOG.exception("无法打开图像 %s", path)
-            QMessageBox.critical(self, "无法打开图像", f"{exc.__class__.__name__}: {exc}")
+            LOG.exception("无法打开%s %s", kind, path)
+            QMessageBox.critical(self, f"无法打开{kind}", f"{exc.__class__.__name__}: {exc}")
             return False
         position = self.workspace.next_source_position()
         node = self.workspace.add_source_image(image, str(path), pos=position)
@@ -274,7 +277,13 @@ class WorkspaceWidget(QWidget):
         self.graph_view.auto_layout()
         self.graph_view.fit_graph()
         self._mark_dirty()
-        self.status_message.emit(f"已添加图像：{Path(path).name}")
+        if is_matrix:
+            self.status_message.emit(
+                f"已添加矩阵：{Path(path).name}"
+                f"（{image.height} 行 × {image.width} 列 · {image.dtype_name}）"
+            )
+        else:
+            self.status_message.emit(f"已添加图像：{Path(path).name}")
         return True
 
     def _on_images_dropped(self, paths: list[str]) -> None:
@@ -791,7 +800,7 @@ class WorkspaceWidget(QWidget):
         result = self.engine.result(node_id) if node_id else None
         if result is None or result.primary is None:
             if result is not None and result.outputs:
-                self.status_message.emit("当前节点没有图像输出，无法导出为图像文件")
+                self.status_message.emit("当前节点没有图像输出，无法导出为文件")
             else:
                 self.status_message.emit("当前节点没有可导出的结果")
             return False

@@ -15,7 +15,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QToolBar
 
 from app.config import AppSettings
-from app.core.imageio import save_image
+from app.core.imageio import load_image, save_image
 from app.core.model import WorkspaceModel
 from app.core.types import ImageData
 from app.operators.loader import OperatorRegistry
@@ -106,6 +106,32 @@ class MainWindowIntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(sizes[1], sizes[0] * 2, delta=max(16, sizes[0] * 0.2))
         self.assertGreater(sizes[1], sizes[0] * 1.5)
         self.assertGreater(sizes[2], sizes[1] * 1.5)
+
+    def test_open_csv_matrix_creates_source_node_and_preview(self) -> None:
+        path = _TMP / f"integration_matrix_{uuid.uuid4().hex[:8]}.csv"
+        path.write_text("name,a,b\nr1,1,2\nr2,3,4\n", encoding="utf-8")
+        self.addCleanup(path.unlink, missing_ok=True)
+
+        self.win.open_image_path(str(path))
+        widget = self.win._active_workspace()
+        self.assertIsNotNone(widget)
+        sources = widget.workspace.graph.source_nodes()
+        self.assertEqual(len(sources), 1)
+        image = widget.workspace.image_for_node(sources[0])
+        self.assertIsNotNone(image)
+        self.assertEqual(image.array.dtype, np.int32)
+        np.testing.assert_array_equal(image.array, [[1, 2], [3, 4]])
+        self.assertEqual(image.color_space, "L")
+
+        self._wait_idle(widget)
+        self.assertIsNotNone(widget.engine.result(sources[0].id))
+        self.assertIsNotNone(widget.preview.image_size())
+
+        out = _TMP / f"integration_matrix_out_{uuid.uuid4().hex[:8]}.csv"
+        self.addCleanup(out.unlink, missing_ok=True)
+        self.assertTrue(widget.export_current_image(out))
+        exported = load_image(out)
+        np.testing.assert_array_equal(exported.array, [[1, 2], [3, 4]])
 
     def test_display_mode_toolbar_and_workspace_isolation(self) -> None:
         toolbar = self.win.findChild(QToolBar, "mainToolBar")

@@ -1632,6 +1632,49 @@ class GraphViewTestCase(unittest.TestCase):
         self.assertTrue(captured[0][0].endswith("示例.png"))
         self.assertFalse(self.graph.nodes)
 
+    def test_csv_matrix_drop_emits_paths(self) -> None:
+        from PySide6.QtCore import QUrl
+
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile("C:/tmp/矩阵数据.csv")])
+        event = QDropEvent(
+            QPointF(50.0, 50.0),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        captured: list[list[str]] = []
+        self.view.images_dropped.connect(captured.append)
+        self.view.dropEvent(event)
+        self.assertTrue(event.isAccepted())
+        self.assertEqual(len(captured), 1)
+        self.assertTrue(captured[0][0].endswith("矩阵数据.csv"))
+        self.assertFalse(self.graph.nodes)
+
+    def test_matrix_source_node_annotation(self) -> None:
+        matrix = NodeModel(
+            id=new_id("n"),
+            op_id=SOURCE_OP_ID,
+            title="矩阵数据",
+            pos=(0.0, 0.0),
+            source_path="C:/tmp/矩阵数据.csv",
+        )
+        self.graph.add_node(matrix)
+        matrix_item = self.item(matrix)
+        self.assertIn("矩阵数据节点（由 CSV / 文本矩阵导入）", matrix_item.toolTip())
+        self.assertNotIn("原始图像节点", matrix_item.toolTip())
+        matrix_chip = matrix_item._header_chip()
+        assert matrix_chip is not None
+        self.assertEqual(matrix_chip[0], "矩阵")
+
+        image = self.add_source()
+        image_item = self.item(image)
+        self.assertIn("原始图像节点", image_item.toolTip())
+        image_chip = image_item._header_chip()
+        assert image_chip is not None
+        self.assertEqual(image_chip[0], "原始图像")
+
     # ------------------------------------------------------------ 结果与状态
     def test_notify_result_thumbnail_and_error(self) -> None:
         node = self.add_node(pos=(30.0, 30.0))

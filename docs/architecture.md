@@ -20,6 +20,9 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   `images: dict[str, ImageData]`。节点参数变化通过 `NodeModel.touch()` 增加
   `revision`。引擎用 revision 丢弃过期结果。`WorkspaceModel.display_mode` 保存
   工作区级预览显示模式（`imshow` / `imagesc` / `mesh`），随 `.mi` 工程持久化。
+* **矩阵 IO**：`app/core/matrixio.py` 负责 CSV / TSV / TXT 等文本矩阵的解析（分隔符、
+  表头 / 行名与缺失值），导入后统一为单通道灰度 `ImageData`；`.npy` 仍按 NumPy 数组
+  读取，矩阵数组随源图像以 npz 内嵌保存，工程格式版本不变。
 * **端口数据类型**：`app/core/data_types.py` 是端口类型的唯一来源。`DataType`
   定义 `image / number / edges / contours / components` 五种类型；
   `NumberValue / EdgesData / ContoursData / ComponentsData` 是结构化值的运行时

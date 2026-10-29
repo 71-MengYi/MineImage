@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 import numpy as np
@@ -31,6 +32,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QGraphicsItem, QStyleOptionGraphicsItem, QWidget
 
+from app.core.constants import MATRIX_SUFFIXES
 from app.core.data_types import DataType, NumberValue, data_type_of, format_number
 from app.core.model import NodeModel
 from app.core.types import make_thumbnail
@@ -543,10 +545,20 @@ class NodeItem(QGraphicsItem):
         text_height = min(self.NOTE_MAX_TEXT_H, lines * self._canvas_line_spacing)
         return max(self.NOTE_MIN_TEXT_H, text_height) + 2.0 * self.NOTE_PADDING
 
+    def _is_matrix_source(self) -> bool:
+        """源节点是否由 CSV / 文本矩阵导入（画布用「矩阵」区分）。"""
+
+        if not self.node.is_source or not self.node.source_path:
+            return False
+        return Path(self.node.source_path).suffix.lower() in MATRIX_SUFFIXES
+
     def _refresh_tooltip(self) -> None:
         lines: list[str] = [self.node.display_title()]
         if self.node.is_source:
-            lines.append("原始图像节点")
+            if self._is_matrix_source():
+                lines.append("矩阵数据节点（由 CSV / 文本矩阵导入）")
+            else:
+                lines.append("原始图像节点")
         elif self.spec is not None:
             lines.append(f"{self.spec.name} · {self.spec.id}")
             if self.spec.description:
@@ -570,6 +582,8 @@ class NodeItem(QGraphicsItem):
         if self._error:
             return "错误", QColor("#dc2626")
         if self.node.is_source:
+            if self._is_matrix_source():
+                return "矩阵", QColor("#0f766e")
             return "原始图像", QColor("#0f766e")
         if self.is_stale:
             return "失效", QColor("#b45309")
@@ -648,7 +662,10 @@ class NodeItem(QGraphicsItem):
         painter.setFont(subtitle_font)
         painter.setPen(QColor("#6b7280"))
         if self.node.is_source:
-            subtitle = "原始图像 · 源节点"
+            if self._is_matrix_source():
+                subtitle = "矩阵数据 · 源节点"
+            else:
+                subtitle = "原始图像 · 源节点"
         elif self.spec is not None:
             subtitle = f"{self.spec.tab} · {self.spec.id}"
         else:

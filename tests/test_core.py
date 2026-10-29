@@ -13,7 +13,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 
-from app.core.imageio import load_image, save_image
+from app.core.imageio import ImageIOError, load_image, save_image
+from app.core.matrixio import MatrixIOError, parse_matrix_text, read_matrix_file
 from app.core.model import GraphError, GraphModel, NodeModel, WorkspaceModel
 from app.core.project import ProjectFormatError, load_project, save_project
 from app.core.types import (
@@ -108,6 +109,138 @@ class TestImageTypes(unittest.TestCase):
             np.testing.assert_array_equal(loaded.array, data)
         finally:
             path.unlink(missing_ok=True)
+
+
+class TestMatrixIO(TempDirMixin, unittest.TestCase):
+    """CSV / TSV / 文本矩阵导入导出。"""
+
+    def _write(self, name: str, text: str, encoding: str = "utf-8") -> Path:
+        path = self.unique(name)
+        path.write_text(text, encoding=encoding)
+        return path
+
+    def test_csv_loads_as_single_channel_int_matrix(self) -> None:
+        path = self._write("matrix.csv", "1,2,3\n4,5,6\n")
+        matrix = read_matrix_file(path)
+        self.assertEqual(matrix.array.shape, (2, 3))
+        self.assertEqual(matrix.array.dtype, np.int32)
+        self.assertEqual(matrix.delimiter, ",")
+        self.assertFalse(matrix.has_header)
+        np.testing.assert_array_equal(matrix.array, [[1, 2, 3], [4, 5, 6]])
+
+        image = load_image(path)
+        self.assertEqual(image.array.shape, (2, 3))
+        self.assertEqual(image.color_space, "L")
+        self.assertEqual(image.name, path.name)
+
+    def test_header_and_row_labels_are_detected(self) -> None:
+        matrix = parse_matrix_text(
+            "name,a,b\nr1,1.5,2\nr2,3,4.5\n",
+            name="expr.csv",
+            suffix=".csv",
+        )
+        np.testing.assert_allclose(matrix.array, [[1.5, 2.0], [3.0, 4.5]])
+        self.assertEqual(matrix.array.dtype, np.float64)
+        self.assertTrue(matrix.has_header)
+        self.assertEqual(matrix.column_labels, ("a", "b"))
+        self.assertEqual(matrix.row_labels, ("r1", "r2"))
+
+    def test_delimiter_detection(self) -> None:
+        semicolon = parse_matrix_text("1,5;2,5\n3,5;4,5\n", name="eu.csv", suffix=".csv")
+        self.assertEqual(semicolon.delimiter, ";")
+        np.testing.assert_allclose(semicolon.array, [[1.5, 2.5], [3.5, 4.5]])
+
+        tabbed = parse_matrix_text("1\t2\n3\t4\n", name="data.tsv", suffix=".tsv")
+        self.assertEqual(tabbed.delimiter, "\t")
+        np.testing.assert_array_equal(tabbed.array, [[1, 2], [3, 4]])
+
+        spaced = parse_matrix_text("1 2 3\n4 5 6\n", name="data.txt", suffix=".txt")
+        self.assertIsNone(spaced.delimiter)
+        np.testing.assert_array_equal(spaced.array, [[1, 2, 3], [4, 5, 6]])
+
+        piped = parse_matrix_text("1|2\n3|4\n", name="data.dat", suffix=".dat")
+        self.assertEqual(piped.delimiter, "|")
+
+        directive = parse_matrix_text("sep=;\n1;2\n3;4\n", name="excel.csv", suffix=".csv")
+        self.assertEqual(directive.delimiter, ";")
+        np.testing.assert_array_equal(directive.array, [[1, 2], [3, 4]])
+
+    def test_comments_bom_and_missing_cells(self) -> None:
+        matrix = parse_matrix_text(
+            "\ufeff# 注释\n\n1;2\n;3\n",
+            name="comment.txt",
+            suffix=".txt",
+        )
+        self.assertEqual(matrix.delimiter, ";")
+        self.assertFalse(matrix.has_header)
+        self.assertEqual(matrix.array.dtype, np.float64)
+        self.assertEqual(matrix.array.shape, (2, 2))
+        self.assertTrue(np.isnan(matrix.array[1, 0]))
+        self.assertEqual(matrix.array[0].tolist(), [1.0, 2.0])
+
+    def test_single_column_and_scientific_notation(self) -> None:
+        matrix = parse_matrix_text("1\n2\n3\n", name="column.txt", suffix=".txt")
+        self.assertEqual(matrix.array.shape, (3, 1))
+        self.assertEqual(matrix.array.dtype, np.int32)
+
+        values = parse_matrix_text("1.5e-3,-2E2\nnan,inf\n", name="sci.csv", suffix=".csv")
+        self.assertEqual(values.array.dtype, np.float64)
+        self.assertAlmostEqual(float(values.array[0, 0]), 0.0015)
+        self.assertAlmostEqual(float(values.array[0, 1]), -200.0)
+        self.assertTrue(np.isnan(values.array[1, 0]))
+        self.assertTrue(np.isinf(values.array[1, 1]))
+
+    def test_gbk_encoded_header(self) -> None:
+        path = self.unique("gbk.csv")
+        path.write_bytes("名称,数值\n甲,1\n乙,2\n".encode("gbk"))
+        matrix = read_matrix_file(path)
+        self.assertEqual(matrix.row_labels, ("甲", "乙"))
+        np.testing.assert_array_equal(matrix.array, [[1], [2]])
+
+    def test_parse_errors_are_chinese_and_actionable(self) -> None:
+        empty = self._write("empty.csv", "")
+        with self.assertRaises(MatrixIOError) as context:
+            read_matrix_file(empty)
+        self.assertIn("为空", str(context.exception))
+
+        with self.assertRaises(MatrixIOError) as context:
+            parse_matrix_text("1,2\n3,4,5\n", name="ragged.csv", suffix=".csv")
+        message = str(context.exception)
+        self.assertIn("第 2 行", message)
+        self.assertIn("列", message)
+
+        with self.assertRaises(MatrixIOError) as context:
+            parse_matrix_text("1,x\n3,4\n", name="bad.csv", suffix=".csv")
+        message = str(context.exception)
+        self.assertIn("不是数字", message)
+        self.assertIn("第 1 行第 2 列", message)
+
+        binary = self.unique("binary.dat")
+        binary.write_bytes(b"1,2\x00\x01")
+        with self.assertRaises(MatrixIOError) as context:
+            read_matrix_file(binary)
+        self.assertIn("二进制", str(context.exception))
+
+    def test_matrix_export_roundtrip(self) -> None:
+        float_path = self.unique("out.csv")
+        float_values = np.array([[1.5, 2.0], [3.0, 4.25]], dtype=np.float64)
+        save_image(float_path, ImageData(float_values))
+        loaded = load_image(float_path)
+        self.assertEqual(loaded.array.dtype, np.float64)
+        np.testing.assert_allclose(loaded.array, float_values)
+
+        int_path = self.unique("out.tsv")
+        int_values = np.array([[1, 2], [3, 4]], dtype=np.int32)
+        save_image(int_path, ImageData(int_values))
+        loaded_int = load_image(int_path)
+        self.assertEqual(loaded_int.array.dtype, np.int32)
+        np.testing.assert_array_equal(loaded_int.array, int_values)
+
+    def test_matrix_export_rejects_multichannel(self) -> None:
+        path = self.unique("rgb.csv")
+        with self.assertRaises(ImageIOError) as context:
+            save_image(path, ImageData(np.zeros((2, 2, 3), dtype=np.uint8)))
+        self.assertIn("二维单通道", str(context.exception))
 
 
 class TestGraphModel(unittest.TestCase):
