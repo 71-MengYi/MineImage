@@ -396,6 +396,21 @@ class PreviewWidgetTests(unittest.TestCase):
         self.assertNotAlmostEqual(rotated[0], azimuth, places=2)
         self.assertNotAlmostEqual(rotated[1], elevation, places=2)
 
+        # 仰角不限制：继续向下拖可以越过 90°（旧实现会卡在 82°）。
+        _mouse_event(self.widget, QEvent.Type.MouseButtonPress, start)
+        _mouse_event(
+            self.widget,
+            QEvent.Type.MouseMove,
+            start + QPointF(0.0, 140.0),
+        )
+        _mouse_event(
+            self.widget,
+            QEvent.Type.MouseButtonRelease,
+            start + QPointF(0.0, 140.0),
+            buttons=Qt.MouseButton.NoButton,
+        )
+        self.assertGreater(self.widget.mesh_camera()[1], 90.0)
+
         zoom_before = self.widget.zoom_percent()
         _send_wheel(self.widget, start)
         self.assertGreater(self.widget.zoom_percent(), zoom_before)
@@ -411,6 +426,20 @@ class PreviewWidgetTests(unittest.TestCase):
         QApplication.sendEvent(self.widget, double_click)
         self.assertAlmostEqual(self.widget.mesh_camera()[0], -37.5, places=3)
         self.assertAlmostEqual(self.widget.mesh_camera()[1], 30.0, places=3)
+
+    def test_mesh_flat_image_at_horizon_stays_finite(self) -> None:
+        """仰角可到 0°：平坦图像在该角度下不应产生无穷大的缩放坐标。"""
+
+        self.widget.set_image(ImageData(np.full((32, 48), 7, np.uint8), "flat"))
+        self.widget.set_display_mode("mesh")
+        self.widget._mesh_elevation = 0.0
+        self.widget.fit_to_window()
+        self.assertFalse(self.widget.grab().isNull())
+        geometry = self.widget._mesh_geometry_for(self.widget.current_image())
+        self.assertIsNotNone(geometry)
+        assert geometry is not None
+        self.assertTrue(np.isfinite(geometry.points).all())
+        self.assertLessEqual(float(np.abs(geometry.points).max()), 5000.0)
 
     def test_mouse_wheel_without_ctrl_only_zooms_mesh(self) -> None:
         center = QPointF(self.widget.width() / 2.0, self.widget.height() / 2.0)

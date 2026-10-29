@@ -100,9 +100,6 @@ _MESH_MAX_SIDE = 320
 #: 初始视角与 MATLAB `view(-37.5, 30)` 一致。
 _MESH_AZIMUTH = math.radians(-37.5)
 _MESH_ELEVATION = math.radians(30.0)
-#: 交互时允许的仰角范围（弧度）。
-_MESH_ELEVATION_MIN = math.radians(8.0)
-_MESH_ELEVATION_MAX = math.radians(82.0)
 #: 拖动旋转的灵敏度（弧度 / 屏幕像素）。
 _MESH_ROTATE_SPEED_X = math.radians(0.55)
 _MESH_ROTATE_SPEED_Y = math.radians(0.4)
@@ -808,12 +805,16 @@ class PreviewWidget(QWidget):
         projected_y = rotated_y * sin_el - grid_z * cos_el
         view_depth = rotated_y * cos_el + grid_z * sin_el
 
-        span_x = max(1e-6, float(projected_x.max() - projected_x.min()))
-        span_y = max(1e-6, float(projected_y.max() - projected_y.min()))
-        scale = min(
-            (float(field.width) * _MESH_PADDING) / span_x,
-            (float(field.height) * _MESH_PADDING) / span_y,
-        )
+        span_x = max(0.0, float(projected_x.max() - projected_x.min()))
+        span_y = max(0.0, float(projected_y.max() - projected_y.min()))
+        # 仰角接近 0° 且图像完全平坦时 span_y 可能为 0；不要让退化的
+        # 维度参与缩放，否则会把所有点放大到极端坐标。
+        limits: list[float] = []
+        if span_x > 1e-6:
+            limits.append((float(field.width) * _MESH_PADDING) / span_x)
+        if span_y > 1e-6:
+            limits.append((float(field.height) * _MESH_PADDING) / span_y)
+        scale = min(limits) if limits else 1.0
         points = np.empty((row_count, col_count, 2), dtype=np.float32)
         points[:, :, 0] = (projected_x - projected_x.min()) * scale + (
             float(field.width) - span_x * scale
@@ -1226,11 +1227,13 @@ class PreviewWidget(QWidget):
         azimuth = math.degrees(self._mesh_azimuth) % 360.0
         if azimuth > 180.0:
             azimuth -= 360.0
+        elevation = math.degrees(self._mesh_elevation)
+        elevation = (elevation + 180.0) % 360.0 - 180.0
         lines = [
             "Mesh · 左键拖动旋转 · 滚轮缩放",
             (
                 f"Shift/右键拖动平移 · 双击重置 · "
-                f"方位 {azimuth:.0f}° / 仰角 {math.degrees(self._mesh_elevation):.0f}°"
+                f"方位 {azimuth:.0f}° / 仰角 {elevation:.0f}°"
             ),
         ]
         max_width = max(120.0, self.width() * 0.62)
@@ -1664,11 +1667,8 @@ class PreviewWidget(QWidget):
             delta = position - self._mesh_rotate_last
             self._mesh_rotate_last = position
             self._mesh_azimuth -= delta.x() * _MESH_ROTATE_SPEED_X
-            self._mesh_elevation = _clamp(
-                self._mesh_elevation + delta.y() * _MESH_ROTATE_SPEED_Y,
-                _MESH_ELEVATION_MIN,
-                _MESH_ELEVATION_MAX,
-            )
+            # 仰角不设限制：可连续拖过顶部 / 底部，便于从任意方向观察曲面。
+            self._mesh_elevation += delta.y() * _MESH_ROTATE_SPEED_Y
             self.update()
             return
         if self._dragging_divider:
