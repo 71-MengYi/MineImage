@@ -510,6 +510,52 @@ class ExecutionEngineTests(EngineTestCase):
         self.assertFalse(self.wait_chain(unknown.id))
         self.assertIn("找不到算子", self.engine.error(unknown.id).message)
 
+    # ------------------------------------------------------------------ 便签 / 空输出
+    def test_sticky_note_without_input_is_not_an_error(self) -> None:
+        note = self.add_op("note.sticky", "便签", {"text": "说明文字"})
+        self.engine.preview_node(note.id)
+        self.assertTrue(self.wait_chain(note.id))
+        self.assertEqual(self.failures, [])
+        result = self.engine.result(note.id)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.outputs, {})
+        self.assertEqual(result.summary_text(), "算子没有输出")
+
+    def test_sticky_note_passes_through_any_data(self) -> None:
+        source = self.add_source(_image())
+        note = self.add_op("note.sticky", "便签", {"text": "透传"})
+        sink = self.add_op("output.display", "输出预览")
+        self.connect(source, note, "image", "data")
+        self.connect(note, sink, "data", "data")
+
+        self.engine.preview_node(sink.id)
+        self.assertTrue(self.wait_chain(sink.id))
+        self.assertEqual(self.failures, [])
+        source_result = self.engine.result(source.id)
+        note_result = self.engine.result(note.id)
+        self.assertIsNotNone(source_result)
+        self.assertIsNotNone(note_result)
+        # 万能端口不复制、不转换：便签输出就是上游的同一个对象。
+        self.assertIs(note_result.outputs["data"], source_result.outputs["image"])
+
+    def test_empty_output_requires_operator_opt_in(self) -> None:
+        registry = OperatorRegistry.build([OPS_FIXTURES])
+        engine = self.new_engine(registry=registry)
+        events = self.attach_events(engine)
+        denied = self.add_op("test.empty_output", "空输出被拒绝")
+        allowed = self.add_op("test.empty_output_allowed", "空输出被允许")
+
+        engine.preview_node(denied.id)
+        self.assertFalse(self.wait_chain_in(events["chain"], denied.id))
+        self.assertEqual([node_id for node_id, _message in events["failures"]], [denied.id])
+        self.assertIn("没有产生任何输出", events["failures"][0][1])
+        self.assertIsNone(engine.result(denied.id))
+
+        engine.preview_node(allowed.id)
+        self.assertTrue(self.wait_chain_in(events["chain"], allowed.id))
+        self.assertIsNotNone(engine.result(allowed.id))
+        self.assertEqual(engine.result(allowed.id).outputs, {})
+
     # ------------------------------------------------------------------ 多端口
     def test_channel_split_and_merge_multi_port_roundtrip(self) -> None:
         source_array = _image()

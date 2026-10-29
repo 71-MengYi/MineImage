@@ -297,6 +297,31 @@ class TestOperatorSpec(unittest.TestCase):
         with self.assertRaises(ParamValidationError):
             coerce_param_value(spec.param("roi"), [1, 2, 0, 4])
 
+    def test_canvas_text_param_must_reference_string_param(self) -> None:
+        note = OperatorSpec(
+            id="test.note",
+            name="便签",
+            params=(ParamSpec("text", "文字", "string", multiline=True),),
+            canvas_text_param="text",
+            allow_empty_output=True,
+        )
+        self.assertEqual(note.canvas_text_param, "text")
+        self.assertTrue(note.allow_empty_output)
+        with self.assertRaises(ValueError):
+            OperatorSpec(
+                id="test.note_missing",
+                name="错误便签",
+                params=(ParamSpec("text", "文字", "string"),),
+                canvas_text_param="missing",
+            )
+        with self.assertRaises(ValueError):
+            OperatorSpec(
+                id="test.note_not_string",
+                name="错误便签",
+                params=(ParamSpec("ksize", "核大小", "int", default=3),),
+                canvas_text_param="ksize",
+            )
+
     def test_output_normalization_and_port_validation(self) -> None:
         spec = self._spec()
         array = np.zeros((2, 2), dtype=np.uint8)

@@ -42,6 +42,11 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
   数据中的任意一种，输出按运行时类型原样透传；连线校验只要任意一端为万能端口即兼容。
   `其他 → 可视化 → 输出预览`（`output.display`）就用一个 `data` 输入和一个
   `data` 输出实现任意链路的终点。
+* **便签节点**：`其他 → 可视化 → 便签`（`note.sticky`）同样使用万能入口 / 出口，
+  但节点卡片由 `OperatorSpec.canvas_text_param` 声明为文字卡片：只显示可编辑的便签
+  文字（暖色样式、按行数自适应高度），不渲染缩略图 / 数值 / 数组提示。
+  `OperatorSpec.allow_empty_output` 允许它在未接输入时返回空输出而不算失败，
+  输入端口声明为 `optional=True`，因此便签可以单独放在画布上。
 * **算子**：`app/operators/spec.py` 定义 `OperatorSpec / ParamSpec / PortSpec /
   Operator`；`loader.py` 扫描目录。每个算子文件定义模块级 `OPERATOR`。
   参数联动 `visible_when/enabled_when` 使用受限 `eval`：支持裸参数名与

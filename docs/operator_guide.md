@@ -146,6 +146,8 @@ OperatorSpec(
 | `params` | `tuple[ParamSpec, ...]` | `()` | 参数声明 |
 | `keywords` | `tuple[str, ...]` | `()` | 参与算子库搜索 |
 | `notes` | `str` | `""` | 说明浮层追加段落 |
+| `canvas_text_param` | `str` | `""` | 在画布卡片内显示这个 `string` 参数的文字（便签 / 注释节点）；设置后卡片不再显示结果数据 |
+| `allow_empty_output` | `bool` | `False` | 允许 `process()` 返回空输出（例如便签未接输入时）；默认空输出会报错 |
 
 构造时会校验：
 
@@ -705,6 +707,35 @@ class Output(Operator):
   数量、画布尺寸、形状、前几个点等详情；
 * `render_preview()` 保留给算子**显式**生成可视化输出（例如连通域分析的彩色标签图），
   不再参与节点预览 / 缩略图的自动回退。
+
+如果是便签 / 注释类节点，希望卡片只显示一段可编辑文字，可同时使用
+`canvas_text_param` 与 `allow_empty_output`：
+
+```python
+from app.operators.spec import Operator, OperatorSpec, ParamSpec, PortSpec
+
+class Note(Operator):
+    spec = OperatorSpec(
+        id="example.note",
+        name="便签",
+        category=("其他", "可视化"),
+        inputs=(PortSpec("data", "任意数据", any_type=True, optional=True),),
+        outputs=(PortSpec("data", "任意数据", any_type=True),),
+        params=(ParamSpec("text", "便签文字", "string", default="", multiline=True),),
+        canvas_text_param="text",
+        allow_empty_output=True,
+    )
+
+    def process(self, data=None, **_):
+        return {"data": data} if data is not None else {}
+```
+
+* `canvas_text_param` 必须指向一个已声明的 `string` 参数；设置后节点卡片改用暖色
+  便签样式，只显示该参数的文字，不再绘制缩略图 / 数值 / 数组提示；
+* 文字在参数面板中编辑（`multiline=True` 提供多行输入框），修改后画布卡片实时重排；
+* `allow_empty_output=True` 允许未接输入时不产生输出，避免出现
+  “算子没有产生任何输出”的节点错误；
+* 便签的万能输入建议同时声明 `optional=True`，这样单独摆放不会报“缺少输入”。
 
 ---
 

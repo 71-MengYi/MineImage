@@ -124,7 +124,7 @@ REQUIRED_IDS = {
     "analysis.phase_correlate", "analysis.template_match", "analysis.psnr",
     "analysis.ssim", "analysis.match_shapes",
     # 通用能力与特征匹配
-    "feature.match", "misc.cv2_call", "misc.cv2_info", "output.display",
+    "feature.match", "misc.cv2_call", "misc.cv2_info", "output.display", "note.sticky",
 }
 
 CJK = ("\u4e00", "\u9fff")
@@ -215,6 +215,31 @@ class OpenCVCatalogTests(unittest.TestCase):
         self.assertEqual(
             list(tabs),
             [category for category in CATEGORY_ORDER if category in tabs],
+        )
+
+    def test_sticky_note_passes_through_and_allows_empty_output(self) -> None:
+        entry = self.registry.entry("note.sticky")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.spec.category, ("其他", "可视化"))
+        self.assertEqual(entry.spec.canvas_text_param, "text")
+        self.assertTrue(entry.spec.allow_empty_output)
+        self.assertTrue(entry.spec.inputs[0].optional)
+        self.assertTrue(entry.spec.inputs[0].any_type)
+        self.assertTrue(entry.spec.outputs[0].any_type)
+
+        params = normalize_params(entry.spec, {"text": "第一行\n第二行"})
+        self.assertEqual(params["text"], "第一行\n第二行")
+        image = ImageData(self.samples["bgr8"])
+        outputs = output_to_dict(entry.spec, entry.operator.process(data=image, **params))
+        self.assertIs(outputs["data"], image)
+        number = NumberValue(3.0, "计数")
+        self.assertIs(
+            output_to_dict(entry.spec, entry.operator.process(data=number, **params))["data"],
+            number,
+        )
+        self.assertEqual(
+            output_to_dict(entry.spec, entry.operator.process(data=None, **params)),
+            {},
         )
 
     def test_catalog_metadata(self) -> None:

@@ -976,7 +976,7 @@ class _EvalState:
             call_kwargs.update(params)
             output = entry.operator.process(**call_kwargs)
             outputs = output_to_dict(spec, output)
-            if not outputs:
+            if not outputs and not spec.allow_empty_output:
                 raise OperatorError("算子没有产生任何输出")
             for key, value in outputs.items():
                 if isinstance(value, ImageData) and value.name in ("", "image"):

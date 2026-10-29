@@ -21,7 +21,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QRectF, Qt
-from PySide6.QtGui import QDropEvent, QUndoStack, QWheelEvent
+from PySide6.QtGui import QDropEvent, QImage, QPainter, QUndoStack, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -97,6 +97,17 @@ OUTPUT_SPEC = OperatorSpec(
     outputs=(PortSpec("data", "任意数据", any_type=True),),
 )
 
+NOTE_SPEC = OperatorSpec(
+    id="note.sticky",
+    name="便签",
+    category=("其他", "可视化"),
+    inputs=(PortSpec("data", "任意数据", any_type=True, optional=True),),
+    outputs=(PortSpec("data", "任意数据", any_type=True),),
+    params=(ParamSpec("text", "便签文字", "string", default="", multiline=True),),
+    canvas_text_param="text",
+    allow_empty_output=True,
+)
+
 
 class FakeRegistry:
     """仅实现 GraphView 需要的 ``spec`` 查询接口。"""
@@ -115,7 +126,7 @@ class FakeRegistry:
 
 
 def make_registry() -> FakeRegistry:
-    return FakeRegistry(BLUR_SPEC, MERGE_SPEC, SPLIT_SPEC, OUTPUT_SPEC)
+    return FakeRegistry(BLUR_SPEC, MERGE_SPEC, SPLIT_SPEC, OUTPUT_SPEC, NOTE_SPEC)
 
 
 #: 测试用算子组定义：一个输入 -> 一个模糊节点 -> 一个输出。
@@ -1649,6 +1660,53 @@ class GraphViewTestCase(unittest.TestCase):
 
         self.view.set_thumbnails_enabled(True)
         self.assertIsNotNone(item.thumbnail_pixmap)
+
+    def test_note_card_shows_text_instead_of_result_data(self) -> None:
+        node = self.add_node(
+            "note.sticky",
+            params={"text": "第一行便签\n第二行"},
+            pos=(20.0, 20.0),
+        )
+        item = self.item(node)
+        self.assertTrue(item.is_note_card)
+        self.assertEqual(item.canvas_text, "第一行便签\n第二行")
+        self.assertIsNone(item.thumbnail_pixmap)
+        self.assertAlmostEqual(item.size().width(), NodeItem.NOTE_WIDTH)
+        height = item.size().height()
+
+        # 便签不显示结果数据：即使输出一张图像也不生成缩略图，高度只由文字决定。
+        image = ImageData(np.zeros((24, 36, 3), dtype=np.uint8))
+        self.view.notify_result(
+            node.id, NodeResult(node.id, {"data": image}, 5.0, node.revision)
+        )
+        self.assertIsNone(item.thumbnail_pixmap)
+        self.assertEqual(item.size().height(), height)
+        self.assertIn("第一行便签", item.toolTip())
+
+        # 参数变化会同步重排卡片：行数增加后卡片变高。
+        longer = "\n".join(["便签内容"] * 10)
+        self.graph.set_node_params(node.id, {"text": longer})
+        self.assertEqual(item.canvas_text, longer)
+        self.assertGreater(item.size().height(), height)
+
+        # 长文字与占位文字都能正常绘制。
+        canvas = QImage(320, 320, QImage.Format.Format_ARGB32)
+        painter = QPainter(canvas)
+        try:
+            item.paint(painter, None, None)
+        finally:
+            painter.end()
+
+    def test_note_card_placeholder_and_rename(self) -> None:
+        node = self.add_node("note.sticky", pos=(0.0, 0.0))
+        item = self.item(node)
+        self.assertEqual(item.canvas_text, "")
+        self.assertIn("空便签", item.toolTip())
+        self.assertGreaterEqual(item.size().height(), NodeItem.NOTE_MIN_TEXT_H)
+
+        self.graph.rename_node(node.id, "流程说明")
+        self.assertIn("流程说明", item.toolTip())
+        self.assertFalse(item.is_stale)
 
     def test_refresh_all_rebuilds_items(self) -> None:
         first = self.add_node("test.blur", pos=(0.0, 0.0))

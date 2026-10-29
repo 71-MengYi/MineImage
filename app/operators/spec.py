@@ -267,6 +267,11 @@ class OperatorSpec:
     params: tuple[ParamSpec, ...] = ()
     keywords: tuple[str, ...] = ()
     notes: str = ""
+    #: 在画布卡片内显示这个字符串参数的内容（便签 / 注释类节点）；
+    #: 设置后卡片只显示文字，不再显示结果数据（缩略图 / 数值 / 数组提示）。
+    canvas_text_param: str = ""
+    #: 允许 ``process()`` 在未连接输入等情况下返回空输出（例如便签节点）。
+    allow_empty_output: bool = False
 
     def __post_init__(self) -> None:
         if not self.id or not re.match(r"^[A-Za-z0-9_.-]+$", self.id):
@@ -304,6 +309,16 @@ class OperatorSpec:
                 coerce_param_value(param, defaults[param.key])
             except ParamValidationError as exc:
                 raise ValueError(f"参数 {param.key} 的默认值非法：{exc.message}") from exc
+        if self.canvas_text_param:
+            text_params = [param for param in self.params if param.key == self.canvas_text_param]
+            if not text_params:
+                raise ValueError(
+                    f"canvas_text_param 指向不存在的参数：{self.canvas_text_param}"
+                )
+            if text_params[0].type != "string":
+                raise ValueError(
+                    f"canvas_text_param 只能指向 string 参数：{self.canvas_text_param}"
+                )
 
     @property
     def tab(self) -> str:

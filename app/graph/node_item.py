@@ -1,7 +1,9 @@
 """画布上的节点卡片。
 
 节点外观为浅色圆角卡片：标题、分类 / 算子 id、上边缘的输入端口、下边缘的输出端口、
-右下角耗时、结果区（图像缩略图 / 单个数值 / 数组提示）以及出错时的红色边框与 tooltip。
+右下角耗时、结果区（图像缩略图 / 单个数值 / 数组提示 / 便签文字）以及出错时的红色
+边框与 tooltip。算子通过 ``OperatorSpec.canvas_text_param`` 声明便签文字参数后，
+卡片改为暖色便签样式，只显示该参数的文字，不显示任何结果数据。
 节点条目的位置始终与 :class:`NodeModel.pos`（左上角场景坐标）保持一致。
 
 端口改为上下方向后，输入端口沿节点上边缘水平分布，输出端口沿下边缘水平分布；
@@ -24,6 +26,8 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QTextLayout,
+    QTextOption,
 )
 from PySide6.QtWidgets import QGraphicsItem, QStyleOptionGraphicsItem, QWidget
 
@@ -80,6 +84,11 @@ class NodeItem(QGraphicsItem):
     FOOTER_LABEL_GAP = 3.0
     BOTTOM_LABEL_GAP = 8.0
     THUMB_MARGIN = 8.0
+    # 便签卡片（OperatorSpec.canvas_text_param）的文字内边距、最小 / 最大文字高度。
+    NOTE_WIDTH = 240.0
+    NOTE_PADDING = 10.0
+    NOTE_MIN_TEXT_H = 34.0
+    NOTE_MAX_TEXT_H = 150.0
 
     def __init__(
         self,
@@ -102,11 +111,18 @@ class NodeItem(QGraphicsItem):
         self._thumbnail_box = max(24, int(thumbnail_box))
         self._result: Any = None
         self._thumb_pixmap: QPixmap | None = None
-        self._content_mode = "empty"  # empty | thumb | number | numbers | array
+        self._content_mode = "empty"  # empty | thumb | number | numbers | array | note
         self._content_label = ""
         self._content_value = ""
         self._content_hint = ""
         self._footer_number = ""
+        # 由 OperatorSpec.canvas_text_param 声明的卡片文字（便签 / 注释类节点）。
+        self._text_param_key = (
+            str(getattr(spec, "canvas_text_param", "") or "") if spec is not None else ""
+        )
+        self._canvas_text = ""
+        self._canvas_lines: list[str] = []
+        self._canvas_line_spacing = 14.0
         self._elapsed: float | None = None
         self._error: str | None = None
         self._thumb_rect = QRectF()
@@ -129,6 +145,7 @@ class NodeItem(QGraphicsItem):
         self.setZValue(0.0)
         self.setPos(QPointF(float(node.pos[0]), float(node.pos[1])))
         self._build_ports()
+        self._update_content()
         self._rebuild_geometry()
         self._refresh_tooltip()
 
@@ -150,6 +167,12 @@ class NodeItem(QGraphicsItem):
         return self._thumb_pixmap
 
     @property
+    def canvas_text(self) -> str:
+        """便签卡片显示的文字（非便签卡片为空字符串）。"""
+
+        return self._canvas_text
+
+    @property
     def is_stale(self) -> bool:
         """节点引用的算子未注册 / 已失效。"""
 
@@ -158,6 +181,12 @@ class NodeItem(QGraphicsItem):
             and not self.node.is_source
             and getattr(self.node, "group", None) is None
         )
+
+    @property
+    def is_note_card(self) -> bool:
+        """卡片是否显示 ``canvas_text_param`` 指定的文字（便签 / 注释样式）。"""
+
+        return bool(self._text_param_key)
 
     @property
     def input_ports(self) -> dict[str, PortItem]:
@@ -253,7 +282,12 @@ class NodeItem(QGraphicsItem):
         output_count = len(self._output_ports)
         port_count = max(input_count, output_count, 1)
         needed = 2.0 * self.PORT_MARGIN + self.PORT_SPACING * (port_count - 1)
-        self._width = min(self.MAX_WIDTH, max(self.WIDTH, needed))
+        base_width = self.NOTE_WIDTH if self.is_note_card else self.WIDTH
+        self._width = min(self.MAX_WIDTH, max(base_width, needed))
+
+        # 便签文字按最终卡片宽度排版，下面用它计算文字区高度。
+        if self.is_note_card:
+            self._layout_canvas_text()
 
         header_top = self.TOP_LABEL_GAP
         if input_count:
@@ -277,7 +311,9 @@ class NodeItem(QGraphicsItem):
             )
         text_area = 0.0
         if not thumb_area:
-            if self._content_mode == "number":
+            if self.is_note_card:
+                text_area = self._canvas_text_height()
+            elif self._content_mode == "number":
                 text_area = 48.0
             elif self._content_mode in ("array", "numbers"):
                 text_area = 40.0
@@ -378,11 +414,16 @@ class NodeItem(QGraphicsItem):
         self.update()
 
     def refresh_from_model(self) -> None:
+        if self.is_note_card:
+            # 便签文字来自参数：文字变化会改变卡片高度，需要重新排版。
+            self._update_content()
+            self._rebuild_geometry()
+            self._refresh_connections()
         self._refresh_tooltip()
         self.update()
 
     def _update_content(self) -> None:
-        """按结果类型决定节点中部显示缩略图、数值还是数组提示。"""
+        """按结果类型决定节点中部显示缩略图、数值、数组提示或便签文字。"""
 
         self._thumb_pixmap = None
         self._content_mode = "empty"
@@ -390,6 +431,9 @@ class NodeItem(QGraphicsItem):
         self._content_value = ""
         self._content_hint = ""
         self._footer_number = ""
+        if self.is_note_card:
+            self._update_canvas_text()
+            return
         if self._result is None:
             return
 
@@ -435,6 +479,70 @@ class NodeItem(QGraphicsItem):
             self._content_label = f"数值 ×{len(numbers)}"
             self._content_hint = "双击节点查看详情"
 
+    # ------------------------------------------------------------- 便签文字
+    @staticmethod
+    def _canvas_text_font() -> QFont:
+        font = QFont("Microsoft YaHei UI")
+        font.setPointSizeF(8.6)
+        return font
+
+    @staticmethod
+    def _canvas_text_placeholder() -> str:
+        return "双击节点输入便签文字"
+
+    def _update_canvas_text(self) -> None:
+        params = getattr(self.node, "params", None) or {}
+        value = params.get(self._text_param_key, "")
+        self._canvas_text = "" if value is None else str(value)
+        self._content_mode = "note"
+
+    @staticmethod
+    def _wrap_canvas_text(text: str, width: float, font: QFont) -> list[str]:
+        """按给定宽度换行；保留显式换行产生的空行。"""
+
+        option = QTextOption()
+        option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        wrapped: list[str] = []
+        for paragraph in text.splitlines() or [""]:
+            if not paragraph:
+                wrapped.append("")
+                continue
+            layout = QTextLayout(paragraph, font)
+            layout.setTextOption(option)
+            layout.beginLayout()
+            while True:
+                line = layout.createLine()
+                if not line.isValid():
+                    break
+                line.setLineWidth(width)
+                start = line.textStart()
+                wrapped.append(paragraph[start : start + line.textLength()])
+            layout.endLayout()
+        return wrapped or [""]
+
+    def _layout_canvas_text(self) -> None:
+        """按当前卡片宽度排版便签文字；超出上限时在最后一行加省略号。"""
+
+        text = self._canvas_text.strip() or self._canvas_text_placeholder()
+        width = max(
+            40.0,
+            self._width - 2.0 * self.THUMB_MARGIN - 2.0 * self.NOTE_PADDING,
+        )
+        font = self._canvas_text_font()
+        metrics = QFontMetrics(font)
+        self._canvas_line_spacing = max(12.0, float(metrics.lineSpacing()))
+        lines = self._wrap_canvas_text(text, width, font)
+        max_lines = max(1, int(self.NOTE_MAX_TEXT_H // self._canvas_line_spacing))
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] = _elide(font, lines[-1].rstrip() + "…", width)
+        self._canvas_lines = lines
+
+    def _canvas_text_height(self) -> float:
+        lines = max(1, len(self._canvas_lines))
+        text_height = min(self.NOTE_MAX_TEXT_H, lines * self._canvas_line_spacing)
+        return max(self.NOTE_MIN_TEXT_H, text_height) + 2.0 * self.NOTE_PADDING
+
     def _refresh_tooltip(self) -> None:
         lines: list[str] = [self.node.display_title()]
         if self.node.is_source:
@@ -443,8 +551,12 @@ class NodeItem(QGraphicsItem):
             lines.append(f"{self.spec.name} · {self.spec.id}")
             if self.spec.description:
                 lines.append(self.spec.description.strip().splitlines()[0])
-            for port in self.spec.outputs:
-                lines.append(f"输出 {port.label}：{port.type_text()}")
+            if self.is_note_card:
+                lines.append("便签文字（双击节点编辑）：")
+                lines.append(self._canvas_text.strip() or "（空便签）")
+            else:
+                for port in self.spec.outputs:
+                    lines.append(f"输出 {port.label}：{port.type_text()}")
         else:
             lines.append(f"未注册的算子：{self.node.op_id}")
         if self._error:
@@ -476,16 +588,20 @@ class NodeItem(QGraphicsItem):
         shadow.addRoundedRect(rect.translated(0.0, 2.0), self.CORNER, self.CORNER)
         painter.drawPath(shadow)
 
-        painter.fillPath(body, QColor("#ffffff"))
+        note_card = self.is_note_card
+        painter.fillPath(body, QColor("#fffdf2") if note_card else QColor("#ffffff"))
 
         painter.save()
         painter.setClipPath(body)
         header_color = QColor("#f6f8fb")
         if self.node.is_source:
             header_color = QColor("#eef7f5")
+        elif note_card:
+            header_color = QColor("#fbf3d6")
         painter.fillRect(self._header_rect, header_color)
-        if self.node.is_source:
-            painter.fillRect(QRectF(0.0, 0.0, 3.0, self._height), QColor("#0f766e"))
+        if self.node.is_source or note_card:
+            accent = "#0f766e" if self.node.is_source else "#d9b84a"
+            painter.fillRect(QRectF(0.0, 0.0, 3.0, self._height), QColor(accent))
         painter.restore()
 
         error = self._error is not None
@@ -497,6 +613,9 @@ class NodeItem(QGraphicsItem):
             border_width = 2.0
         elif self.node.is_source:
             border_color = QColor("#7fbfb5")
+            border_width = 1.2
+        elif note_card:
+            border_color = QColor("#e6d7a4")
             border_width = 1.2
         else:
             border_color = QColor("#cfd6de")
@@ -582,8 +701,11 @@ class NodeItem(QGraphicsItem):
             y = self._thumb_rect.y() + (self._thumb_rect.height() - pixmap.height()) / 2.0
             painter.drawPixmap(QPointF(round(x), round(y)), pixmap)
 
+        # 便签文字：直接绘制在卡片中部，不画结果数据框。
+        if self._content_mode == "note" and self._content_rect.height() > 0.0:
+            self._paint_canvas_text(painter)
         # 数值 / 数组提示：没有缩略图时占用节点中部
-        if self._content_rect.height() > 0.0:
+        elif self._content_rect.height() > 0.0:
             painter.setPen(QPen(QColor("#e2e7ec"), 1.0))
             painter.setBrush(QColor("#f8fafc"))
             painter.drawRoundedRect(self._content_rect, 6.0, 6.0)
@@ -633,10 +755,13 @@ class NodeItem(QGraphicsItem):
         footer_font = QFont("Microsoft YaHei UI")
         footer_font.setPointSizeF(7.0)
         painter.setFont(footer_font)
-        painter.setPen(QColor("#94a3b8"))
+        painter.setPen(QColor("#a29464") if note_card else QColor("#94a3b8"))
         footer_y = self._footer_rect.top()
         output_count = len(self._output_ports)
-        footer_left = self._footer_number or f"输出 {output_count}"
+        if note_card:
+            footer_left = "便签"
+        else:
+            footer_left = self._footer_number or f"输出 {output_count}"
         painter.drawText(
             QRectF(12.0, footer_y, self._width / 2.0, self.FOOTER_H),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
@@ -645,6 +770,10 @@ class NodeItem(QGraphicsItem):
         if error:
             footer_text = "错误"
             painter.setPen(QColor("#dc2626"))
+        elif note_card:
+            count = len(self._canvas_text.strip())
+            footer_text = f"{count} 字" if count else "空便签"
+            painter.setPen(QColor("#a29464"))
         elif self._elapsed is not None:
             footer_text = f"{self._elapsed:.1f} ms"
             painter.setPen(QColor("#64748b"))
@@ -655,6 +784,32 @@ class NodeItem(QGraphicsItem):
             int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
             footer_text,
         )
+
+    def _paint_canvas_text(self, painter: QPainter) -> None:
+        """绘制便签文字；文字为空时显示「双击节点输入便签文字」占位。"""
+
+        text_rect = self._content_rect.adjusted(
+            self.NOTE_PADDING,
+            self.NOTE_PADDING,
+            -self.NOTE_PADDING,
+            -self.NOTE_PADDING,
+        )
+        if text_rect.width() <= 4.0 or text_rect.height() <= 4.0:
+            return
+        font = self._canvas_text_font()
+        metrics = QFontMetrics(font)
+        painter.setFont(font)
+        placeholder = not self._canvas_text.strip()
+        painter.setPen(QColor("#b5a86f") if placeholder else QColor("#564a20"))
+        painter.save()
+        painter.setClipRect(text_rect)
+        y = text_rect.top() + float(metrics.ascent())
+        for line in self._canvas_lines:
+            if y - metrics.ascent() > text_rect.bottom():
+                break
+            painter.drawText(QPointF(text_rect.left(), y), line)
+            y += self._canvas_line_spacing
+        painter.restore()
 
     # ------------------------------------------------------------------ 交互
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value: Any) -> Any:  # noqa: N802 - Qt 接口
