@@ -34,7 +34,6 @@ from PySide6.QtGui import (
     QOffscreenSurface,
     QOpenGLContext,
     QPainter,
-    QPainterPath,
     QPen,
     QPolygonF,
     QSurfaceFormat,
@@ -111,8 +110,6 @@ _MESH_ROTATE_SPEED_Y = math.radians(0.4)
 _MESH_HEIGHT = 0.42
 #: 投影后内容占虚拟图像框的比例，留一点边距。
 _MESH_PADDING = 0.92
-#: 网格线目标数量（按数据网格固定间隔，缩放时线条间距随之放大）。
-_MESH_GRID_LINES = 30
 #: OpenGL FBO 超采样倍数上限与最大边长。
 _MESH_GL_SUPERSAMPLE = 2.0
 _MESH_GL_MAX_SIDE = 2400
@@ -128,18 +125,14 @@ _GL_LESS = 0x0201
 _GL_COLOR_BUFFER_BIT = 0x4000
 _GL_DEPTH_BUFFER_BIT = 0x0100
 
-#: mesh 曲面着色器：顶点直接输出屏幕 NDC；片元按插值的网格坐标画网格线，
-#: 网格线在片元阶段生成，天然具备深度消隐。
+#: mesh 曲面着色器：顶点直接输出屏幕 NDC + 平滑插值颜色。
 _MESH_GL_VERTEX_SHADER = """
 #version 330 core
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aColor;
-layout(location = 2) in vec2 aCell;
 out vec3 vColor;
-out vec2 vCell;
 void main() {
     vColor = aColor;
-    vCell = aCell;
     gl_Position = vec4(aPos, 1.0);
 }
 """
@@ -147,24 +140,9 @@ void main() {
 _MESH_GL_FRAGMENT_SHADER = """
 #version 330 core
 in vec3 vColor;
-in vec2 vCell;
-uniform float uGridStep;
-uniform float uLineHalf;
 out vec4 fragColor;
-float lineMask(float value, float step, float halfWidth) {
-    float distance = abs(mod(value + step * 0.5, step) - step * 0.5);
-    return 1.0 - smoothstep(halfWidth * 0.5, halfWidth, distance);
-}
 void main() {
-    float line = max(lineMask(vCell.x, uGridStep, uLineHalf),
-                     lineMask(vCell.y, uGridStep, uLineHalf));
-    float luminance = dot(vColor, vec3(0.299, 0.587, 0.114));
-    // 深色曲面上用浅色网格线，浅色曲面上用深色网格线，保证两者都清晰。
-    vec3 gridColor = luminance > 0.42
-        ? vec3(0.10, 0.14, 0.20)
-        : vec3(0.84, 0.90, 0.97);
-    vec3 color = mix(vColor, gridColor, line * 0.55);
-    fragColor = vec4(color, 1.0);
+    fragColor = vec4(vColor, 1.0);
 }
 """
 
@@ -281,8 +259,6 @@ class PreviewWidget(QWidget):
         self._gl_vao: QOpenGLVertexArrayObject | None = None
         self._gl_fbo: QOpenGLFramebufferObject | None = None
         self._gl_fbo_size = QSize(0, 0)
-        self._gl_grid_uniform = -1
-        self._gl_line_uniform = -1
 
         self._panning = False
         self._pan_last = QPointF()
@@ -904,11 +880,9 @@ class PreviewWidget(QWidget):
             vbo.bind()
             program.bind()
             program.enableAttributeArray(0)
-            program.setAttributeBuffer(0, _GL_FLOAT, 0, 3, 8 * 4)
+            program.setAttributeBuffer(0, _GL_FLOAT, 0, 3, 6 * 4)
             program.enableAttributeArray(1)
-            program.setAttributeBuffer(1, _GL_FLOAT, 3 * 4, 3, 8 * 4)
-            program.enableAttributeArray(2)
-            program.setAttributeBuffer(2, _GL_FLOAT, 6 * 4, 2, 8 * 4)
+            program.setAttributeBuffer(1, _GL_FLOAT, 3 * 4, 3, 6 * 4)
             vao.release()
             program.release()
 
@@ -917,8 +891,6 @@ class PreviewWidget(QWidget):
             self._gl_program = program
             self._gl_vbo = vbo
             self._gl_vao = vao
-            self._gl_grid_uniform = program.uniformLocation(b"uGridStep")
-            self._gl_line_uniform = program.uniformLocation(b"uLineHalf")
             self._gl_ready = True
             self._gl_failed = False
             return True
@@ -980,10 +952,6 @@ class PreviewWidget(QWidget):
             data, row_count, col_count = self._build_mesh_gl_vertices(
                 geometry, pane, width, height
             )
-            line_half = _clamp(0.45 / max(1.0, self._zoom), 0.12, 0.5)
-            grid_step = float(
-                max(1, int(round(max(row_count, col_count) / float(_MESH_GRID_LINES))))
-            )
 
             gl = context.functions()
             gl.glViewport(0, 0, fbo_size.width(), fbo_size.height())
@@ -992,8 +960,6 @@ class PreviewWidget(QWidget):
             gl.glDepthFunc(_GL_LESS)
             gl.glClear(_GL_COLOR_BUFFER_BIT | _GL_DEPTH_BUFFER_BIT)
             program.bind()
-            gl.glUniform1f(self._gl_grid_uniform, grid_step)
-            gl.glUniform1f(self._gl_line_uniform, float(line_half))
             raw = data.tobytes()
             vbo.bind()
             vbo.allocate(raw, len(raw))
@@ -1036,7 +1002,7 @@ class PreviewWidget(QWidget):
         depth = geometry.depth
         row_count, col_count = points.shape[:2]
         if row_count < 2 or col_count < 2:
-            return np.zeros((0, 8), dtype=np.float32), row_count, col_count
+            return np.zeros((0, 6), dtype=np.float32), row_count, col_count
         zoom = self._zoom
         local_x = (
             points[:, :, 0] * zoom + pane.offset.x() - float(pane.rect.left())
@@ -1052,14 +1018,12 @@ class PreviewWidget(QWidget):
             depth_ndc = 1.0 - (depth - low) / (high - low) * 2.0
         else:
             depth_ndc = np.zeros_like(depth)
-        full = np.empty((row_count, col_count, 8), dtype=np.float32)
+        full = np.empty((row_count, col_count, 6), dtype=np.float32)
         full[:, :, 0] = local_x * 2.0 - 1.0
         full[:, :, 1] = 1.0 - local_y * 2.0
         full[:, :, 2] = depth_ndc
         full[:, :, 3:6] = colors * (1.0 / 255.0)
-        full[:, :, 6] = np.arange(col_count, dtype=np.float32)[None, :]
-        full[:, :, 7] = np.arange(row_count, dtype=np.float32)[:, None]
-        strips = np.empty((row_count - 1, 2 * col_count, 8), dtype=np.float32)
+        strips = np.empty((row_count - 1, 2 * col_count, 6), dtype=np.float32)
         strips[:, 0::2, :] = full[:-1]
         strips[:, 1::2, :] = full[1:]
         return np.ascontiguousarray(strips), row_count, col_count
@@ -1089,8 +1053,6 @@ class PreviewWidget(QWidget):
         screen = np.empty_like(points)
         screen[:, :, 0] = points[:, :, 0] * zoom + pane.offset.x()
         screen[:, :, 1] = points[:, :, 1] * zoom + pane.offset.y()
-        step = max(1, int(round(max(row_count, col_count) / float(_MESH_GRID_LINES))))
-        line_width = _clamp(zoom * 0.55, 0.55, 1.35)
         cos_az = math.cos(self._mesh_azimuth)
         sin_az = math.sin(self._mesh_azimuth)
         painter.save()
@@ -1106,9 +1068,6 @@ class PreviewWidget(QWidget):
                     screen[index + 1, :, :],
                     colors[index, :, :],
                     colors[index + 1, :, :],
-                    index,
-                    step,
-                    line_width,
                 )
         else:
             order = range(col_count - 1) if sin_az >= 0 else range(col_count - 2, -1, -1)
@@ -1120,9 +1079,6 @@ class PreviewWidget(QWidget):
                     screen[:, index + 1, :],
                     colors[:, index, :],
                     colors[:, index + 1, :],
-                    index,
-                    step,
-                    line_width,
                 )
         painter.restore()
 
@@ -1134,11 +1090,8 @@ class PreviewWidget(QWidget):
         line_b: np.ndarray,
         colors_a: np.ndarray,
         colors_b: np.ndarray,
-        secondary_index: int,
-        step: int,
-        line_width: float,
     ) -> None:
-        """画一条连续的曲面条带（两排高度点之间），再叠加网格线。"""
+        """画一条连续的曲面条带（两排高度点之间），用渐变色平滑过渡。"""
 
         point_count = len(line_a)
         if point_count < 2:
@@ -1178,19 +1131,6 @@ class PreviewWidget(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QBrush(gradient))
         painter.drawPolygon(polygon)
-
-        path = QPainterPath()
-        if secondary_index % step == 0:
-            path.moveTo(first)
-            for x, y in line_a[1:]:
-                path.lineTo(QPointF(float(x), float(y)))
-        for index in range(0, point_count, step):
-            path.moveTo(QPointF(float(line_a[index, 0]), float(line_a[index, 1])))
-            path.lineTo(QPointF(float(line_b[index, 0]), float(line_b[index, 1])))
-        if not path.isEmpty():
-            painter.setPen(QPen(QColor(30, 41, 59, 80), line_width))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawPath(path)
 
     def _draw_mesh_fallback(
         self,

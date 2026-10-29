@@ -389,7 +389,7 @@ pick_cancelled = Signal(str)
 显示模式与对比布局相互独立：`imshow` 按原始颜色 / 灰度显示；`imagesc` 用
 `app.core.types.to_scaled_rgb()` 把数据 min/max 拉伸后套用 parula 色带；`mesh`
 用 `app.core.types.intensity_grid()` 把强度降采样（最长边 320）成高度场，按
-方位角 / 仰角投影成平滑着色曲面，网格线在片元着色器中生成，天然带深度消隐。
+方位角 / 仰角投影成平滑着色曲面（不绘制网格线）。
 
 * mesh 优先用**离屏 OpenGL 3.3** 渲染（2× 超采样 + 4× MSAA FBO，MSAA 读回后
   缩放回面板）；上下文不可用时自动回退到软件条带渲染（降采样到 160 边）。

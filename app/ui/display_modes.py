@@ -5,7 +5,7 @@
 
 * **Imshow**：带太阳与山峦的相框，代表按原始颜色 / 灰度显示；
 * **Imagesc**：色带填充的网格，代表把数值范围映射到伪彩色；
-* **Mesh**：透视网格曲面，代表以像素强度为高度的三维网格。
+* **Mesh**：透视曲面，代表以像素强度为高度的平滑三维曲面。
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ DISPLAY_MODE_SPECS: tuple[tuple[str, str, str], ...] = (
     (
         "mesh",
         "Mesh",
-        "Mesh：以像素强度为高度绘制三维曲面网格；拖动旋转、滚轮缩放、双击重置（MATLAB mesh）",
+        "Mesh：以像素强度为高度绘制平滑三维曲面；拖动旋转、滚轮缩放、双击重置（MATLAB mesh）",
     ),
 )
 
