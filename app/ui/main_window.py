@@ -484,6 +484,11 @@ class MainWindow(QMainWindow):
         widget.status_message.connect(lambda msg, w=widget: self._on_workspace_message(w, msg))
         widget.library.refresh_requested.connect(self.refresh_operators)
         widget.operator_refresh_requested.connect(self.refresh_operators)
+        # 引擎在运行前发现算子文件变化时，同步重建注册表但不要再次 preview，
+        # 当前请求会继续使用新注册表执行。
+        widget.engine.operator_reload_requested.connect(
+            lambda _checked=False: self.refresh_operators(preview=False)
+        )
         widget.undo_stack.canUndoChanged.connect(self._refresh_edit_actions)
         widget.undo_stack.canRedoChanged.connect(self._refresh_edit_actions)
         widget.graph_view.node_created.connect(lambda _id: self._refresh_edit_actions())
@@ -842,7 +847,7 @@ class MainWindow(QMainWindow):
         self._setup_operator_watcher()
 
     # ------------------------------------------------------------------ 算子
-    def refresh_operators(self) -> None:
+    def refresh_operators(self, _checked: bool = False, *, preview: bool = True) -> None:
         self.statusBar().showMessage("正在扫描算子目录…")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
@@ -851,7 +856,7 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         self.registry = new_registry
         for widget in self._workspaces:
-            widget.set_registry(new_registry)
+            widget.set_registry(new_registry, preview=preview)
         self._watch_snapshot = self._operator_snapshot()
         count = len(new_registry)
         errors = len(new_registry.errors)
@@ -864,21 +869,25 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------- 算子热加载轮询
     def _operator_snapshot(self) -> dict[str, tuple[int, int]]:
         """记录扫描目录内 .py 文件的 (mtime_ns, size)，用于可选的自动刷新。"""
-        snapshot: dict[str, tuple[int, int]] = {}
-        for root in self.registry.scan_roots:
-            try:
-                files = root.rglob("*.py")
-                for path in files:
-                    if "__pycache__" in path.parts or path.name.startswith("."):
-                        continue
-                    try:
-                        stat = path.stat()
-                    except OSError:
-                        continue
-                    snapshot[str(path)] = (stat.st_mtime_ns, stat.st_size)
-            except OSError:
-                continue
-        return snapshot
+        try:
+            return self.registry.file_snapshot(include_builtin=True)
+        except AttributeError:
+            # 兼容极旧的注册表实现（测试替身）；正常构建的注册表都有该方法。
+            snapshot: dict[str, tuple[int, int]] = {}
+            for root in self.registry.scan_roots:
+                try:
+                    files = root.rglob("*.py")
+                    for path in files:
+                        if "__pycache__" in path.parts or path.name.startswith("."):
+                            continue
+                        try:
+                            stat = path.stat()
+                        except OSError:
+                            continue
+                        snapshot[str(path)] = (stat.st_mtime_ns, stat.st_size)
+                except OSError:
+                    continue
+            return snapshot
 
     def _setup_operator_watcher(self) -> None:
         self._watch_snapshot = self._operator_snapshot()

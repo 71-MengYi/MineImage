@@ -11,9 +11,11 @@ GUI 事件循环（不使用 ``app.exec()``）。
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -842,6 +844,160 @@ class ExecutionEngineTests(EngineTestCase):
         self.assertEqual(self.finished, [])
         self.assertFalse(self.engine.busy)
         self.engine.shutdown()  # 幂等
+
+
+class OperatorReloadTests(EngineTestCase):
+    """用户算子文件变化后，引擎在计算前静默重载注册表。"""
+
+    _TMP_ROOT = ROOT / "tests" / ".tmp"
+    _TEMPLATE = '''\
+"""测试用重载探针：process 返回固定像素值的图像。{tag}"""
+
+import numpy as np
+
+from app.operators.spec import Operator, OperatorSpec
+
+
+class ReloadProbe(Operator):
+    spec = OperatorSpec(
+        id="test.reload_probe",
+        name="重载探针",
+        category=("测试",),
+        description="返回固定像素值，用于验证算子文件热重载。",
+    )
+
+    def process(self, image=None, **_):
+        return np.full(image.array.shape, {value}, dtype=np.uint8)
+
+
+OPERATOR = ReloadProbe
+'''
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        self.op_dir = self._TMP_ROOT / f"reload-ops-{uuid.uuid4().hex[:10]}"
+        self.op_dir.mkdir()
+        self.addCleanup(shutil.rmtree, self.op_dir, True)
+        self._write_operator(7)
+        self.registry = OperatorRegistry.build([self.op_dir], include_builtin=False)
+        self.assertIn("test.reload_probe", self.registry)
+        self.engine.set_registry(self.registry)
+        self.reload_requests: list[int] = []
+        self.engine.operator_reload_requested.connect(
+            lambda: self.reload_requests.append(1)
+        )
+
+    def _write_operator(self, value: int, *, tag: str = "") -> None:
+        """改写算子文件，保证快照变化且不复用旧字节码。
+
+        ``importlib`` 的 ``__pycache__`` 校验只使用秒级 mtime + 文件字节数：
+        同一秒内写入字节数相同的两次内容会命中旧 .pyc。这里每次写入都追加不同
+        长度的 tag（改变 size）并显式推进 mtime_ns，确保测试验证的是引擎的
+        重载逻辑，而不是 importlib 的缓存行为。
+        """
+
+        path = self.op_dir / "reload_probe.py"
+        path.write_text(self._TEMPLATE.format(value=value, tag=tag), encoding="utf-8")
+        stat = path.stat()
+        previous = getattr(self, "_forced_mtime_ns", stat.st_mtime_ns)
+        forced = max(stat.st_mtime_ns, previous) + 1_000_000_000
+        self._forced_mtime_ns = forced
+        os.utime(path, ns=(forced, forced))
+
+    def _build_probe_node(self):
+        source = self.add_source(_image())
+        node = self.add_op("test.reload_probe", "重载探针")
+        self.connect(source, node)
+        return node
+
+    def _result_value(self, node_id: str) -> int | None:
+        result = self.engine.result(node_id)
+        if result is None or result.primary is None:
+            return None
+        return int(result.primary.array[0, 0, 0])
+
+    def test_modified_operator_file_requests_single_reload(self) -> None:
+        node = self._build_probe_node()
+        self.engine.preview_node(node.id)
+        self.assertTrue(self.wait_chain(node.id))
+        self.assertEqual(self.reload_requests, [])
+
+        self._write_operator(222, tag="-")
+        self.engine.preview_node(node.id)
+        self.assertEqual(len(self.reload_requests), 1)
+
+        # 文件没再变化：后续请求不得重复发信号（避免反复重建注册表）。
+        self.engine.preview_node(node.id)
+        self.engine.refresh_node(node.id)
+        self.assertEqual(len(self.reload_requests), 1)
+
+    def test_unchanged_operator_files_do_not_request_reload(self) -> None:
+        node = self._build_probe_node()
+        self.engine.preview_node(node.id)
+        self.assertTrue(self.wait_chain(node.id))
+        self.engine.commit_node(node.id)
+        self.assertTrue(self.wait_chain(node.id))
+        self.engine.update_nodes([node.id])
+        self.assertTrue(self.wait_chain(node.id))
+        self.engine.precompute_all()
+        self.assertTrue(self.pump(lambda: not self.engine.busy))
+        self.assertEqual(self.reload_requests, [])
+
+    def test_modified_file_uses_rebuilt_registry_for_current_request(self) -> None:
+        node = self._build_probe_node()
+
+        def rebuild_registry() -> None:
+            # 模拟主窗口 refresh_operators(preview=False)：重建并同步替换注册表。
+            new_registry = OperatorRegistry.build([self.op_dir], include_builtin=False)
+            self.engine.set_registry(new_registry)
+
+        # 先按旧代码算一次：重载后必须丢弃旧缓存，不能回放旧结果。
+        self.engine.preview_node(node.id)
+        self.assertTrue(self.wait_chain(node.id))
+        self.assertEqual(self._result_value(node.id), 7)
+
+        self.engine.operator_reload_requested.connect(rebuild_registry)
+        self._write_operator(222, tag="--")
+        self.engine.preview_node(node.id)
+        self.assertEqual(len(self.reload_requests), 1)
+        self.assertTrue(
+            self.pump(lambda: self._result_value(node.id) == 222),
+            f"重载后仍使用旧算子代码：{self._result_value(node.id)}",
+        )
+        np.testing.assert_array_equal(
+            self.engine.result(node.id).primary.array,
+            np.full(_image().shape, 222, dtype=np.uint8),
+        )
+
+    def test_all_request_entries_check_operator_files(self) -> None:
+        node = self._build_probe_node()
+        entries = [
+            ("preview_node", lambda: self.engine.preview_node(node.id)),
+            ("commit_node", lambda: self.engine.commit_node(node.id)),
+            ("refresh_node", lambda: self.engine.refresh_node(node.id)),
+            ("update_nodes", lambda: self.engine.update_nodes([node.id])),
+            ("precompute_all", self.engine.precompute_all),
+        ]
+        for index, (name, call) in enumerate(entries, start=1):
+            self._write_operator(index, tag="-" * index)
+            before = len(self.reload_requests)
+            call()
+            self.assertEqual(len(self.reload_requests), before + 1, f"{name} 未检测到文件变化")
+            self.assertTrue(self.pump(lambda: not self.engine.busy), f"{name} 未在超时内完成")
+
+    def test_change_stays_pending_until_receiver_connected(self) -> None:
+        """没有接收者时不消费快照：连接槽后的下一个请求仍会补发一次。"""
+
+        engine = self.new_engine(registry=self.registry)
+        self._write_operator(222, tag="---")
+        engine.preview_node("missing-node")  # 无接收者：不发信号、不消费快照
+        late_requests: list[int] = []
+        engine.operator_reload_requested.connect(lambda: late_requests.append(1))
+        engine.preview_node("missing-node")
+        self.assertEqual(late_requests, [1])
+        engine.preview_node("missing-node")
+        self.assertEqual(late_requests, [1])
 
 
 class RegistryTests(EngineTestCase):

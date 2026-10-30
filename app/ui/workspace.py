@@ -133,7 +133,7 @@ class WorkspaceWidget(QWidget):
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(5)
 
-        self.library = OperatorLibrary(self.splitter)
+        self.library = OperatorLibrary(self.splitter, settings=self.settings)
         self.library.setMinimumWidth(220)
         self.library.set_registry(self.registry)
 
@@ -204,7 +204,7 @@ class WorkspaceWidget(QWidget):
 
     # ------------------------------------------------------------------ 连接
     def _connect_signals(self) -> None:
-        self.library.refresh_requested.connect(lambda: self.status_message.emit("请从“算子”菜单刷新算子库"))
+        self.library.status_message.connect(self.status_message.emit)
         self.graph_view.selection_changed.connect(self._on_node_selected)
         self.graph_view.node_activated.connect(self.open_parameters)
         self.graph_view.node_created.connect(self._on_node_created)
@@ -253,7 +253,13 @@ class WorkspaceWidget(QWidget):
         self._sync_settings()
         self._on_pixel_info(self._last_pixel_sample)
 
-    def set_registry(self, registry: OperatorRegistry) -> None:
+    def set_registry(self, registry: OperatorRegistry, *, preview: bool = True) -> None:
+        """替换算子注册表并刷新依赖它的界面。
+
+        ``preview=False`` 用于引擎在计算前发现文件变化后静默重载：只更新
+        library / graph / engine 的注册表，不在这里再次触发 ``preview_node``，
+        避免与引擎当前请求重入；当前请求会继续使用新注册表执行。
+        """
         self.registry = registry
         self.library.set_registry(registry)
         self.graph_view.set_registry(registry)
@@ -263,7 +269,11 @@ class WorkspaceWidget(QWidget):
             entry = registry.entry(node.op_id) if node else None
             if entry is None or node is None:
                 self.back_to_graph()
-        if self._current_node_id and self._current_node_id in self.workspace.graph.nodes:
+        if (
+            preview
+            and self._current_node_id
+            and self._current_node_id in self.workspace.graph.nodes
+        ):
             self.engine.preview_node(self._current_node_id)
 
     # ------------------------------------------------------------------ 图像

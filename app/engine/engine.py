@@ -15,6 +15,9 @@
   无法中断时允许新请求并行启动，旧结果最终被 generation 检查丢弃；
 * 节点级结果缓存（快照）：点击节点立刻拿到上次结果，参数变更会重算当前节点
   与下游，保证画布显示的数据始终与参数一致；
+* 每次对外计算请求开始前检查用户算子文件（mtime_ns + size）是否变化；变化时
+  同步发出 operator_reload_requested，由主窗口重建注册表，原请求继续使用新
+  注册表执行，因此保存算子文件后无需手动刷新算子库；
 * 算子组节点（Group Node）在快照阶段用 GraphModel.resolve_source 把组边界上的
   连线解析成真实普通节点端口；组的每个输出端口作为一条 "@out:<port>" 伪输入参与
   依赖 / 拓扑排序，组内节点仍作为独立节点执行并回传 node_finished；
@@ -225,6 +228,8 @@ class ExecutionEngine(QObject):
     #: 每次真正提交新请求时发出（generation）；旧请求中未完成的节点不会再有
     #: finished / failed，界面据此清理“运行中”的计时。
     request_started = Signal(int)
+    #: 运行前发现用户算子文件变化，请求上层重建注册表（同步槽，发出后即生效）。
+    operator_reload_requested = Signal()
 
     # 内部跨线程信号（接收者都是本对象，自动排队到主线程）
     _started = Signal(int, str)
@@ -261,6 +266,11 @@ class ExecutionEngine(QObject):
         # 允许两个请求同时在跑：新请求不必等待旧请求里无法中断的慢算子结束，
         # 旧 generation 的排队结果会由 _on_* 的 generation 检查丢弃。
         self._pool.setMaxThreadCount(2)
+        # 用户算子文件快照（路径 -> (mtime_ns, size)）；None 表示当前注册表不支持
+        # 快照（例如测试替身），此时热重载检测自然跳过。
+        self._operator_file_snapshot: dict[str, tuple[int, int]] | None = None
+        self._reloading_operators = False
+        self._operator_file_snapshot = self._read_operator_file_snapshot(registry)
 
         self._started.connect(self._on_started)
         self._computed.connect(self._on_computed)
@@ -292,6 +302,8 @@ class ExecutionEngine(QObject):
         """
         if self._shutting_down:
             return
+        # 早于缓存判断与图快照：算子文件变化后本次请求即使用重建后的注册表。
+        self._maybe_reload_operator_files()
         node = self.workspace.graph.nodes.get(node_id)
         if node is None:
             return
@@ -311,6 +323,7 @@ class ExecutionEngine(QObject):
         """保存：使该节点及全部下游失效，并重算整棵下游子树。"""
         if self._shutting_down:
             return
+        self._maybe_reload_operator_files()
         if node_id not in self.workspace.graph.nodes:
             return
         self._clear_cached(node_id, downstream=True)
@@ -320,6 +333,7 @@ class ExecutionEngine(QObject):
         """强制重算单个节点（不重算下游，上游按需补齐）。"""
         if self._shutting_down:
             return
+        self._maybe_reload_operator_files()
         if node_id not in self.workspace.graph.nodes:
             return
         self._clear_cached(node_id, downstream=False)
@@ -333,6 +347,7 @@ class ExecutionEngine(QObject):
         """
         if self._shutting_down:
             return
+        self._maybe_reload_operator_files()
         roots: list[str] = []
         seen: set[str] = set()
         for node_id in node_ids:
@@ -357,6 +372,7 @@ class ExecutionEngine(QObject):
 
         if self._shutting_down:
             return
+        self._maybe_reload_operator_files()
         node_ids = list(self.workspace.graph.nodes)
         if not node_ids:
             return
@@ -489,7 +505,83 @@ class ExecutionEngine(QObject):
 
     def set_registry(self, registry: OperatorRegistry) -> None:
         self.registry = registry
+        snapshot = self._read_operator_file_snapshot(registry)
+        if snapshot is not None:
+            self._operator_file_snapshot = snapshot
         self.invalidate_all()
+
+    @staticmethod
+    def _read_operator_file_snapshot(
+        registry: OperatorRegistry,
+    ) -> dict[str, tuple[int, int]] | None:
+        """读取用户算子文件快照。
+
+        契约由 ``OperatorRegistry.file_snapshot(*, include_builtin=False)`` 提供；
+        若注册表对象不支持（例如测试替身）或读取失败，返回 None 表示“本次无法
+        判断”，调用方保持原快照，避免误判为文件变化。
+        """
+
+        file_snapshot = getattr(registry, "file_snapshot", None)
+        if not callable(file_snapshot):
+            return None
+        try:
+            return dict(file_snapshot(include_builtin=False))
+        except Exception:  # noqa: BLE001 - 快照失败不能阻断计算请求
+            LOG.debug("读取用户算子文件快照失败", exc_info=True)
+            return None
+
+    def _maybe_reload_operator_files(self) -> None:
+        """计算请求开始前检查用户算子文件是否变化，必要时静默重载。
+
+        在所有对外计算入口（preview_node / commit_node / refresh_node /
+        update_nodes / precompute_all）的最开始调用，早于缓存判断与
+        ``_capture_graph()``。发现变化时先确认存在接收者，再记录新快照并同步
+        发出 operator_reload_requested：主窗口收到后重建注册表并调用
+        set_registry，因此原请求继续时 ``self.registry`` 已经是新代码。
+
+        用 ``_reloading_operators`` 防重入：emit 期间主窗口若因其它路径再次
+        触发计算入口，不会嵌套发出第二个重载请求，也不会重复重建注册表。
+
+        没有接收者时（独立使用引擎、未接主窗口）不消费新快照，下一个计算请求
+        会再次检测并补发；连接槽后仍使用旧注册表的场景需要接收者自行调用
+        set_registry，引擎不会替上层重建注册表。
+        """
+
+        if self._shutting_down or self._reloading_operators:
+            return
+        latest = self._read_operator_file_snapshot(self.registry)
+        if latest is None:
+            return
+        previous = self._operator_file_snapshot
+        if previous is None:
+            # 第一次建立基线：不触发重建。
+            self._operator_file_snapshot = latest
+            return
+        if latest == previous:
+            return
+        if not self._has_operator_reload_receivers():
+            # 没人接收就保持“未消费”：连接槽后的下一个请求仍会补发一次。
+            return
+        self._operator_file_snapshot = latest
+        self._reloading_operators = True
+        try:
+            self.operator_reload_requested.emit()
+        except Exception:  # noqa: BLE001 - 上层刷新失败不能阻断本次计算
+            LOG.exception("算子文件变化后重建注册表失败")
+        finally:
+            self._reloading_operators = False
+
+    def _has_operator_reload_receivers(self) -> bool:
+        """operator_reload_requested 是否至少连接了一个槽。
+
+        PySide6 的 ``QObject.receivers()`` 只接受 Qt 签名串（信号名前缀 ``2``）；
+        取不到时按“有接收者”处理，保持与旧版本一致的消费语义。
+        """
+
+        try:
+            return self.receivers("2operator_reload_requested()") > 0
+        except Exception:  # noqa: BLE001 - 不同 PySide6 版本的签名格式差异
+            return True
 
     def shutdown(self) -> None:
         """停止后台计算；可重复调用。"""

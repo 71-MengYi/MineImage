@@ -231,6 +231,7 @@ MineImage 是一个基于 PySide6 的节点式图像处理实验工作台。本�
 | 复制粘贴节点 | 新节点与副本间连线一步入栈；连线事件按 30ms 合并后重算新节点及相关下游 |
 | 打开工程 | 重新创建引擎并清空缓存；随后 `precompute_all()` 以全部节点为根、按广度优先层序一次算完每个子树（含未接线节点与算子组容器），结果与缩略图不再需要手动点击触发；`chain_finished` 只对每个末端节点报告一次 |
 | 并行 worker 配置 | `execution/workers`（设置 → 常规 → 后台计算 → 并行线程数）：默认 `min(4, CPU 核数)`，范围 1–16；只影响后续请求，不打断正在运行的任务 |
+| 算子文件变化 | 目录监视默认开启（每 3 秒比较 mtime/size）；关闭监视时，每次计算请求前由引擎比较 `file_snapshot()`，变化则重建注册表后再抓快照，本次请求即使用新代码 |
 
 后台任务由 generation 编号；新请求会取消旧任务，旧结果不得写入界面。一次请求内部
 按 DAG 拓扑序把互不依赖的分支并行提交到多线程执行器：兄弟分支真正同时运行，有
@@ -336,13 +337,19 @@ node_failed = Signal(str, str)         # node id, message
 chain_finished = Signal(str, bool)     # root id, success
 busy_changed = Signal(bool)
 request_started = Signal(int)          # 新请求真正提交时的 generation；旧请求残留的“运行中”状态据此清理
+operator_reload_requested = Signal()   # 运行前发现用户算子文件变化，请求上层重建注册表
 ```
 
 `workers` 缺省取 `AppSettings.execution_workers`（`execution/workers`，默认
 `min(4, CPU 核数)`，范围 1–16）。同一次请求内多个 worker 并发调用
 `Operator.process()`，算子必须线程安全。
 
+所有对外计算入口（`preview_node` / `commit_node` / `refresh_node` /
 `update_nodes` / `precompute_all`）都会在缓存判断与图快照之前调用
+`_maybe_reload_operator_files()`：比较 `OperatorRegistry.file_snapshot()` 的
+mtime/size，发现用户算子文件变化时同步发出 `operator_reload_requested`。
+主窗口收到后以 `refresh_operators(preview=False)` 重建注册表，当前请求继续使用
+新注册表执行；`_reloading_operators` 标志防止刷新期间重入产生第二个请求。
 
 算子组节点在抓取快照时被展开成真实上游依赖：组的每个输出端口记录一条
 `"@out:<port>"` 伪输入，普通连线用 `GraphModel.resolve_source()` 跨过组边界，
@@ -352,13 +359,31 @@ request_started = Signal(int)          # 新请求真正提交时的 generation�
 ### OperatorLibrary（`app/ui/library.py`）
 
 ```python
+OperatorLibrary(parent=None, *, settings: AppSettings | None = None,
+                user_operator_dir: Path | str | None = None)
+
 set_registry(registry) -> None
-refresh_requested = Signal()
+refresh_requested = Signal()          # 新建 / 改名 / 删除后请求上层重扫
+status_message = Signal(str)          # 文件操作失败提示（主窗口转状态栏）
+
+# 右键菜单与可测试入口
+build_context_menu(item) -> QMenu
+create_operator(category=None) -> str | None
+create_category_named(parent, name) -> Path | None
+rename_operator_to(op_id, new_stem) -> bool
+delete_operator(op_id, confirm=True) -> bool
+open_editor(op_id) -> bool
+select_operator(op_id) -> bool
+begin_rename_operator(op_id) -> bool
 # 拖拽数据 MIME: app.core.constants.MIME_OPERATOR，payload JSON {"id": op_id}
 ```
 
-一级分类顺序来自 `OperatorRegistry.tabs()`（`CATEGORY_ORDER` 决定），
-「用户自定义算子」固定第一；算子组在说明浮层中标注「算子组」。
+一级分类顺序来自 `OperatorRegistry.tabs()`（`CATEGORY_ORDER` 决定），并把
+`known_categories()` 里的 0 算子空分类合并进树；「用户自定义算子」固定第一；
+算子组在说明浮层中标注「算子组」。非内置条目文本使用
+`OperatorEntry.display_name`：界面新建（带 `MINEIMAGE_UI_CREATED` 标记）的算子
+跟随文件 stem，其余仍显示 `spec.name`；原地改名只改文件名（必要时同步模板
+`name`），不改变算子 id。
 
 ### ReplaceOperatorDialog（`app/ui/replace_operator.py`）
 
@@ -442,6 +467,10 @@ SettingsDialog(settings: AppSettings, parent=None)
 applied = Signal()
 ```
 
+「算子目录」页包含用户算子目录、内置算子开关、目录监视开关、默认编辑器选择
+（`operators/editor`）与配置文件路径；默认编辑器由 `app/core/editor.py` 探测
+VS Code / PyCharm 等，亦可用 `system` 或 `path:<可执行文件>` 指定。
+
 ### Theme（`app/ui/theme.py`）
 
 ```python
@@ -452,7 +481,7 @@ apply_theme(app: QApplication) -> None
 
 | 范围 | 负责人 |
 | --- | --- |
-| `app/core/**`（含 `app/core/group.py`）, `app/operators/spec.py`, `app/operators/loader.py`, `app/operators/group.py`, `app/config.py`, `app/ui/main_window.py`, `app/ui/workspace.py`, `app/main.py`, `pyproject.toml`, `tests/test_group.py`, `tests/test_group_integration.py` | Lead |
+| `app/core/**`（含 `app/core/group.py`、`app/core/editor.py`、`app/core/operator_files.py`）, `app/operators/spec.py`, `app/operators/loader.py`, `app/operators/template.py`, `app/operators/group.py`, `app/config.py`, `app/ui/main_window.py`, `app/ui/workspace.py`, `app/main.py`, `pyproject.toml`, `tests/test_group.py`, `tests/test_group_integration.py` | Lead |
 | `app/engine/**`, `app/operators/builtin/**`, `tests/test_engine.py`, `tests/test_operators.py`, `tests/test_group_engine.py` | engine-ops |
 | `app/graph/**`（含 `app/graph/group_item.py`）, `tests/test_graph.py` | graph-ui |
 | `app/ui/preview.py`, `app/ui/display_modes.py`, `app/ui/library.py`, `app/ui/replace_operator.py`, `app/ui/params.py`, `app/ui/settings_dialog.py`, `app/ui/theme.py`, `tests/test_widgets.py` | shell-ui |

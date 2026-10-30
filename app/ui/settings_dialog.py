@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -358,6 +359,8 @@ class SettingsDialog(QDialog):
         group_layout.addLayout(buttons)
         layout.addWidget(group)
 
+        layout.addWidget(self._build_editor_group(page))
+
         options = QGroupBox("扫描选项", page)
         options_layout = QVBoxLayout(options)
         options_layout.setContentsMargins(12, 16, 12, 10)
@@ -393,6 +396,121 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         return page
 
+    def _build_editor_group(self, page: QWidget) -> QGroupBox:
+        group = QGroupBox("默认编辑器", page)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(12, 16, 12, 10)
+        layout.setSpacing(8)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        caption = QLabel("打开用户算子：", group)
+        self.editor_combo = QComboBox(group)
+        self.editor_combo.setMinimumWidth(300)
+        self.editor_combo.setToolTip("右键用户算子「打开编辑器」时使用的程序。")
+        self.redetect_button = QPushButton("重新检测", group)
+        self.redetect_button.setToolTip("重新扫描本机已安装的代码编辑器。")
+        self.redetect_button.clicked.connect(self._on_redetect_editors)
+        self.custom_editor_button = QPushButton("浏览…", group)
+        self.custom_editor_button.setToolTip("手动选择编辑器可执行文件。")
+        self.custom_editor_button.clicked.connect(self._on_choose_editor)
+        row.addWidget(caption, 0)
+        row.addWidget(self.editor_combo, 1)
+        row.addWidget(self.redetect_button, 0)
+        row.addWidget(self.custom_editor_button, 0)
+        layout.addLayout(row)
+        hint = QLabel(
+            "“自动”优先使用检测到的 VS Code / PyCharm；“系统默认程序”交给操作系统"
+            "打开 .py 文件；也可用「浏览…」指定其他编辑器。该选择只用于右键用户"
+            "算子的「打开编辑器」。",
+            group,
+        )
+        hint.setObjectName("hintLabel")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self._refresh_editor_options()
+        return group
+
+    @staticmethod
+    def _editor_choices() -> list[tuple[str, str]]:
+        """默认编辑器候选项：(设置值, 显示文本)。编辑器模块未就绪时只保留前两项。"""
+
+        try:
+            from app.core import editor as editor_module
+        except Exception:  # noqa: BLE001 - 并行开发期编辑器模块可能尚未就绪
+            editor_module = None
+        auto = str(getattr(editor_module, "AUTO_EDITOR", "auto") or "auto")
+        system = str(getattr(editor_module, "SYSTEM_EDITOR", "system") or "system")
+        choices: list[tuple[str, str]] = [
+            (auto, "自动（优先 VS Code / PyCharm）"),
+            (system, "系统默认程序"),
+        ]
+        detect = getattr(editor_module, "detect_editors", None)
+        if callable(detect):
+            try:
+                detected = detect()
+            except Exception:  # noqa: BLE001 - 探测失败不应阻塞设置页
+                detected = []
+            seen = {key for key, _text in choices}
+            for info in detected:
+                key = str(getattr(info, "key", "") or "")
+                if not key or key in seen:
+                    continue
+                name = str(getattr(info, "name", "") or key)
+                executable = str(getattr(info, "executable", "") or "")
+                text = f"{name}（{executable}）" if executable else name
+                choices.append((key, text))
+                seen.add(key)
+        return choices
+
+    def _refresh_editor_options(self, selected: str | None = None) -> None:
+        """重建编辑器下拉项，并尽量保持当前选择（含未探测到的历史值）。"""
+
+        current = str(selected or "")
+        if not current and getattr(self, "editor_combo", None) is not None:
+            current = str(self.editor_combo.currentData() or "")
+        if not current:
+            current = str(getattr(self.settings, "default_editor", "auto") or "auto")
+        choices = self._editor_choices()
+        combo = self.editor_combo
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            for key, text in choices:
+                combo.addItem(text, key)
+            index = combo.findData(current)
+            if index < 0:
+                if current.startswith("path:"):
+                    text = f"自定义：{current[len('path:') :]}"
+                else:
+                    text = f"当前设置（未检测到）：{current}"
+                combo.addItem(text, current)
+                index = combo.count() - 1
+            combo.setCurrentIndex(index)
+        finally:
+            combo.blockSignals(False)
+
+    def _on_redetect_editors(self) -> None:
+        selected = str(self.editor_combo.currentData() or "")
+        self._refresh_editor_options(selected)
+
+    def _on_choose_editor(self) -> None:
+        """手动选择一个编辑器可执行文件，写入 ``path:<路径>``。"""
+
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "选择编辑器可执行文件",
+            str(Path.home()),
+            "可执行文件 (*.exe *.cmd *.bat);;所有文件 (*)",
+        )
+        if not path:
+            return
+        value = f"path:{path}"
+        index = self.editor_combo.findData(value)
+        if index < 0:
+            self.editor_combo.addItem(f"自定义：{path}", value)
+            index = self.editor_combo.count() - 1
+        self.editor_combo.setCurrentIndex(index)
+
     # ------------------------------------------------------------------ 数据
     def _load_values(self) -> None:
         self.undo_spin.setValue(max(1, int(self.settings.undo_limit)))
@@ -408,6 +526,9 @@ class SettingsDialog(QDialog):
         self.dirs_list.clear()
         for path in self.settings.extra_operator_dirs:
             self._add_dir_item(path)
+        self._refresh_editor_options(
+            str(getattr(self.settings, "default_editor", "auto") or "auto")
+        )
 
     def extra_dirs(self) -> list[str]:
         result: list[str] = []
@@ -572,6 +693,7 @@ class SettingsDialog(QDialog):
         self.settings.extra_operator_dirs = self.extra_dirs()
         self.settings.builtin_operators_enabled = self.builtin_check.isChecked()
         self.settings.watch_operator_dirs = self.watch_check.isChecked()
+        self.settings.default_editor = str(self.editor_combo.currentData() or "auto")
         self.settings.sync()
 
     # ------------------------------------------------------------------ 确认/取消

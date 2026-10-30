@@ -12,6 +12,8 @@ from typing import Any
 
 from PySide6.QtCore import QSettings, QStandardPaths
 
+from app.core.editor import AUTO_EDITOR
+
 _CONFIG_FILE_NAME = "MineImage.ini"
 
 
@@ -195,11 +197,27 @@ class AppSettings:
 
     @property
     def watch_operator_dirs(self) -> bool:
-        return self._as_bool(self.value("operators/watch", False))
+        """是否监视用户算子目录，文件变化后自动刷新算子库。"""
+        return self._as_bool(self.value("operators/watch", True))
 
     @watch_operator_dirs.setter
     def watch_operator_dirs(self, value: bool) -> None:
         self._qs.setValue("operators/watch", bool(value))
+
+    @property
+    def default_editor(self) -> str:
+        """新建 / 打开算子文件时使用的编辑器。
+
+        取值见 :mod:`app.core.editor`：``auto``（自动探测）、``system``（系统默认
+        程序）、``path:<路径>``（手动指定）或探测结果的 key。
+        """
+        raw = self.value("operators/editor", AUTO_EDITOR)
+        text = str(raw or "").strip()
+        return text or AUTO_EDITOR
+
+    @default_editor.setter
+    def default_editor(self, value: str) -> None:
+        self._qs.setValue("operators/editor", str(value or "").strip() or AUTO_EDITOR)
 
     # ------------------------------------------------------------------ 窗口
     @property

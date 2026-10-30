@@ -11,6 +11,7 @@ import shutil
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -19,10 +20,18 @@ import numpy as np
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer
 from PySide6.QtGui import QKeyEvent, QMouseEvent, QPalette, QWheelEvent
 from PySide6.QtTest import QSignalSpy, QTest
-from PySide6.QtWidgets import QApplication, QDialog, QListWidgetItem, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QLineEdit,
+    QListWidgetItem,
+    QMessageBox,
+    QWidget,
+)
 
 from app.config import AppSettings
 from app.core.constants import CUSTOM_OPERATOR_CATEGORY, MIME_OPERATOR
+from app.core.editor import EditorInfo
 from app.core.model import NodeModel
 from app.core.types import ImageData
 from app.operators.loader import OperatorRegistry
@@ -1169,6 +1178,427 @@ class GroupOperatorLibraryTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# OperatorLibrary：右键新建 / 原地改名 / 用户算子菜单 / 空分类
+# ---------------------------------------------------------------------------
+class OperatorLibraryCreateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = _workspace_tempdir()
+        self.addCleanup(_cleanup_tempdir, self.root)
+        self.settings = AppSettings(self.root / "settings.ini")
+        self.registry = OperatorRegistry.build([self.root], include_builtin=False)
+        self.library = OperatorLibrary(
+            settings=self.settings, user_operator_dir=self.root
+        )
+        self.library.resize(320, 640)
+        self.library.show()
+        self.library.set_registry(self.registry)
+        self.messages: list[str] = []
+        self.library.status_message.connect(self.messages.append)
+        self.library.refresh_requested.connect(self._reload)
+        QApplication.processEvents()
+
+    def tearDown(self) -> None:
+        self.library.deleteLater()
+
+    def _reload(self) -> None:
+        self.registry = OperatorRegistry.build([self.root], include_builtin=False)
+        self.library.set_registry(self.registry)
+        QApplication.processEvents()
+
+    def _cancel_inline_editor(self) -> None:
+        editor = self.library.tree.findChild(QLineEdit, "operatorNameEditor")
+        if editor is not None:
+            QTest.keyClick(editor, Qt.Key.Key_Escape)
+        QApplication.processEvents()
+
+    def _seed_operator(
+        self,
+        filename: str,
+        *,
+        op_id: str,
+        name: str,
+        category,
+    ) -> None:
+        (self.root / filename).write_text(
+            _OPERATOR_TEMPLATE.format(
+                op_id=op_id,
+                name=name,
+                category=category,
+                description="测试算子",
+                keyword="测试",
+            ),
+            encoding="utf-8",
+        )
+        self._reload()
+
+    @staticmethod
+    def _actions(menu) -> list[str]:
+        return [
+            str(action.data()["action"])
+            for action in menu.actions()
+            if action.data() and action.data().get("action")
+        ]
+
+    def test_create_operator_creates_file_and_starts_inline_rename(self) -> None:
+        op_id = self.library.create_operator()
+        self.assertIsNotNone(op_id)
+        assert op_id is not None
+        category_dir = self.root / CUSTOM_OPERATOR_CATEGORY
+        self.assertTrue(category_dir.is_dir())
+        files = sorted(category_dir.glob("*.py"))
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0].stem, "新建算子")
+
+        entry = self.registry.entry(op_id)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.display_name, "新建算子")
+        self.assertFalse(entry.builtin)
+        self.assertEqual(self.library.category_names(), [CUSTOM_OPERATOR_CATEGORY])
+        item = self.library._entry_items[op_id]  # noqa: SLF001 - 测试内部定位
+        self.assertEqual(item.text(0), "新建算子")
+        self.assertTrue(item.flags() & Qt.ItemFlag.ItemIsEditable)
+        self.assertTrue(item.isSelected())
+        self.assertEqual(self.library.current_category(), CUSTOM_OPERATOR_CATEGORY)
+
+        editor = self.library.tree.findChild(QLineEdit, "operatorNameEditor")
+        self.assertIsNotNone(editor)
+        assert editor is not None
+        self.assertEqual(editor.text(), "新建算子")
+        self.assertNotIn(".py", editor.text())
+        self._cancel_inline_editor()
+
+    def test_create_operator_clears_active_search_filter(self) -> None:
+        self._seed_operator(
+            "seed.py",
+            op_id="test.seed",
+            name="种子算子",
+            category=("基础调整",),
+        )
+        self.library.search_edit.setText("不存在的关键字")
+        self.assertIs(
+            self.library._content_stack.currentWidget(),  # noqa: SLF001
+            self.library.filter_empty_page,
+        )
+        op_id = self.library.create_operator()
+        self.assertIsNotNone(op_id)
+        assert op_id is not None
+        self.assertEqual(self.library.search_edit.text(), "")
+        self.assertIs(
+            self.library._content_stack.currentWidget(),  # noqa: SLF001
+            self.library.tree,
+        )
+        item = self.library._entry_items[op_id]  # noqa: SLF001
+        self.assertFalse(item.isHidden())
+        self._cancel_inline_editor()
+
+    def test_rename_trims_py_extension_and_info_uses_display_name(self) -> None:
+        op_id = self.library.create_operator()
+        self.assertIsNotNone(op_id)
+        assert op_id is not None
+        self._cancel_inline_editor()
+        self.assertTrue(self.library.rename_operator_to(op_id, "我的算子.py"))
+        self._cancel_inline_editor()
+
+        category_dir = self.root / CUSTOM_OPERATOR_CATEGORY
+        self.assertTrue((category_dir / "我的算子.py").is_file())
+        self.assertFalse((category_dir / "我的算子.py.py").exists())
+        entry = self.registry.entry(op_id)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.path.stem, "我的算子")
+        self.assertTrue(self.library.show_operator_info(op_id))
+        self.assertEqual(self.library.info_name.text(), "我的算子")
+
+    def test_blank_context_menu_creates_in_default_category(self) -> None:
+        # 空列表页面本身启用自定义右键菜单。
+        self.assertIs(
+            self.library._content_stack.currentWidget(), self.library.empty_page
+        )
+        self.assertEqual(
+            self.library.empty_page.contextMenuPolicy(),
+            Qt.ContextMenuPolicy.CustomContextMenu,
+        )
+        blank_menu = self.library.build_context_menu(None)
+        self.assertEqual(
+            self._actions(blank_menu), ["create_operator", "create_category"]
+        )
+
+        # 先选中一个非默认分类，空白处新建仍应固定落到「用户自定义算子」。
+        self._seed_operator(
+            "brightness.py",
+            op_id="test.brightness",
+            name="亮度调整",
+            category=("基础调整", "颜色"),
+        )
+        self.assertTrue(self.library.select_category("基础调整"))
+        create_action = next(
+            action
+            for action in blank_menu.actions()
+            if action.data() and action.data()["action"] == "create_operator"
+        )
+        create_action.trigger()
+        QApplication.processEvents()
+        self._cancel_inline_editor()
+        self.assertTrue((self.root / CUSTOM_OPERATOR_CATEGORY).is_dir())
+        self.assertFalse((self.root / "基础调整").exists())
+
+        # 分类行右键：动作携带该分类完整路径。
+        category_item = self.library._category_items[CUSTOM_OPERATOR_CATEGORY]
+        menu = self.library.build_context_menu(category_item)
+        self.assertEqual(
+            self._actions(menu), ["create_operator", "create_category"]
+        )
+        payload = next(
+            action.data()["payload"]
+            for action in menu.actions()
+            if action.data() and action.data()["action"] == "create_operator"
+        )
+        self.assertEqual(tuple(payload), (CUSTOM_OPERATOR_CATEGORY,))
+
+    def test_empty_category_context_menu_creates_operator(self) -> None:
+        path = self.library.create_category_named(None, "空分类")
+        self.assertIsNotNone(path)
+        empty_item = self.library._category_items["空分类"]
+        self.assertEqual(empty_item.text(1), "0")
+
+        menu = self.library.build_context_menu(empty_item)
+        self.assertEqual(
+            self._actions(menu), ["create_operator", "create_category"]
+        )
+        create_action = next(
+            action
+            for action in menu.actions()
+            if action.data() and action.data()["action"] == "create_operator"
+        )
+        self.assertEqual(tuple(create_action.data()["payload"]), ("空分类",))
+        create_action.trigger()
+        QApplication.processEvents()
+        self._cancel_inline_editor()
+        self.assertEqual(len(list((self.root / "空分类").glob("*.py"))), 1)
+        self.assertEqual(self.library._category_items["空分类"].text(1), "1")
+
+    def test_group_row_context_menu_uses_full_category_path(self) -> None:
+        self.library.create_category_named(None, "父分类")
+        self.library.create_operator(("父分类", "子分组"))
+        self._cancel_inline_editor()
+        parent_item = self.library._category_items["父分类"]
+        group_item = next(
+            parent_item.child(index)
+            for index in range(parent_item.childCount())
+            if parent_item.child(index).text(0) == "子分组"
+        )
+        menu = self.library.build_context_menu(group_item)
+        payloads = [
+            tuple(action.data()["payload"])
+            for action in menu.actions()
+            if action.data()
+        ]
+        self.assertEqual(
+            payloads, [("父分类", "子分组"), ("父分类", "子分组")]
+        )
+
+    def test_user_and_builtin_leaf_context_menu_actions(self) -> None:
+        op_id = self.library.create_operator(("基础调整", "颜色"))
+        self.assertIsNotNone(op_id)
+        self._cancel_inline_editor()
+        leaf = self.library._entry_items[op_id]  # noqa: SLF001 - 测试内部定位
+        menu = self.library.build_context_menu(leaf)
+        self.assertEqual(
+            self._actions(menu),
+            ["rename_operator", "open_editor", "delete_operator"],
+        )
+        self.assertEqual(
+            [action.text() for action in menu.actions() if action.text()],
+            ["重命名", "打开编辑器", "删除算子…"],
+        )
+
+        fake_builtin = SimpleNamespace(id="builtin.demo", builtin=True)
+        with patch.object(self.library, "_entry", return_value=fake_builtin):
+            builtin_menu = self.library.build_context_menu(leaf)
+        self.assertEqual(self._actions(builtin_menu), ["show_info"])
+        self.assertEqual(builtin_menu.actions()[0].text(), "查看说明")
+
+    def test_inline_editor_commit_renames_file(self) -> None:
+        op_id = self.library.create_operator()
+        self.assertIsNotNone(op_id)
+        assert op_id is not None
+        editor = self.library.tree.findChild(QLineEdit, "operatorNameEditor")
+        self.assertIsNotNone(editor)
+        assert editor is not None
+        editor.setText("输入框改名")
+        QTest.keyClick(editor, Qt.Key.Key_Return)
+        QApplication.processEvents()
+        # 提交由 QTimer.singleShot(0) 延后执行，再跑一轮事件循环。
+        QApplication.processEvents()
+        category_dir = self.root / CUSTOM_OPERATOR_CATEGORY
+        self.assertTrue((category_dir / "输入框改名.py").exists())
+        self.assertFalse((category_dir / "新建算子.py").exists())
+        entry = self.registry.entry(op_id)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.display_name, "输入框改名")
+        self.assertIn(op_id, self.library._entry_items)  # noqa: SLF001
+
+    def test_rename_operator_file_updates_display_and_keeps_selection(self) -> None:
+        op_id = self.library.create_operator()
+        self.assertIsNotNone(op_id)
+        assert op_id is not None
+        self._cancel_inline_editor()
+        self.assertTrue(self.library.rename_operator_to(op_id, "我的算子"))
+        old_path = self.root / CUSTOM_OPERATOR_CATEGORY / "新建算子.py"
+        new_path = self.root / CUSTOM_OPERATOR_CATEGORY / "我的算子.py"
+        self.assertFalse(old_path.exists())
+        self.assertTrue(new_path.exists())
+        entry = self.registry.entry(op_id)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.display_name, "我的算子")
+        self.assertEqual(entry.spec.name, "我的算子")  # 生成模板的 name 行已同步
+        item = self.library._entry_items[op_id]  # noqa: SLF001 - 测试内部定位
+        self.assertEqual(item.text(0), "我的算子")
+        self.assertTrue(item.isSelected())
+
+        # 重名 / 空名只走 status_message，不改文件。
+        duplicate = self.root / CUSTOM_OPERATOR_CATEGORY / "占位.py"
+        duplicate.write_text(
+            _OPERATOR_TEMPLATE.format(
+                op_id="test.placeholder",
+                name="占位算子",
+                category=(CUSTOM_OPERATOR_CATEGORY,),
+                description="占位算子",
+                keyword="占位",
+            ),
+            encoding="utf-8",
+        )
+        self._reload()
+        self.assertFalse(self.library.rename_operator_to(op_id, "占位"))
+        self.assertTrue(new_path.exists())
+        self.assertTrue(any("同名文件已存在" in message for message in self.messages))
+        self.assertFalse(self.library.rename_operator_to(op_id, "   "))
+        self.assertTrue(any("文件名不能为空" in message for message in self.messages))
+        self.assertTrue(new_path.exists())
+
+    def test_rename_legacy_user_operator_keeps_spec_name(self) -> None:
+        # 旧的手写用户算子没有 UI_CREATED 标记：改名后显示名仍来自 spec.name。
+        self._seed_operator(
+            "legacy.py",
+            op_id="test.legacy",
+            name="旧算子",
+            category=(CUSTOM_OPERATOR_CATEGORY, "旧分组"),
+        )
+        leaf = self.library._entry_items["test.legacy"]  # noqa: SLF001 - 测试内部定位
+        self.assertEqual(
+            self._actions(self.library.build_context_menu(leaf))[0],
+            "rename_operator",
+        )
+        self.assertTrue(
+            self.library.rename_operator_to("test.legacy", "legacy_renamed")
+        )
+        self.assertTrue((self.root / "legacy_renamed.py").exists())
+        entry = self.registry.entry("test.legacy")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.path.stem, "legacy_renamed")
+        self.assertEqual(entry.display_name, "旧算子")
+        self.assertEqual(
+            self.library._entry_items["test.legacy"].text(0),  # noqa: SLF001
+            "旧算子",
+        )
+
+    def test_delete_operator_requires_confirmation(self) -> None:
+        op_id = self.library.create_operator()
+        self.assertIsNotNone(op_id)
+        assert op_id is not None
+        self._cancel_inline_editor()
+        path = self.root / CUSTOM_OPERATOR_CATEGORY / "新建算子.py"
+        with patch(
+            "app.ui.library.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ):
+            self.assertFalse(self.library.delete_operator(op_id))
+        self.assertTrue(path.exists())
+        with patch(
+            "app.ui.library.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.assertTrue(self.library.delete_operator(op_id))
+        self.assertFalse(path.exists())
+        self.assertIsNone(self.registry.entry(op_id))
+        self.assertNotIn(op_id, self.library._entry_items)  # noqa: SLF001
+        # 分类目录仍然存在（供右键继续新建），空分类继续显示、计数为 0。
+        self.assertIn(CUSTOM_OPERATOR_CATEGORY, self.library.category_names())
+        self.assertEqual(
+            self.library._category_items[CUSTOM_OPERATOR_CATEGORY].text(1), "0"
+        )
+        self.assertIs(self.library._content_stack.currentWidget(), self.library.tree)
+
+    def test_open_editor_uses_settings_default_editor(self) -> None:
+        self.settings.default_editor = "vscode-test"
+        op_id = self.library.create_operator()
+        self.assertIsNotNone(op_id)
+        assert op_id is not None
+        self._cancel_inline_editor()
+        entry = self.registry.entry(op_id)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        with patch(
+            "app.core.editor.launch_editor", return_value=(True, "")
+        ) as launch:
+            self.assertTrue(self.library.open_editor(op_id))
+        launch.assert_called_once_with(str(entry.path), "vscode-test")
+        with patch(
+            "app.core.editor.launch_editor",
+            return_value=(False, "未找到可用编辑器"),
+        ):
+            self.assertFalse(self.library.open_editor(op_id))
+        self.assertTrue(any("未找到可用编辑器" in item for item in self.messages))
+        self.assertFalse(self.library.open_editor("missing.operator"))
+
+    def test_empty_categories_shown_and_user_category_first(self) -> None:
+        (self.root / "自定义空分类").mkdir()
+        (self.root / CUSTOM_OPERATOR_CATEGORY).mkdir()
+        self._reload()
+        self.assertEqual(
+            self.library.category_names(),
+            [CUSTOM_OPERATOR_CATEGORY, "自定义空分类"],
+        )
+        self.assertEqual(
+            [item.text(1) for item in self.library.category_items()],
+            ["0", "0"],
+        )
+        # 没有算子但已知空分类时显示树，而不是「尚未加载算子」空页面。
+        self.assertIs(self.library._content_stack.currentWidget(), self.library.tree)
+
+    def test_create_category_named_creates_and_selects_empty_category(self) -> None:
+        path = self.library.create_category_named(None, "我的分类")
+        self.assertIsNotNone(path)
+        assert path is not None
+        self.assertTrue(path.is_dir())
+        self.assertIn("我的分类", self.library.category_names())
+        item = self.library._category_items["我的分类"]
+        self.assertEqual(item.text(1), "0")
+        self.assertEqual(self.library.current_category(), "我的分类")
+        self.assertIs(self.library._content_stack.currentWidget(), self.library.tree)
+
+        child = self.library.create_category_named(("我的分类",), "子分类")
+        self.assertIsNotNone(child)
+        assert child is not None
+        self.assertTrue(child.is_dir())
+        # 第二次创建会重建整棵树，旧的 QTreeWidgetItem 已失效，需要重新获取。
+        item = self.library._category_items["我的分类"]
+        self.library.select_category("我的分类")
+        group = item.child(0)
+        self.assertEqual(group.text(0), "子分类")
+        self.assertEqual(group.text(1), "0")
+
+        self.assertIsNone(self.library.create_category_named(None, "a/b"))
+        self.assertTrue(any("新建分类失败" in message for message in self.messages))
+        self.assertIsNone(self.library.create_category_named(None, "我的分类"))
+        self.assertTrue(any("已存在" in message for message in self.messages))
+
+
+# ---------------------------------------------------------------------------
 # ReplaceOperatorDialog
 # ---------------------------------------------------------------------------
 class ReplaceOperatorDialogTests(unittest.TestCase):
@@ -1348,6 +1778,56 @@ class SettingsDialogTests(unittest.TestCase):
             reloaded = AppSettings(self.ini_path)
             self.assertGreaterEqual(reloaded.undo_limit, 1)
             self.assertGreaterEqual(reloaded.downsample_max_dim, 256)
+        finally:
+            dialog.deleteLater()
+
+    def test_default_editor_options_and_persist(self) -> None:
+        settings = AppSettings(self.ini_path)
+        detected = [EditorInfo("vscode", "VS Code", r"C:\tools\code.cmd")]
+        with patch("app.core.editor.detect_editors", return_value=detected):
+            dialog = SettingsDialog(settings)
+        try:
+            combo = dialog.editor_combo
+            data = [combo.itemData(index) for index in range(combo.count())]
+            self.assertEqual(data[:2], ["auto", "system"])
+            self.assertIn("vscode", data)
+            text = combo.itemText(data.index("vscode"))
+            self.assertIn("VS Code", text)
+            self.assertIn("code.cmd", text)
+            combo.setCurrentIndex(combo.findData("vscode"))
+            dialog.accept()
+            reloaded = AppSettings(self.ini_path)
+            self.assertEqual(reloaded.default_editor, "vscode")
+        finally:
+            dialog.deleteLater()
+
+    def test_default_editor_keeps_undetected_value_and_redetects(self) -> None:
+        settings = AppSettings(self.ini_path)
+        settings.default_editor = r"path:C:\tools\notepad.exe"
+        with patch("app.core.editor.detect_editors", return_value=[]):
+            dialog = SettingsDialog(settings)
+        try:
+            combo = dialog.editor_combo
+            index = combo.findData(r"path:C:\tools\notepad.exe")
+            self.assertGreaterEqual(index, 0)
+            self.assertIn("自定义", combo.itemText(index))
+
+            detected = [
+                EditorInfo(
+                    "pycharm", "PyCharm", r"C:\pycharm\bin\pycharm64.exe"
+                )
+            ]
+            with patch("app.core.editor.detect_editors", return_value=detected):
+                dialog.redetect_button.click()
+            data = [combo.itemData(index) for index in range(combo.count())]
+            self.assertIn("pycharm", data)
+            # 重新检测不改变当前选择。
+            self.assertEqual(combo.currentData(), r"path:C:\tools\notepad.exe")
+            dialog.accept()
+            self.assertEqual(
+                AppSettings(self.ini_path).default_editor,
+                r"path:C:\tools\notepad.exe",
+            )
         finally:
             dialog.deleteLater()
 

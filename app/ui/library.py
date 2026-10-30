@@ -7,16 +7,31 @@
 * 将算子叶子拖到画布时使用 :data:`app.core.constants.MIME_OPERATOR`，
   payload 为 ``{"id": op_id}`` 的 UTF-8 JSON；
 * 单击算子叶子在库底部弹出说明浮层（名称 / 分类 / 描述 / 参数 / 端口），
-  点击浮层外部或按 Esc 关闭。
+  点击浮层外部或按 Esc 关闭；
+* 右键分类 / 分组 / 空白处可直接新建用户算子或分类，右键用户算子可原地改名、
+  打开编辑器或删除（新建与改名后通过 :attr:`OperatorLibrary.refresh_requested`
+  让上层同步重扫算子目录）。
 """
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QEvent, QMimeData, QPoint, QRectF, QSize, Qt, Signal
+from PySide6.QtCore import (
+    QEvent,
+    QMimeData,
+    QModelIndex,
+    QPoint,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import (
+    QAction,
     QBrush,
     QColor,
     QDrag,
@@ -33,11 +48,15 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QMenu,
+    QMessageBox,
     QScrollArea,
     QStackedWidget,
     QStyle,
+    QStyledItemDelegate,
     QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
@@ -48,9 +67,22 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.core.constants import MIME_OPERATOR
+from app.config import AppSettings, default_user_operator_dir
+from app.core.constants import CATEGORY_ORDER, CUSTOM_OPERATOR_CATEGORY, MIME_OPERATOR
 from app.operators.loader import OperatorEntry, OperatorRegistry
 from app.operators.spec import ParamSpec
+
+# 条目数据角色：前两个沿用旧值（UserRole / UserRole + 1），避免破坏现有拖拽与搜索。
+ROLE_OP_ID = Qt.ItemDataRole.UserRole
+ROLE_HAYSTACK = Qt.ItemDataRole.UserRole + 1
+ROLE_KIND = Qt.ItemDataRole.UserRole + 2
+ROLE_CATEGORY_PATH = Qt.ItemDataRole.UserRole + 3
+ROLE_OPERATOR_PATH = Qt.ItemDataRole.UserRole + 4
+ROLE_FILE_STEM = Qt.ItemDataRole.UserRole + 5
+
+_KIND_CATEGORY = "category"
+_KIND_GROUP = "group"
+_KIND_OPERATOR = "operator"
 
 _TYPE_LABELS = {
     "int": "整数",
@@ -141,6 +173,78 @@ def _is_group_operator(operator: object) -> bool:
     return getattr(operator, "group_definition", None) is not None
 
 
+def _normalize_category(
+    category: str | tuple[str, ...] | list[str] | None,
+) -> tuple[str, ...]:
+    """把分类路径统一成去掉空段的 tuple；``None`` 表示没有分类。"""
+
+    if category is None:
+        return ()
+    if isinstance(category, str):
+        parts = category.replace("\\", "/").split("/")
+    else:
+        parts = [str(part) for part in category]
+    return tuple(part.strip() for part in parts if part and part.strip())
+
+
+def _category_sort_key(name: str) -> tuple[int, str]:
+    """一级分类排序：CATEGORY_ORDER 内按声明顺序，未知分类按名称排最后。"""
+
+    try:
+        return (CATEGORY_ORDER.index(name), name)
+    except ValueError:
+        return (len(CATEGORY_ORDER), name)
+
+
+class _OperatorNameDelegate(QStyledItemDelegate):
+    """用户算子文件名的原地编辑器：只显示文件 stem，提交后交给算子库改名。
+
+    Qt 默认会把编辑器文本写回模型；这里改由 :meth:`OperatorLibrary.rename_operator_to`
+    统一校验并改名，避免条目显示名被未校验的文本覆盖。
+    """
+
+    def __init__(self, library: "OperatorLibrary", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._library = library
+
+    def createEditor(  # noqa: N802 - Qt 命名
+        self,
+        parent: QWidget,
+        option: QStyleOptionViewItem,
+        index: QModelIndex,
+    ) -> QWidget | None:
+        if index.column() != 0 or not index.data(ROLE_FILE_STEM):
+            return None
+        editor = QLineEdit(parent)
+        editor.setFrame(False)
+        editor.setObjectName("operatorNameEditor")
+        return editor
+
+    def setEditorData(self, editor: QWidget, index: QModelIndex) -> None:  # noqa: N802
+        if not isinstance(editor, QLineEdit):
+            return
+        editor.setText(str(index.data(ROLE_FILE_STEM) or ""))
+        editor.selectAll()
+
+    def setModelData(  # noqa: N802 - Qt 命名
+        self,
+        editor: QWidget,
+        model,
+        index: QModelIndex,
+    ) -> None:
+        if not isinstance(editor, QLineEdit):
+            return
+        op_id = str(index.data(ROLE_OP_ID) or "")
+        old_stem = str(index.data(ROLE_FILE_STEM) or "")
+        new_stem = editor.text().strip()
+        if not op_id or not new_stem or new_stem == old_stem:
+            return
+        # 延后到编辑器关闭、Qt 退出数据提交后再重建算子树，避免删掉正在提交的条目。
+        QTimer.singleShot(
+            0, lambda: self._library.rename_operator_to(op_id, new_stem)
+        )
+
+
 class _OperatorTree(QTreeWidget):
     """算子库主树：一级分类为整行折叠标题，叶子可拖拽。
 
@@ -165,7 +269,8 @@ class _OperatorTree(QTreeWidget):
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu_requested)
         header = self.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -257,13 +362,17 @@ class _OperatorTree(QTreeWidget):
         item = self.currentItem()
         if item is None:
             return
-        op_id = item.data(0, Qt.ItemDataRole.UserRole)
+        op_id = item.data(0, ROLE_OP_ID)
         if not op_id:
             return
         self._library.begin_operator_drag(self, str(op_id))
 
+    def _on_context_menu_requested(self, pos: QPoint) -> None:
+        item = self.itemAt(pos)
+        self._library.show_context_menu(item, self.viewport().mapToGlobal(pos))
+
     def _on_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
-        op_id = item.data(0, Qt.ItemDataRole.UserRole)
+        op_id = item.data(0, ROLE_OP_ID)
         if op_id:
             self._library.show_operator_info(str(op_id))
             self._library.note_leaf_clicked(item)
@@ -272,7 +381,7 @@ class _OperatorTree(QTreeWidget):
         item.setExpanded(not item.isExpanded())
 
     def _on_item_activated(self, item: QTreeWidgetItem, _column: int) -> None:
-        op_id = item.data(0, Qt.ItemDataRole.UserRole)
+        op_id = item.data(0, ROLE_OP_ID)
         if op_id:
             self._library.show_operator_info(str(op_id))
 
@@ -281,10 +390,22 @@ class OperatorLibrary(QWidget):
     """算子库面板。"""
 
     refresh_requested = Signal()
+    # 新建 / 改名 / 删除 / 打开编辑器失败时的简短中文提示（由主窗口转状态栏）。
+    status_message = Signal(str)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        settings: AppSettings | None = None,
+        user_operator_dir: Path | str | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setMinimumWidth(220)
+        self._settings = settings
+        self._user_operator_dir = (
+            Path(user_operator_dir) if user_operator_dir is not None else None
+        )
         self._registry: OperatorRegistry | None = None
         self._category_items: dict[str, QTreeWidgetItem] = {}
         self._entry_items: dict[str, QTreeWidgetItem] = {}
@@ -351,6 +472,10 @@ class OperatorLibrary(QWidget):
 
         self._content_stack = QStackedWidget(self)
         self.tree = _OperatorTree(self)
+        self._name_delegate = _OperatorNameDelegate(self, self.tree)
+        # 委托覆盖整棵树，但 createEditor 只对第 0 列返回编辑器；这样用户算子的
+        # 数量列不会被双击写入任意文本。
+        self.tree.setItemDelegate(self._name_delegate)
         self.tree.itemExpanded.connect(self._on_tree_item_expanded)
         self.tree.itemCollapsed.connect(self._on_tree_item_collapsed)
 
@@ -362,7 +487,8 @@ class OperatorLibrary(QWidget):
         empty_title.setObjectName("sectionTitle")
         empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_hint = QLabel(
-            "请检查「设置 → 算子目录」，\n然后点击右上角的刷新按钮重新扫描。",
+            "右键此处可直接新建算子或分类；\n"
+            "也可检查「设置 → 算子目录」后点击右上角刷新。",
             self.empty_page,
         )
         empty_hint.setObjectName("hintLabel")
@@ -390,6 +516,14 @@ class OperatorLibrary(QWidget):
         self._content_stack.addWidget(self.empty_page)
         self._content_stack.addWidget(self.filter_empty_page)
         layout.addWidget(self._content_stack, 1)
+        # 空列表 / 无匹配页面也要能右键新建算子或分类。
+        for page in (self.empty_page, self.filter_empty_page):
+            page.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            page.customContextMenuRequested.connect(
+                lambda pos, widget=page: self.show_context_menu(
+                    None, widget.mapToGlobal(pos)
+                )
+            )
 
         footer = QHBoxLayout()
         footer.setSpacing(8)
@@ -499,12 +633,14 @@ class OperatorLibrary(QWidget):
             self._entry_items.clear()
             self._current_category = None
             entries = registry.entries if registry is not None else {}
-            if not entries or registry is None:
+            known_categories = self._known_categories(registry)
+            # 0 算子的空分类也要显示，便于右键新建算子。
+            if not entries and not known_categories:
                 self.tree_bar.setVisible(False)
                 self._content_stack.setCurrentWidget(self.empty_page)
                 self._update_footer()
                 return
-            self._build_tree(self.tree, registry.tabs())
+            self._build_tree(self.tree, registry.tabs(), known_categories)
             self.tree_bar.setVisible(True)
             self._content_stack.setCurrentWidget(self.tree)
             if not self._filter_text:
@@ -523,6 +659,28 @@ class OperatorLibrary(QWidget):
             self._apply_filter()
         finally:
             self.setUpdatesEnabled(True)
+
+    @staticmethod
+    def _known_categories(
+        registry: OperatorRegistry | None,
+    ) -> tuple[tuple[str, ...], ...]:
+        """读取 loader 记录的空分类（含仅有一级的分类）；旧 loader 无接口时为空。"""
+
+        if registry is None:
+            return ()
+        getter = getattr(registry, "known_categories", None)
+        if not callable(getter):
+            return ()
+        try:
+            raw = getter()
+        except Exception:  # noqa: BLE001 - 空分类只是增强信息，失败不应影响主树
+            return ()
+        result: list[tuple[str, ...]] = []
+        for path in raw:
+            normalized = _normalize_category(path)
+            if normalized and normalized not in result:
+                result.append(normalized)
+        return tuple(result)
 
     # ------------------------------------------------------------------ 分类
     def category_names(self) -> list[str]:
@@ -682,23 +840,34 @@ class OperatorLibrary(QWidget):
         self,
         tree: QTreeWidget,
         tabs: dict[str, list[OperatorEntry]],
+        known_categories: tuple[tuple[str, ...], ...] = (),
     ) -> None:
         tree.clear()
-        # registry.tabs() 已按 CATEGORY_ORDER 排序（「用户自定义算子」固定第一），
-        # 这里直接按给定顺序建树，避免二次排序破坏分类契约。
+        # 先合并 registry.tabs()（非空分类）与 known_categories（含 0 算子空分类），
+        # 再按 CATEGORY_ORDER 统一排序一级分类，避免空分类被追加到末尾。
+        roots: dict[str, dict[str, Any]] = {}
         for name, entries in tabs.items():
-            if not entries:
-                continue
-            root: dict[str, Any] = {"groups": {}, "entries": []}
+            root = roots.setdefault(name, {"groups": {}, "entries": []})
             for entry in entries:
                 node = root
                 for part in entry.subgroups:
                     node = node["groups"].setdefault(part, {"groups": {}, "entries": []})
                 node["entries"].append(entry)
+        for path in known_categories:
+            if not path:
+                continue
+            node = roots.setdefault(path[0], {"groups": {}, "entries": []})
+            for part in path[1:]:
+                node = node["groups"].setdefault(part, {"groups": {}, "entries": []})
 
+        # 无论分类来自 tabs 还是空目录，一级分类都按 CATEGORY_ORDER 排序；
+        # 未知分类按名称排在最后，保证「用户自定义算子」始终第一。
+        for name in sorted(roots, key=_category_sort_key):
+            root = roots[name]
             category = QTreeWidgetItem([name, ""])
-            category.setData(0, Qt.ItemDataRole.UserRole, None)
-            category.setData(0, Qt.ItemDataRole.UserRole + 2, "category")
+            category.setData(0, ROLE_OP_ID, None)
+            category.setData(0, ROLE_KIND, _KIND_CATEGORY)
+            category.setData(0, ROLE_CATEGORY_PATH, (name,))
             category.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             category_font = category.font(0)
             category_font.setBold(True)
@@ -710,9 +879,9 @@ class OperatorLibrary(QWidget):
                 int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
             )
             category.setSizeHint(0, QSize(0, 36))
-            category.setToolTip(0, f"{name} · 单击展开 / 折叠")
+            category.setToolTip(0, f"{name} · 单击展开 / 折叠 · 右键新建")
             tree.addTopLevelItem(category)
-            total = self._populate_tree(category, root, ())
+            total = self._populate_tree(category, root, (), name)
             category.setText(1, str(total))
             category.setToolTip(1, f"{total} 个算子")
             self._category_items[name] = category
@@ -723,13 +892,15 @@ class OperatorLibrary(QWidget):
         parent: QTreeWidgetItem,
         node: dict[str, Any],
         path: tuple[str, ...],
+        top_name: str,
     ) -> int:
         total = 0
         for group_name, child in node["groups"].items():
             group = QTreeWidgetItem([group_name, ""])
             group_path = path + (group_name,)
-            group.setData(0, Qt.ItemDataRole.UserRole, None)
-            group.setData(0, Qt.ItemDataRole.UserRole + 2, "group")
+            group.setData(0, ROLE_OP_ID, None)
+            group.setData(0, ROLE_KIND, _KIND_GROUP)
+            group.setData(0, ROLE_CATEGORY_PATH, (top_name,) + group_path)
             group.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             group_font = group.font(0)
             group_font.setBold(True)
@@ -742,37 +913,49 @@ class OperatorLibrary(QWidget):
             )
             group.setForeground(1, QBrush(QColor("#94a3b8")))
             group.setSizeHint(0, QSize(0, 28))
-            group.setToolTip(0, "分类：" + " / ".join(group_path))
+            group.setToolTip(0, "分类：" + " / ".join((top_name,) + group_path))
             parent.addChild(group)
-            count = self._populate_tree(group, child, group_path)
+            count = self._populate_tree(group, child, group_path, top_name)
             group.setText(1, str(count))
             group.setToolTip(1, f"{count} 个算子")
             total += count
 
         for entry in node["entries"]:
-            item = QTreeWidgetItem([entry.name, ""])
+            display_name = getattr(entry, "display_name", None) or entry.name
+            item = QTreeWidgetItem([display_name, ""])
             category_text = " / ".join(entry.spec.category) or "未分类"
             haystack = " ".join(
                 [
+                    display_name,
                     entry.name,
+                    entry.path.stem,
+                    entry.path.name,
                     entry.spec.id,
                     entry.spec.description or "",
                     category_text,
                     " ".join(str(keyword) for keyword in entry.spec.keywords),
                 ]
             ).lower()
-            item.setData(0, Qt.ItemDataRole.UserRole, entry.id)
-            item.setData(0, Qt.ItemDataRole.UserRole + 1, haystack)
-            tooltip_lines = [entry.name, f"分类：{category_text}"]
+            item.setData(0, ROLE_OP_ID, entry.id)
+            item.setData(0, ROLE_HAYSTACK, haystack)
+            item.setData(0, ROLE_KIND, _KIND_OPERATOR)
+            item.setData(0, ROLE_CATEGORY_PATH, (top_name,) + path)
+            item.setData(0, ROLE_OPERATOR_PATH, str(entry.path))
+            tooltip_lines = [display_name, f"分类：{category_text}"]
             if _is_group_operator(entry.operator):
                 tooltip_lines.append("类型：算子组")
             tooltip_lines.append(entry.spec.description or "暂无描述")
             item.setToolTip(0, "\n".join(tooltip_lines))
-            item.setFlags(
+            flags = (
                 Qt.ItemFlag.ItemIsEnabled
                 | Qt.ItemFlag.ItemIsSelectable
                 | Qt.ItemFlag.ItemIsDragEnabled
             )
+            if not entry.builtin:
+                # 用户算子允许原地改名；内置算子保持只读。
+                item.setData(0, ROLE_FILE_STEM, entry.path.stem)
+                flags |= Qt.ItemFlag.ItemIsEditable
+            item.setFlags(flags)
             item.setSizeHint(0, QSize(0, 26))
             parent.addChild(item)
             self._entry_items[entry.id] = item
@@ -836,11 +1019,9 @@ class OperatorLibrary(QWidget):
 
         def walk(item: QTreeWidgetItem) -> bool:
             nonlocal matched
-            op_id = item.data(0, Qt.ItemDataRole.UserRole)
+            op_id = item.data(0, ROLE_OP_ID)
             if op_id:
-                haystack = str(
-                    item.data(0, Qt.ItemDataRole.UserRole + 1) or item.text(0).lower()
-                )
+                haystack = str(item.data(0, ROLE_HAYSTACK) or item.text(0).lower())
                 hit = not text or text in haystack
                 item.setHidden(not hit)
                 if hit:
@@ -878,6 +1059,383 @@ class OperatorLibrary(QWidget):
         else:
             self.error_label.setToolTip("算子目录加载正常")
 
+    # ------------------------------------------------------------------ 右键菜单
+    def build_context_menu(self, item: QTreeWidgetItem | None) -> QMenu:
+        """按条目类型构造右键菜单（只构造、不弹出，便于测试）。"""
+
+        menu = QMenu(self)
+        kind = item.data(0, ROLE_KIND) if item is not None else None
+        if item is None or kind in (_KIND_CATEGORY, _KIND_GROUP):
+            category = self._category_path_for_item(item)
+            self._add_menu_action(
+                menu,
+                "新建算子",
+                lambda: self.create_operator(category),
+                "create_operator",
+                category,
+            )
+            self._add_menu_action(
+                menu,
+                "新建分类…",
+                lambda: self._prompt_create_category(category),
+                "create_category",
+                category,
+            )
+            return menu
+        entry = self._entry_for_item(item)
+        if entry is None:
+            return menu
+        if entry.builtin:
+            self._add_menu_action(
+                menu,
+                "查看说明",
+                lambda: self.show_operator_info(entry.id),
+                "show_info",
+                entry.id,
+            )
+            return menu
+        self._add_menu_action(
+            menu,
+            "重命名",
+            lambda: self.begin_rename_operator(entry.id),
+            "rename_operator",
+            entry.id,
+        )
+        self._add_menu_action(
+            menu,
+            "打开编辑器",
+            lambda: self.open_editor(entry.id),
+            "open_editor",
+            entry.id,
+        )
+        menu.addSeparator()
+        self._add_menu_action(
+            menu,
+            "删除算子…",
+            lambda: self.delete_operator(entry.id),
+            "delete_operator",
+            entry.id,
+        )
+        return menu
+
+    @staticmethod
+    def _add_menu_action(
+        menu: QMenu,
+        text: str,
+        callback,
+        action_name: str,
+        payload,
+    ) -> QAction:
+        action = menu.addAction(text)
+        action.setData({"action": action_name, "payload": payload})
+        action.triggered.connect(lambda _checked=False: callback())
+        return action
+
+    @staticmethod
+    def _category_path_for_item(
+        item: QTreeWidgetItem | None,
+    ) -> tuple[str, ...] | None:
+        if item is None:
+            return None
+        path = item.data(0, ROLE_CATEGORY_PATH)
+        if not path:
+            return None
+        return _normalize_category(path)
+
+    def _entry_for_item(self, item: QTreeWidgetItem | None) -> OperatorEntry | None:
+        if item is None:
+            return None
+        op_id = item.data(0, ROLE_OP_ID)
+        if not op_id:
+            return None
+        return self._entry(str(op_id))
+
+    def show_context_menu(self, item: QTreeWidgetItem | None, global_pos: QPoint) -> None:
+        """弹出右键菜单（测试只调用 :meth:`build_context_menu`，不阻塞）。"""
+
+        menu = self.build_context_menu(item)
+        if menu.actions():
+            menu.exec(global_pos)
+        menu.deleteLater()
+
+    # ------------------------------------------------------------------ 新建 / 改名 / 删除
+    def user_operator_root(self) -> Path:
+        """用户算子根目录：构造参数优先，否则使用默认用户算子目录。"""
+
+        return self._user_operator_dir or default_user_operator_dir()
+
+    def create_operator(
+        self,
+        category: str | tuple[str, ...] | list[str] | None = None,
+    ) -> str | None:
+        """在用户算子目录新建一个算子文件；返回新算子 id（失败返回 None）。
+
+        新建后发出 :attr:`refresh_requested`，由上层同步重扫注册表；未指定分类
+        （算子库空白处 / 空列表右键）时固定归入 :data:`CUSTOM_OPERATOR_CATEGORY`，
+        分类 / 分组行右键会显式传入该分类路径。
+        """
+
+        category_path = _normalize_category(category) or (CUSTOM_OPERATOR_CATEGORY,)
+        try:
+            from app.core import operator_files
+        except Exception as exc:  # noqa: BLE001 - 并行开发期文件服务可能尚未就绪
+            self.status_message.emit(f"新建算子失败：文件服务不可用（{exc}）")
+            return None
+        try:
+            created = operator_files.create_operator_file(
+                self.user_operator_root(), category_path
+            )
+        except Exception as exc:  # noqa: BLE001 - 统一转换为状态栏提示
+            self.status_message.emit(f"新建算子失败：{exc}")
+            return None
+        op_id = str(getattr(created, "operator_id", "") or "")
+        # 搜索过滤可能把新条目隐藏；先清空过滤，让用户看到刚建的文件。
+        self._clear_search_for_new_item()
+        self.refresh_requested.emit()
+        if op_id:
+            self.select_operator(op_id)
+            self.begin_rename_operator(op_id)
+        return op_id or None
+
+    def _clear_search_for_new_item(self) -> None:
+        """新建后清空搜索过滤，避免新条目被当前过滤条件隐藏。"""
+
+        if self.search_edit.text().strip():
+            self.search_edit.clear()
+
+    def create_category_named(
+        self,
+        parent: str | tuple[str, ...] | list[str] | None,
+        name: str,
+    ) -> Path | None:
+        """在 ``parent`` 分类下创建目录并刷新；返回新目录路径（失败返回 None）。"""
+
+        parent_path = _normalize_category(parent)
+        raw_name = str(name or "").strip()
+        if not raw_name:
+            self.status_message.emit("新建分类失败：分类名称不能为空。")
+            return None
+        try:
+            from app.core import operator_files
+        except Exception as exc:  # noqa: BLE001 - 并行开发期文件服务可能尚未就绪
+            self.status_message.emit(f"新建分类失败：文件服务不可用（{exc}）")
+            return None
+        try:
+            created = operator_files.create_category_dir(
+                self.user_operator_root(), parent_path, raw_name
+            )
+        except Exception as exc:  # noqa: BLE001 - 统一转换为状态栏提示
+            self.status_message.emit(f"新建分类失败：{exc}")
+            return None
+        directory = Path(created)
+        self._clear_search_for_new_item()
+        self.refresh_requested.emit()
+        self._select_category_path(
+            self._relative_category(directory, parent_path, raw_name)
+        )
+        return directory
+
+    def _prompt_create_category(
+        self,
+        parent: tuple[str, ...] | None,
+    ) -> Path | None:
+        parent_path = _normalize_category(parent)
+        title = "新建分类" if not parent_path else "新建子分类"
+        name, accepted = QInputDialog.getText(
+            self,
+            title,
+            "分类名称：",
+            QLineEdit.EchoMode.Normal,
+            "",
+        )
+        if not accepted:
+            return None
+        return self.create_category_named(parent_path, name)
+
+    def _relative_category(
+        self,
+        directory: Path,
+        parent: tuple[str, ...],
+        name: str,
+    ) -> tuple[str, ...]:
+        """优先按实际创建目录反推分类路径（名称可能被 sanitize）。"""
+
+        root = self.user_operator_root()
+        try:
+            relative = directory.resolve().relative_to(root.resolve())
+        except (OSError, ValueError):
+            return parent + (name,)
+        parts = tuple(part for part in relative.parts if part not in ("", "."))
+        return parts or (parent + (name,))
+
+    def rename_operator_to(self, op_id: str, new_stem: str) -> bool:
+        """原地重命名用户算子文件；失败时只发 :attr:`status_message`，不弹窗。"""
+
+        entry = self._entry(op_id)
+        if entry is None:
+            self.status_message.emit("重命名失败：找不到该算子。")
+            return False
+        if entry.builtin:
+            self.status_message.emit("重命名失败：内置算子文件不能改名。")
+            return False
+        stem = str(new_stem or "").strip()
+        if stem.lower().endswith(".py"):
+            # 列表不显示扩展名；用户误输入 .py 时不要再叠一层。
+            stem = stem[:-3].rstrip()
+        if not stem:
+            self.status_message.emit("重命名失败：文件名不能为空。")
+            return False
+        if stem == entry.path.stem:
+            self.select_operator(op_id)
+            return True
+        try:
+            from app.core import operator_files
+        except Exception as exc:  # noqa: BLE001 - 并行开发期文件服务可能尚未就绪
+            self.status_message.emit(f"重命名失败：文件服务不可用（{exc}）")
+            return False
+        try:
+            # rename_operator_file 内部同步 UI_CREATED 模板的 name 行，无需重复调用。
+            operator_files.rename_operator_file(entry.path, stem)
+        except Exception as exc:  # noqa: BLE001 - 中文错误直接展示到状态栏
+            self.status_message.emit(f"重命名失败：{exc}")
+            return False
+        self.refresh_requested.emit()
+        self.select_operator(op_id)
+        return True
+
+    def delete_operator(self, op_id: str, confirm: bool = True) -> bool:
+        """删除用户算子文件；``confirm=True`` 时先弹确认框。"""
+
+        entry = self._entry(op_id)
+        if entry is None:
+            self.status_message.emit("删除失败：找不到该算子。")
+            return False
+        if entry.builtin:
+            self.status_message.emit("删除失败：内置算子不能删除。")
+            return False
+        if confirm:
+            answer = QMessageBox.question(
+                self,
+                "删除算子",
+                f"确定删除用户算子文件“{entry.path.name}”吗？\n"
+                f"{entry.path}\n删除后无法恢复。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        try:
+            from app.core import operator_files
+        except Exception as exc:  # noqa: BLE001 - 并行开发期文件服务可能尚未就绪
+            self.status_message.emit(f"删除失败：文件服务不可用（{exc}）")
+            return False
+        try:
+            operator_files.delete_operator_file(entry.path)
+        except Exception as exc:  # noqa: BLE001 - 中文错误直接展示到状态栏
+            self.status_message.emit(f"删除失败：{exc}")
+            return False
+        self.refresh_requested.emit()
+        return True
+
+    def open_editor(self, op_id: str) -> bool:
+        """用设置中的默认编辑器打开用户算子文件。"""
+
+        entry = self._entry(op_id)
+        if entry is None:
+            self.status_message.emit("打开编辑器失败：找不到该算子。")
+            return False
+        if not entry.path.exists():
+            self.status_message.emit(f"打开编辑器失败：文件不存在（{entry.path}）。")
+            return False
+        editor_value = "auto"
+        if self._settings is not None:
+            editor_value = str(
+                getattr(self._settings, "default_editor", "auto") or "auto"
+            )
+        try:
+            from app.core import editor as editor_module
+        except Exception as exc:  # noqa: BLE001 - 并行开发期编辑器模块可能尚未就绪
+            self.status_message.emit(f"打开编辑器失败：编辑器模块不可用（{exc}）")
+            return False
+        try:
+            launched, message = editor_module.launch_editor(
+                str(entry.path), editor_value
+            )
+        except Exception as exc:  # noqa: BLE001 - 启动失败统一提示
+            self.status_message.emit(f"打开编辑器失败：{exc}")
+            return False
+        if not launched:
+            detail = str(message or "").strip() or "未找到可用编辑器。"
+            self.status_message.emit(f"打开编辑器失败：{detail}")
+            return False
+        return True
+
+    def select_operator(self, op_id: str) -> bool:
+        """展开所属分类并选中算子条目。"""
+
+        item = self._entry_items.get(str(op_id))
+        if item is None:
+            return False
+        parent = item.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+        self.tree.setCurrentItem(item)
+        self.tree.scrollToItem(item, QAbstractItemView.ScrollHint.EnsureVisible)
+        top = self._top_category(item)
+        self._current_category = top.text(0)
+        self._refresh_category_styles()
+        self._update_tree_label()
+        return True
+
+    def begin_rename_operator(self, op_id: str) -> bool:
+        """对用户算子条目第一列开始原地编辑（编辑框只显示文件 stem）。"""
+
+        entry = self._entry(op_id)
+        item = self._entry_items.get(str(op_id))
+        if entry is None or item is None or entry.builtin:
+            return False
+        if not (item.flags() & Qt.ItemFlag.ItemIsEditable):
+            return False
+        self.select_operator(op_id)
+        self.tree.setFocus()
+        self.tree.editItem(item, 0)
+        return True
+
+    def _select_category_path(self, path: tuple[str, ...]) -> bool:
+        if not path:
+            return False
+        item = self._category_items.get(path[0])
+        if item is None:
+            return False
+        item.setExpanded(True)
+        current = item
+        for part in path[1:]:
+            child: QTreeWidgetItem | None = None
+            for index in range(current.childCount()):
+                candidate = current.child(index)
+                if (
+                    candidate.data(0, ROLE_KIND) == _KIND_GROUP
+                    and candidate.text(0) == part
+                ):
+                    child = candidate
+                    break
+            if child is None:
+                break
+            child.setExpanded(True)
+            current = child
+        self.tree.setCurrentItem(current)
+        self.tree.scrollToItem(current, QAbstractItemView.ScrollHint.EnsureVisible)
+        self._current_category = path[0]
+        self._refresh_category_styles()
+        self._update_tree_label()
+        return True
+
+    def _entry(self, op_id: str) -> OperatorEntry | None:
+        if self._registry is None:
+            return None
+        return self._registry.entry(str(op_id))
+
     # ------------------------------------------------------------------ 说明浮层
     def show_operator_info(self, op_id: str) -> bool:
         """显示指定算子的说明浮层；返回是否找到该算子。"""
@@ -908,7 +1466,7 @@ class OperatorLibrary(QWidget):
         if group_operator:
             # 算子组与普通算子在库中的操作不同，说明浮层需要明确标识。
             meta = f"{meta} · 算子组"
-        self.info_name.setText(entry.name)
+        self.info_name.setText(getattr(entry, "display_name", entry.name))
         self.info_meta.setText(meta)
         tooltip = f"算子 id：{entry.id}\n文件：{entry.path}"
         if group_operator:
@@ -1020,7 +1578,7 @@ class OperatorLibrary(QWidget):
         mime.setData(MIME_OPERATOR, payload)
         entry = self._registry.entry(op_id) if self._registry is not None else None
         if entry is not None:
-            mime.setText(entry.name)
+            mime.setText(getattr(entry, "display_name", entry.name))
         return mime
 
     def begin_operator_drag(self, source: QWidget, op_id: str) -> None:
@@ -1030,7 +1588,9 @@ class OperatorLibrary(QWidget):
         drag = QDrag(source)
         drag.setMimeData(mime)
         if entry is not None:
-            drag.setPixmap(self._drag_pixmap(entry.name))
+            drag.setPixmap(
+                self._drag_pixmap(getattr(entry, "display_name", entry.name))
+            )
         drag.setHotSpot(QPoint(24, 16))
         drag.exec(Qt.DropAction.CopyAction)
 

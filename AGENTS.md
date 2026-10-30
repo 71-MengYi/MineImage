@@ -99,7 +99,7 @@ powershell -ExecutionPolicy Bypass -File packaging/build_exe.ps1
 
 | 负责人 | 可写范围 |
 | --- | --- |
-| Lead | `app/core/**`、`app/operators/spec.py`、`app/operators/loader.py`、`app/operators/group.py`、`app/config.py`、`app/ui/main_window.py`、`app/ui/workspace.py`、`app/main.py`、`pyproject.toml`、`tests/test_group.py`、`tests/test_group_integration.py` |
+| Lead | `app/core/**`（含 `app/core/editor.py`、`app/core/operator_files.py`）、`app/operators/spec.py`、`app/operators/loader.py`、`app/operators/template.py`、`app/operators/group.py`、`app/config.py`、`app/ui/main_window.py`、`app/ui/workspace.py`、`app/main.py`、`pyproject.toml`、`tests/test_group.py`、`tests/test_group_integration.py` |
 | engine-ops | `app/engine/**`、`app/operators/builtin/**`、`tests/test_engine.py`、`tests/test_operators.py`、`tests/test_group_engine.py` |
 | graph-ui | `app/graph/**`、`tests/test_graph.py` |
 | shell-ui | `app/ui/preview.py`、`app/ui/library.py`、`app/ui/replace_operator.py`、`app/ui/params.py`、`app/ui/settings_dialog.py`、`app/ui/theme.py`、`tests/test_widgets.py` |
@@ -125,6 +125,7 @@ powershell -ExecutionPolicy Bypass -File packaging/build_exe.ps1
 | 改端口类型 / 结构化数据 / 连线校验 | `docs/architecture.md`「端口数据类型系统」；`app/core/data_types.py` | `app/core/data_types.py`、`app/operators/spec.py`（声明/校验部分） | `tests.test_data_types`、`tests.test_catalog_all` |
 | 新增 / 修改内置算子 | `docs/operator_guide.md` §1–5、§10–11；同类 `app/operators/builtin/catalog/<module>.py` 的 `OPERATORS` 模式 | 对应 `app/operators/builtin/catalog/*.py`（优先）；单文件旧模式用 `app/operators/builtin/*.py`；新一级分类才改 `app/core/constants.py` | 对应 `tests.test_catalog_*.py`；新 id 补进 `tests/test_catalog_all.py` 的 `REQUIRED_IDS`；跑 `python scripts/gen_opencv_catalog_doc.py`；用 `app/operators/builtin/catalog/_cv.py` 做输入/dtype/输出，默认参数可运行，不原地改输入 |
 | 改算子加载 / 发现 / 注册 / 分类 / 加载日志 | `app/operators/loader.py` 顶部约定；`docs/operator_guide.md` §2；`docs/opencv_catalog.md`「扩展方式」 | `app/operators/loader.py`、`app/operators/spec.py`、`app/core/constants.py`（分类顺序） | `tests.test_loader_multi`、`tests.test_engine`（RegistryTests）、`tests.test_catalog_all` |
+| 改用户算子新建 / 重命名 / 删除 / 默认编辑器 | `docs/user_guide.md` §14–15；`app/core/operator_files.py` 顶部；`app/core/editor.py` 顶部 | `app/core/operator_files.py`、`app/core/editor.py`、`app/operators/template.py`、`app/ui/library.py`（右键 / 原地改名）、`app/ui/settings_dialog.py`（编辑器选择） | `tests.test_editor`、`tests.test_loader_multi`、`tests.test_widgets`（OperatorLibraryCreateTests / SettingsDialogTests）、`tests.test_integration` |
 | 改算子组 / 保存为自定义算子 / 占位替换 | `docs/group_node.md` §2、§5、§9；`app/core/group.py`、`app/operators/group.py` 顶部 | `app/core/group.py`、`app/operators/group.py`、`app/graph/group_item.py`、`app/graph/commands.py`、`app/graph/view.py` 相关段、`app/engine/engine.py` 快照段 | `tests.test_group`、`tests.test_group_engine`、`tests.test_group_integration`、`tests.test_graph`；对照 §9 不变量 |
 | 改参数面板 / 自定义控件 / 联动 / 校验 | `docs/operator_guide.md` §5–6；`app/ui/params.py`（grep 方法，不整读） | `app/ui/params.py`、`app/ui/param_widgets.py` | `tests.test_param_widgets`、`tests.test_widgets`；用 `normalize_params`，非法时禁用保存 |
 | 改预览 / 缩放 / 平移 / 对比 / ROI 拾取 | `docs/architecture.md`「PreviewWidget」；`app/ui/preview.py` 相关方法 | `app/ui/preview.py`；参数回调看 `app/ui/params.py` | `tests.test_widgets`（PreviewWidgetTests） |
@@ -165,8 +166,8 @@ powershell -ExecutionPolicy Bypass -File packaging/build_exe.ps1
 | --- | --- |
 | `app/main.py`、`app/__main__.py` | 启动、日志/异常钩子；`main()` |
 | `app/config.py` | `AppSettings`、配置路径、`MINEIMAGE_*` 环境变量 |
-| `app/core/` | `model.py` 图/工作区、`data_types.py` 端口类型、`types.py` `ImageData`、`group.py` 算子组、`project.py` `.mi`、`imageio.py` 图像 IO、`matrixio.py` CSV/文本矩阵、`models.py` ONNX、`logstore.py`、`constants.py` |
-| `app/operators/` | `spec.py` 算子/参数/端口声明、`loader.py` 扫描注册、`group.py` 算子组保存/展开、`builtin/catalog/*.py` 目录算子、`builtin/*.py` 单文件算子、共享工具 `builtin/_utils.py` / `catalog/_cv.py` |
+| `app/core/` | `model.py` 图/工作区、`data_types.py` 端口类型、`types.py` `ImageData`、`group.py` 算子组、`project.py` `.mi`、`imageio.py` 图像 IO、`matrixio.py` CSV/文本矩阵、`models.py` ONNX、`logstore.py`、`constants.py`、`editor.py` 外部编辑器探测/启动、`operator_files.py` 用户算子文件新建/重命名/删除 |
+| `app/operators/` | `spec.py` 算子/参数/端口声明、`loader.py` 扫描注册、`template.py` 界面新建算子的空白模板、`group.py` 算子组保存/展开、`builtin/catalog/*.py` 目录算子、`builtin/*.py` 单文件算子、共享工具 `builtin/_utils.py` / `catalog/_cv.py` |
 | `app/engine/engine.py` | `ExecutionEngine`：快照 / 拓扑并行 / 缓存 / generation |
 | `app/graph/` | `view.py` 画布交互、`scene.py`、`commands.py` 撤销命令、`layout.py` 自动布局、`group_item.py`、`node_item.py`、`port_item.py`、`connection_item.py`、`curve.py`、`collapse_item.py` |
 | `app/ui/` | `main_window.py`、`workspace.py`、`library.py`、`params.py`、`param_widgets.py`、`preview.py`、`settings_dialog.py`、`replace_operator.py`、`log_dialog.py`、`theme.py`、`model_download.py` |
@@ -183,7 +184,7 @@ powershell -ExecutionPolicy Bypass -File packaging/build_exe.ps1
 
 | 领域 | 测试文件 |
 | --- | --- |
-| 核心模型 / 工程 / 矩阵 IO / 算子规范 | `test_core.py` |
+| 核心模型 / 工程 / 矩阵 IO / 算子规范 / 编辑器 | `test_core.py`、`test_editor.py` |
 | 端口类型 / 结构化数据 / 连线校验 | `test_data_types.py` |
 | 目录算子分组 | `test_catalog_filter_geom.py`、`test_catalog_segment_feature.py`、`test_catalog_arithmetic_color.py`、`test_catalog_enhance_draw.py`、`test_catalog_video_analysis.py` |
 | 目录算子全量门禁 | `test_catalog_all.py` |

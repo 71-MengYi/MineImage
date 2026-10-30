@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -16,6 +18,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QToolBar
 
 from app.config import AppSettings
+from app.core.constants import CUSTOM_OPERATOR_CATEGORY
 from app.core.imageio import load_image, save_image
 from app.core.model import WorkspaceModel
 from app.core.types import ImageData
@@ -620,6 +623,93 @@ class MainWindowIntegrationTests(unittest.TestCase):
         self.win.undo()
         self._wait_idle(widget)
         self.assertTrue(self.win.act_redo.isEnabled())
+
+
+class OperatorCreationIntegrationTests(unittest.TestCase):
+    """算子库右键新建与引擎热重载在主窗口里的接线。"""
+
+    def setUp(self) -> None:  # noqa: N802
+        self.operator_root = _TMP / f"integration_ops_{uuid.uuid4().hex[:10]}"
+        self.operator_root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(shutil.rmtree, self.operator_root, ignore_errors=True)
+        self._patch_user_dir()
+
+        self.win = MainWindow(
+            AppSettings(_TMP / f"integration_ops_{uuid.uuid4().hex[:8]}.ini")
+        )
+        self.win.resize(1480, 900)
+        self.win.show()
+        _APP.processEvents()
+        self.widget = self.win.new_workspace()
+        _APP.processEvents()
+
+    def tearDown(self) -> None:  # noqa: N802
+        for widget in list(self.win._workspaces):
+            try:
+                widget.mark_clean()
+            except Exception:  # noqa: BLE001
+                pass
+        self.win.close()
+        self.win.deleteLater()
+        _APP.processEvents()
+
+    def _patch_user_dir(self) -> None:
+        """主窗口建注册表与算子库新建文件都指向临时用户目录。"""
+
+        for target in (
+            "app.ui.main_window.default_user_operator_dir",
+            "app.ui.library.default_user_operator_dir",
+        ):
+            patcher = mock.patch(target, return_value=self.operator_root)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_create_operator_refreshes_registry_and_tree(self) -> None:
+        op_id = self.widget.library.create_operator(("基础调整",))
+        self.assertIsNotNone(op_id)
+        assert op_id is not None
+        _APP.processEvents()
+
+        entry = self.win.registry.entry(op_id)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertFalse(entry.builtin)
+        self.assertTrue(entry.path.is_file())
+        self.assertEqual(entry.path.parent, self.operator_root / "基础调整")
+        self.assertIn(op_id, self.widget.library._entry_items)  # noqa: SLF001
+        self.assertEqual(entry.display_name, entry.path.stem)
+
+        # 关闭原地编辑器，避免测试结束销毁窗口时残留焦点对象。
+        self.widget.library.tree.closePersistentEditor(
+            self.widget.library._entry_items[op_id]  # noqa: SLF001
+        )
+        self.widget.library.tree.setCurrentItem(None)
+
+    def test_blank_area_defaults_to_custom_category(self) -> None:
+        op_id = self.widget.library.create_operator()
+        self.assertIsNotNone(op_id)
+        assert op_id is not None
+        entry = self.win.registry.entry(op_id)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category[0], CUSTOM_OPERATOR_CATEGORY)
+        self.assertEqual(
+            entry.path.parent, self.operator_root / CUSTOM_OPERATOR_CATEGORY
+        )
+
+    def test_engine_reload_signal_refreshes_without_preview_reentry(self) -> None:
+        with mock.patch.object(self.win, "refresh_operators") as refresh:
+            self.widget.engine.operator_reload_requested.emit()
+        refresh.assert_called_once_with(preview=False)
+
+    def test_set_registry_preview_false_does_not_replay_current_node(self) -> None:
+        with mock.patch.object(self.widget.engine, "preview_node") as preview:
+            self.widget.set_registry(self.win.registry, preview=False)
+        preview.assert_not_called()
+
+    def test_operator_watch_is_enabled_by_default(self) -> None:
+        self.assertTrue(self.win.settings.watch_operator_dirs)
+        self.assertTrue(self.win._watch_timer.isActive())
 
 
 class SplitterRatioTests(unittest.TestCase):
