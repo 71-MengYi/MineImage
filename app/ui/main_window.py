@@ -6,8 +6,23 @@ import logging
 import platform
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QActionGroup, QCloseEvent, QDesktopServices, QKeySequence
+from PySide6.QtCore import (
+    QByteArray,
+    QEasingCurve,
+    QSize,
+    Qt,
+    QTimer,
+    QUrl,
+    QVariantAnimation,
+)
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QCloseEvent,
+    QColor,
+    QDesktopServices,
+    QKeySequence,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -51,6 +66,7 @@ from app.operators.loader import OperatorRegistry
 from app.ui.display_modes import DISPLAY_MODE_SPECS, display_mode_icon
 from app.ui.log_dialog import LogDialog
 from app.ui.settings_dialog import SettingsDialog
+from app.ui.theme import TEXT_MUTED
 from app.ui.workspace import WorkspaceWidget
 
 LOG = logging.getLogger(__name__)
@@ -71,6 +87,9 @@ class MainWindow(QMainWindow):
         self._workspace_counter = 0
         self._workspaces: list[WorkspaceWidget] = []
         self._status_labels: dict[str, QLabel] = {}
+        #: 状态栏「耗时」：idle / running / done；running→done 时播放绿色渐暗动画。
+        self._elapsed_state = "idle"
+        self._elapsed_flash: QVariantAnimation | None = None
         self._watch_snapshot: dict[str, tuple[int, int]] = {}
         self._watch_timer = QTimer(self)
         self._watch_timer.setInterval(3000)
@@ -443,6 +462,9 @@ class MainWindow(QMainWindow):
                 label.setMinimumWidth(280)
             elif key == "node":
                 label.setMinimumWidth(130)
+            elif key == "elapsed":
+                # 运行中数字会持续变化，固定最小宽度避免状态栏字段左右抖动。
+                label.setMinimumWidth(120)
             bar.addPermanentWidget(label)
             self._status_labels[key] = label
             self._set_status_field(key, "--")
@@ -516,6 +538,9 @@ class MainWindow(QMainWindow):
             self._maybe_close_workspace(widget)
 
     def _on_current_tab_changed(self, _index: int) -> None:
+        # 切换工作区时先停止上一页的耗时动画，避免颜色残留到新标签。
+        self._stop_elapsed_flash()
+        self._elapsed_state = "idle"
         widget = self._active_workspace()
         if widget is None:
             self._reset_status()
@@ -973,6 +998,8 @@ class MainWindow(QMainWindow):
         label.setText(f"{prefix}: {value}")
 
     def _reset_status(self) -> None:
+        self._stop_elapsed_flash()
+        self._elapsed_state = "idle"
         for key in ("node", "size", "zoom", "elapsed", "coord", "pixel"):
             self._set_status_field(key, "--")
         self.status_message_label.setText("就绪")
@@ -980,12 +1007,52 @@ class MainWindow(QMainWindow):
     def _on_status_info(self, widget: WorkspaceWidget, info: dict) -> None:
         if widget is not self._active_workspace():
             return
+        previous_state = self._elapsed_state
+        state = str(info.get("elapsed_state", "idle"))
         self._set_status_field("node", info.get("node", "--"))
         self._set_status_field("size", info.get("size", "--"))
         self._set_status_field("zoom", info.get("zoom", "--"))
         self._set_status_field("elapsed", info.get("elapsed", "--"))
         self._set_status_field("coord", info.get("coord", "--"))
         self._set_status_field("pixel", info.get("pixel", "--"))
+        self._elapsed_state = state
+        if state == "done" and previous_state == "running":
+            self._flash_elapsed_field()
+        elif state != "done":
+            self._stop_elapsed_flash()
+
+    def _flash_elapsed_field(self) -> None:
+        """状态栏「耗时」完成动画：绿色出现后渐暗回主题文字颜色。"""
+
+        label = self._status_labels.get("elapsed")
+        if label is None:
+            return
+        self._stop_elapsed_flash()
+        animation = QVariantAnimation(self)
+        animation.setDuration(900)
+        animation.setStartValue(QColor("#22c55e"))
+        animation.setKeyValueAt(0.15, QColor("#22c55e"))
+        animation.setEndValue(QColor(TEXT_MUTED))
+        animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        animation.valueChanged.connect(
+            lambda value: label.setStyleSheet(f"color: {value.name()};")
+        )
+        animation.finished.connect(self._stop_elapsed_flash)
+        self._elapsed_flash = animation
+        # 先立即显示绿色，避免首帧动画回调到来前仍显示灰色。
+        label.setStyleSheet("color: #22c55e;")
+        animation.start()
+
+    def _stop_elapsed_flash(self) -> None:
+        animation = self._elapsed_flash
+        self._elapsed_flash = None
+        if animation is not None:
+            animation.stop()
+            animation.deleteLater()
+        label = self._status_labels.get("elapsed")
+        if label is not None:
+            # 清掉内联样式，恢复主题里 QStatusBar QLabel 的默认样式。
+            label.setStyleSheet("")
 
     # ------------------------------------------------------------------ 窗口
     def _restore_window_state(self) -> None:

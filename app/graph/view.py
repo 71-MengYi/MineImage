@@ -17,7 +17,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QPoint,
+    QPointF,
+    QRectF,
+    Qt,
+    QTimer,
+    QVariantAnimation,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QCursor,
@@ -148,6 +158,10 @@ EDGE_SCROLL_MARGIN = 36.0
 EDGE_SCROLL_STEP = 16
 #: 自动滚动定时器间隔（毫秒）。
 EDGE_SCROLL_INTERVAL_MS = 30
+#: 节点卡片“运行中耗时”的刷新间隔（毫秒）。
+RUNNING_ELAPSED_TICK_MS = 100
+#: 计算完成后右下角耗时绿色渐暗动画时长（毫秒）。
+ELAPSED_FLASH_MS = 900
 
 
 @dataclass(frozen=True)
@@ -259,6 +273,13 @@ class GraphView(QGraphicsView):
         self._edge_scroll_timer = QTimer(self)
         self._edge_scroll_timer.setInterval(EDGE_SCROLL_INTERVAL_MS)
         self._edge_scroll_timer.timeout.connect(self._auto_scroll_during_drag)
+
+        # 节点卡片右下角耗时：运行中按 tick 刷新；完成后播放绿色渐暗动画。
+        self._running_nodes: set[str] = set()
+        self._elapsed_flash_animations: dict[str, QVariantAnimation] = {}
+        self._running_timer = QTimer(self)
+        self._running_timer.setInterval(RUNNING_ELAPSED_TICK_MS)
+        self._running_timer.timeout.connect(self._tick_running_nodes)
 
         self.graph.node_added.connect(self._on_node_added)
         self.graph.node_removed.connect(self._on_node_removed)
@@ -490,13 +511,39 @@ class GraphView(QGraphicsView):
             self._syncing_selection = False
         self.selection_changed.emit(primary or (node_ids[-1] if node_ids else ""))
 
+    def notify_started(self, node_id: str) -> None:
+        """节点开始执行：卡片右下角改为实时增加的耗时。"""
+
+        item = self._nodes.get(node_id)
+        if item is None or isinstance(item, GroupItem):
+            return
+        item.set_running()
+        self._running_nodes.add(node_id)
+        if not self._running_timer.isActive():
+            self._running_timer.start()
+
+    def clear_running(self) -> None:
+        """清除所有“运行中”计时（新请求取消旧请求、停止计算时调用）。"""
+
+        self._running_timer.stop()
+        self._running_nodes.clear()
+        for item in self._nodes.values():
+            if item.running:
+                item.clear_running()
+
     def notify_result(self, node_id: str, result: Any) -> None:
         self._results[node_id] = result
         self._errors.pop(node_id, None)
         item = self._nodes.get(node_id)
         if item is not None:
+            was_running = item.running
+            item.clear_running()
+            self._running_nodes.discard(node_id)
             item.set_result(result, self._thumbnails_enabled)
+            if was_running and not isinstance(item, GroupItem):
+                self._start_elapsed_flash(node_id, item)
             self._update_connections_for(node_id)
+        self._stop_running_timer_if_idle()
 
     def notify_error(self, node_id: str, message: str | None) -> None:
         if message:
@@ -505,7 +552,59 @@ class GraphView(QGraphicsView):
             self._errors.pop(node_id, None)
         item = self._nodes.get(node_id)
         if item is not None:
+            item.clear_running()
+            self._running_nodes.discard(node_id)
             item.set_error(message)
+        self._stop_running_timer_if_idle()
+
+    def _tick_running_nodes(self) -> None:
+        for node_id in list(self._running_nodes):
+            item = self._nodes.get(node_id)
+            if item is None or not item.running:
+                self._running_nodes.discard(node_id)
+                continue
+            item.refresh_running_elapsed()
+        if not self._running_nodes:
+            self._running_timer.stop()
+
+    def _stop_running_timer_if_idle(self) -> None:
+        if not self._running_nodes:
+            self._running_timer.stop()
+
+    def _start_elapsed_flash(self, node_id: str, item: NodeItem) -> None:
+        """计算完成：耗时文本从亮绿渐暗回常规颜色。"""
+
+        self._stop_elapsed_flash(node_id)
+        animation = QVariantAnimation(self)
+        animation.setDuration(ELAPSED_FLASH_MS)
+        animation.setStartValue(0.0)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.valueChanged.connect(
+            lambda value, target=item: target.set_elapsed_flash(float(value))
+        )
+        animation.finished.connect(lambda target_id=node_id: self._finish_elapsed_flash(target_id))
+        self._elapsed_flash_animations[node_id] = animation
+        # 先立即显示绿色，避免首帧动画回调到来前仍显示灰色。
+        item.set_elapsed_flash(0.0)
+        animation.start()
+
+    def _finish_elapsed_flash(self, node_id: str) -> None:
+        animation = self._elapsed_flash_animations.pop(node_id, None)
+        if animation is not None:
+            animation.deleteLater()
+        item = self._nodes.get(node_id)
+        if item is not None:
+            item.set_elapsed_flash(None)
+
+    def _stop_elapsed_flash(self, node_id: str) -> None:
+        animation = self._elapsed_flash_animations.pop(node_id, None)
+        if animation is not None:
+            animation.stop()
+            animation.deleteLater()
+        item = self._nodes.get(node_id)
+        if item is not None:
+            item.set_elapsed_flash(None)
 
     def set_thumbnails_enabled(self, enabled: bool) -> None:
         self._thumbnails_enabled = bool(enabled)
@@ -1059,6 +1158,9 @@ class GraphView(QGraphicsView):
     def _recreate_node_item(self, node_id: str) -> None:
         node = self.graph.nodes.get(node_id)
         old = self._nodes.pop(node_id, None)
+        self._running_nodes.discard(node_id)
+        self._stop_elapsed_flash(node_id)
+        self._stop_running_timer_if_idle()
         was_selected = bool(old is not None and old.isSelected())
         if old is not None and old.scene() is self._scene:
             self._scene.removeItem(old)
@@ -1937,6 +2039,9 @@ class GraphView(QGraphicsView):
         item = self._nodes.pop(node_id, None)
         if item is not None and item.scene() is self._scene:
             self._scene.removeItem(item)
+        self._running_nodes.discard(node_id)
+        self._stop_elapsed_flash(node_id)
+        self._stop_running_timer_if_idle()
         for connection_id, connection in list(self._connections.items()):
             if node_id in (connection.src_node, connection.dst_node):
                 if connection.scene() is self._scene:
@@ -3366,6 +3471,12 @@ class GraphView(QGraphicsView):
 
     def _clear_items(self) -> None:
         self._selection_timer.stop()
+        self._running_timer.stop()
+        self._running_nodes.clear()
+        for animation in self._elapsed_flash_animations.values():
+            animation.stop()
+            animation.deleteLater()
+        self._elapsed_flash_animations.clear()
         self._pending_move_target = None
         self._pending_move_reason = None
         self._clear_target_highlight()

@@ -11,6 +11,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
+from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QToolBar
 
@@ -18,6 +19,7 @@ from app.config import AppSettings
 from app.core.imageio import load_image, save_image
 from app.core.model import WorkspaceModel
 from app.core.types import ImageData
+from app.engine.engine import NodeResult
 from app.operators.loader import OperatorRegistry
 from app.ui.main_window import MainWindow
 from app.ui.theme import apply_theme
@@ -41,6 +43,13 @@ def _sample_image(path: Path) -> Path:
     )
     save_image(path, ImageData(bgr, "input"))
     return path
+
+
+def _status_elapsed_ms(text: str) -> float:
+    """把状态栏“耗时: 123 ms / 1.2 s”换算成毫秒。"""
+
+    value, unit = text.split(":", 1)[1].strip().split()
+    return float(value) * 1000.0 if unit == "s" else float(value)
 
 
 class MainWindowIntegrationTests(unittest.TestCase):
@@ -83,6 +92,18 @@ class MainWindowIntegrationTests(unittest.TestCase):
             if not widget.engine.busy:
                 return
         self.fail("后台计算超时")
+
+    def _pump_until(self, predicate, timeout: float = 3.0) -> bool:
+        """离屏环境下逐步跑事件循环，直到条件满足（用于等待动画帧）。"""
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            _APP.processEvents()
+            if predicate():
+                return True
+            QTest.qWait(20)
+        _APP.processEvents()
+        return predicate()
 
     def test_toolbar_omits_refresh_action(self) -> None:
         # 刷新入口只保留在算子库和「算子」菜单，工具栏不再重复放一个。
@@ -333,6 +354,44 @@ class MainWindowIntegrationTests(unittest.TestCase):
             )
         self.assertEqual(loaded._current_node_id, blur)
         self.assertIsNotNone(loaded.preview.image_size())
+
+    def test_elapsed_status_ticks_and_flashes_on_completion(self) -> None:
+        widget = self._open()
+        node_id = widget._current_node_id
+        self.assertIsNotNone(node_id)
+        assert node_id is not None
+        label = self.win._status_labels["elapsed"]
+
+        # 运行中：状态栏耗时数字持续增加。
+        widget._on_node_started(node_id)
+        _APP.processEvents()
+        self.assertEqual(widget._elapsed_state, "running")
+        first = label.text()
+        QTest.qWait(260)
+        _APP.processEvents()
+        second = label.text()
+        self.assertNotEqual(first, second)
+        self.assertGreater(_status_elapsed_ms(second), _status_elapsed_ms(first))
+
+        # 完成：绿色渐暗动画，结束后恢复主题里的普通样式。
+        node = widget.workspace.graph.nodes[node_id]
+        image = ImageData(np.zeros((12, 16, 3), dtype=np.uint8), "结果")
+        result = NodeResult(node_id, {"image": image}, 42.5, node.revision)
+        widget._on_node_finished(result)
+        _APP.processEvents()
+        self.assertEqual(widget._elapsed_state, "done")
+        self.assertIn("42.5 ms", label.text())
+        self.assertTrue(self._pump_until(lambda: bool(label.styleSheet())), "完成动画未启动")
+        sheet = label.styleSheet()
+        self.assertTrue(sheet.startswith("color: "), sheet)
+        color = QColor(sheet[len("color: ") :].rstrip(";"))
+        self.assertGreater(color.green(), color.red())
+        self.assertTrue(self._pump_until(lambda: not label.styleSheet()), "完成动画未恢复")
+        self.assertIn("42.5 ms", label.text())
+
+        # 卡片右下角的计时也随完成结束。
+        item = widget.graph_view._nodes[node_id]
+        self.assertFalse(item.running)
 
     def test_interactive_roi_pick_updates_params_and_preview(self) -> None:
         from PySide6.QtCore import QPoint, Qt

@@ -765,6 +765,25 @@ class ExecutionEngineTests(EngineTestCase):
         self.assertIsNot(engine.result(first.id), previous)
         self.assertEqual(events["started"], ordered)
 
+    def test_request_started_emits_once_per_real_request(self) -> None:
+        generations: list[int] = []
+        self.engine.request_started.connect(generations.append)
+        _source, _gray, blur = self.build_chain()
+
+        self.engine.preview_node(blur.id)
+        self.assertTrue(self.wait_chain(blur.id))
+        self.assertEqual(len(generations), 1)
+
+        # 快照命中直接回放，不启动新请求。
+        self.engine.preview_node(blur.id)
+        self.assertEqual(len(generations), 1)
+
+        self.chain_events.clear()
+        self.engine.refresh_node(blur.id)
+        self.assertTrue(self.wait_chain(blur.id))
+        self.assertEqual(len(generations), 2)
+        self.assertGreater(generations[1], generations[0])
+
     # ------------------------------------------------------------------ 取消 / 过期
     def _slow_registry(self) -> OperatorRegistry:
         return OperatorRegistry.build([OPS_FIXTURES])

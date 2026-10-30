@@ -222,6 +222,9 @@ class ExecutionEngine(QObject):
     node_failed = Signal(str, str)  # node id, message
     chain_finished = Signal(str, bool)  # target id, success
     busy_changed = Signal(bool)
+    #: 每次真正提交新请求时发出（generation）；旧请求中未完成的节点不会再有
+    #: finished / failed，界面据此清理“运行中”的计时。
+    request_started = Signal(int)
 
     # 内部跨线程信号（接收者都是本对象，自动排队到主线程）
     _started = Signal(int, str)
@@ -396,6 +399,8 @@ class ExecutionEngine(QObject):
         self._generation += 1
         generation = self._generation
         self._cancel_current()
+        # 旧请求已被取代：界面可以立即清掉它的“运行中”计时。
+        self.request_started.emit(generation)
         token = _CancelToken()
         try:
             snapshot = self._capture_graph()

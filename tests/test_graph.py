@@ -129,6 +129,13 @@ def make_registry() -> FakeRegistry:
     return FakeRegistry(BLUR_SPEC, MERGE_SPEC, SPLIT_SPEC, OUTPUT_SPEC, NOTE_SPEC)
 
 
+def _parse_elapsed_text(text: str) -> float:
+    """把卡片耗时（如 “123 ms” / “1.2 s”）换算成毫秒，便于比较数字增长。"""
+
+    value, unit = text.split()
+    return float(value) * 1000.0 if unit == "s" else float(value)
+
+
 #: 测试用算子组定义：一个输入 -> 一个模糊节点 -> 一个输出。
 DEMO_GROUP_DEFINITION = {
     "format": "mineimage-group-definition",
@@ -1703,6 +1710,55 @@ class GraphViewTestCase(unittest.TestCase):
 
         self.view.set_thumbnails_enabled(True)
         self.assertIsNotNone(item.thumbnail_pixmap)
+
+    def test_running_elapsed_counts_up_and_flashes_on_completion(self) -> None:
+        node = self.add_node(pos=(30.0, 30.0))
+        item = self.item(node)
+        self.assertFalse(item.running)
+        self.assertIsNone(item.elapsed_display_text)
+
+        # 完成动画颜色：亮绿起始，渐暗回常规耗时灰色。
+        item.set_elapsed_flash(0.0)
+        self.assertEqual(item._elapsed_footer_color().name(), "#22c55e")  # noqa: SLF001
+        item.set_elapsed_flash(1.0)
+        self.assertEqual(item._elapsed_footer_color().name(), "#64748b")  # noqa: SLF001
+        item.set_elapsed_flash(None)
+
+        self.view.notify_started(node.id)
+        self.assertTrue(item.running)
+        self.assertTrue(self.view._running_timer.isActive())  # noqa: SLF001
+        QTest.qWait(120)
+        first = item.elapsed_display_text
+        self.assertIsNotNone(first)
+        QTest.qWait(260)
+        second = item.elapsed_display_text
+        self.assertIsNotNone(second)
+        assert first is not None and second is not None
+        self.assertGreater(_parse_elapsed_text(second), _parse_elapsed_text(first))
+
+        image = ImageData(np.zeros((24, 36, 3), dtype=np.uint8), "结果")
+        result = NodeResult(node.id, {"image": image}, 12.5, node.revision)
+        self.view.notify_result(node.id, result)
+        self.assertFalse(item.running)
+        self.assertFalse(self.view._running_timer.isActive())  # noqa: SLF001
+        self.assertEqual(item.elapsed_display_text, "12.5 ms")
+        QTest.qWait(80)
+        self.assertIsNotNone(item.elapsed_flash_progress)
+        # 动画结束后恢复普通样式（进度清空，文本仍是最终耗时）。
+        QTest.qWait(1100)
+        self.assertIsNone(item.elapsed_flash_progress)
+        self.assertEqual(item.elapsed_display_text, "12.5 ms")
+
+    def test_clear_running_stops_card_clock(self) -> None:
+        node = self.add_node()
+        item = self.item(node)
+        self.view.notify_started(node.id)
+        self.assertTrue(item.running)
+
+        self.view.clear_running()
+        self.assertFalse(item.running)
+        self.assertFalse(self.view._running_timer.isActive())  # noqa: SLF001
+        self.assertIsNone(item.elapsed_display_text)
 
     def test_note_card_shows_text_instead_of_result_data(self) -> None:
         node = self.add_node(

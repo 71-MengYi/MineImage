@@ -276,8 +276,10 @@ status_message = Signal(str)
 operators_changed = Signal()          # 保存算子组为新算子后，请求主窗口刷新算子库
 
 set_registry(registry) -> None
+notify_started(node_id: str) -> None  # 节点开始执行：卡片右下角实时计时
 notify_result(node_id: str, result: NodeResult) -> None
 notify_error(node_id: str, message: str | None) -> None
+clear_running() -> None              # 新请求取消旧请求时清掉遗留的运行中计时
 selected_node_id() -> str | None
 set_selected_node(node_id: str) -> None
 copy_selected() -> bool              # Ctrl+C：复制选中节点及副本间连线；算子组会自动带上全部后代
@@ -300,6 +302,11 @@ delete_selected() -> None
 
 `NodeResult` 需要 `.primary`、`.preview_image`、`.outputs`、`.summary_text()`、
 `.elapsed_ms`、`.revision`；`.outputs` 的 value 可以是任意类型的端口值。
+
+节点卡片右下角的耗时由 GraphView 维护：`notify_started()` 开始按 100ms tick 显示
+实时耗时；`notify_result()` / `notify_error()` 结束计时，成功时播放 900ms 的绿色渐隐
+动画后恢复常规灰色（失败直接显示「错误」）。状态栏「耗时」由 WorkspaceWidget 计时，
+通过 `status_info["elapsed_state"]` 传递 idle / running / done，供主窗口做同款完成动画。
 
 连线校验：GraphView 在创建连线时调用
 `app.operators.spec.port_types_compatible(output_port, input_port)`，只允许
@@ -328,11 +335,14 @@ node_finished = Signal(object)         # NodeResult
 node_failed = Signal(str, str)         # node id, message
 chain_finished = Signal(str, bool)     # root id, success
 busy_changed = Signal(bool)
+request_started = Signal(int)          # 新请求真正提交时的 generation；旧请求残留的“运行中”状态据此清理
 ```
 
 `workers` 缺省取 `AppSettings.execution_workers`（`execution/workers`，默认
 `min(4, CPU 核数)`，范围 1–16）。同一次请求内多个 worker 并发调用
 `Operator.process()`，算子必须线程安全。
+
+`update_nodes` / `precompute_all`）都会在缓存判断与图快照之前调用
 
 算子组节点在抓取快照时被展开成真实上游依赖：组的每个输出端口记录一条
 `"@out:<port>"` 伪输入，普通连线用 `GraphModel.resolve_source()` 跨过组边界，

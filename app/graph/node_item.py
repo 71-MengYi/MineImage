@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -41,6 +42,12 @@ from app.operators.spec import OperatorSpec, PortSpec
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型检查
     from app.graph.view import GraphView
+
+
+#: 节点卡片右下角耗时文本的常规颜色。
+ELAPSED_TEXT_COLOR = "#64748b"
+#: 计算完成时耗时文本的起始绿色；动画从该颜色渐暗回 ELAPSED_TEXT_COLOR。
+ELAPSED_FLASH_COLOR = "#22c55e"
 
 
 def _elide(font: QFont, text: str, width: float) -> str:
@@ -126,6 +133,10 @@ class NodeItem(QGraphicsItem):
         self._canvas_lines: list[str] = []
         self._canvas_line_spacing = 14.0
         self._elapsed: float | None = None
+        #: 正在运行时的 monotonic 起始时间；None 表示当前没有在执行。
+        self._running_since: float | None = None
+        #: 计算完成后的绿色渐暗动画进度（0→1）；None 表示未播放。
+        self._flash_progress: float | None = None
         self._error: str | None = None
         self._thumb_rect = QRectF()
         self._content_rect = QRectF()
@@ -159,6 +170,24 @@ class NodeItem(QGraphicsItem):
     @property
     def elapsed_ms(self) -> float | None:
         return self._elapsed
+
+    @property
+    def running(self) -> bool:
+        """节点是否正在后台执行（右下角显示实时耗时）。"""
+
+        return self._running_since is not None
+
+    @property
+    def elapsed_flash_progress(self) -> float | None:
+        """完成后的绿色渐暗动画进度；None 表示动画未播放。"""
+
+        return self._flash_progress
+
+    @property
+    def elapsed_display_text(self) -> str | None:
+        """右下角耗时文本：运行中为实时耗时，完成后为最终耗时。"""
+
+        return self._elapsed_footer_text()
 
     @property
     def error_message(self) -> str | None:
@@ -384,6 +413,7 @@ class NodeItem(QGraphicsItem):
         if thumbnails_enabled is not None:
             self._thumbnails_enabled = bool(thumbnails_enabled)
         self._result = result
+        self._running_since = None
         self._elapsed = float(getattr(result, "elapsed_ms", 0.0) or 0.0)
         self._error = None
         self._update_content()
@@ -391,6 +421,62 @@ class NodeItem(QGraphicsItem):
         self._refresh_connections()
         self._refresh_tooltip()
         self.update()
+
+    def set_running(self) -> None:
+        """开始运行：右下角从“未运行”切换为实时增加的耗时。"""
+
+        self._running_since = time.monotonic()
+        self._flash_progress = None
+        if self._error is not None:
+            # 重跑时旧错误不再成立，先恢复普通卡片样式。
+            self._error = None
+            self._refresh_tooltip()
+        self.update(self._footer_rect)
+
+    def clear_running(self) -> None:
+        """结束运行计时（最终耗时由后续 ``set_result`` 写入）。"""
+
+        if self._running_since is None:
+            return
+        self._running_since = None
+        self.update(self._footer_rect)
+
+    def set_elapsed_flash(self, progress: float | None) -> None:
+        """设置完成动画进度；None 表示恢复常规耗时样式。"""
+
+        if progress is None:
+            self._flash_progress = None
+        else:
+            self._flash_progress = max(0.0, min(1.0, float(progress)))
+        self.update(self._footer_rect)
+
+    def refresh_running_elapsed(self) -> None:
+        """运行中由画布定时器调用：只重绘底部耗时区域。"""
+
+        if self._running_since is not None:
+            self.update(self._footer_rect)
+
+    def _elapsed_footer_text(self) -> str | None:
+        if self._running_since is not None:
+            seconds = max(0.0, time.monotonic() - self._running_since)
+            if seconds < 1.0:
+                return f"{seconds * 1000.0:.0f} ms"
+            return f"{seconds:.1f} s"
+        if self._elapsed is not None:
+            return f"{self._elapsed:.1f} ms"
+        return None
+
+    def _elapsed_footer_color(self) -> QColor:
+        base = QColor(ELAPSED_TEXT_COLOR)
+        if self._flash_progress is None:
+            return base
+        start = QColor(ELAPSED_FLASH_COLOR)
+        t = self._flash_progress
+        return QColor(
+            round(start.red() + (base.red() - start.red()) * t),
+            round(start.green() + (base.green() - start.green()) * t),
+            round(start.blue() + (base.blue() - start.blue()) * t),
+        )
 
     def set_thumbnails_enabled(self, enabled: bool, thumbnail_box: int | None = None) -> None:
         enabled = bool(enabled)
@@ -409,7 +495,9 @@ class NodeItem(QGraphicsItem):
 
     def set_error(self, message: str | None) -> None:
         message = message or None
-        if self._error == message:
+        was_running = self._running_since is not None
+        self._running_since = None
+        if self._error == message and not was_running:
             return
         self._error = message
         self._refresh_tooltip()
@@ -791,11 +879,17 @@ class NodeItem(QGraphicsItem):
             count = len(self._canvas_text.strip())
             footer_text = f"{count} 字" if count else "空便签"
             painter.setPen(QColor("#a29464"))
-        elif self._elapsed is not None:
-            footer_text = f"{self._elapsed:.1f} ms"
-            painter.setPen(QColor("#64748b"))
         else:
-            footer_text = "未运行"
+            elapsed_text = self._elapsed_footer_text()
+            if elapsed_text is None:
+                footer_text = "未运行"
+            else:
+                footer_text = elapsed_text
+                if self._running_since is None:
+                    # 完成动画：亮绿渐暗回常规耗时颜色。
+                    painter.setPen(self._elapsed_footer_color())
+                else:
+                    painter.setPen(QColor(ELAPSED_TEXT_COLOR))
         painter.drawText(
             QRectF(self._width - 92.0, footer_y, 80.0, self.FOOTER_H),
             int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),

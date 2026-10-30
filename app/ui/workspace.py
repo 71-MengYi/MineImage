@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -40,6 +41,8 @@ LEGACY_RATIO_TOLERANCE = 0.22
 #: 连线变化后合并触发的延迟（毫秒）：一次撤销宏 / 粘贴可能产生多条连线，
 #: 合并成一次引擎更新，避免互相取消。
 CONNECTION_UPDATE_DELAY_MS = 30
+#: 状态栏「耗时」在节点运行中的刷新间隔（毫秒）。
+ELAPSED_TICK_MS = 100
 
 LOG = logging.getLogger(__name__)
 
@@ -86,6 +89,9 @@ class WorkspaceWidget(QWidget):
         self._dirty = False
         self._current_node_id: str | None = None
         self._last_elapsed_ms: float | None = None
+        #: 状态栏「耗时」的显示状态：idle / running / done。
+        self._elapsed_state = "idle"
+        self._run_started_at: float | None = None
         self._pixel_coord = "--"
         self._pixel_value = "--"
         self._compare_mode = "single"
@@ -101,6 +107,10 @@ class WorkspaceWidget(QWidget):
         self._connection_update_timer.setSingleShot(True)
         self._connection_update_timer.setInterval(CONNECTION_UPDATE_DELAY_MS)
         self._connection_update_timer.timeout.connect(self._flush_connection_updates)
+        # 当前节点运行中时，按 tick 刷新状态栏「耗时」。
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(ELAPSED_TICK_MS)
+        self._elapsed_timer.timeout.connect(self._emit_status)
         # 默认比例 1:2:4；旧版本默认比例（1:1:3 / 1:1:4）也视为“未自定义”，
         # 首次显示时校正，避免已有配置一直保留旧比例。
         saved_sizes = tuple(self.settings.workspace_splitter_sizes)
@@ -223,6 +233,7 @@ class WorkspaceWidget(QWidget):
         self.engine.node_failed.connect(self._on_node_failed)
         self.engine.chain_finished.connect(self._on_chain_finished)
         self.engine.busy_changed.connect(self._on_busy_changed)
+        self.engine.request_started.connect(self._on_engine_request_started)
 
         self.undo_stack.indexChanged.connect(self._on_undo_index_changed)
 
@@ -320,6 +331,8 @@ class WorkspaceWidget(QWidget):
 
     def _on_node_selected(self, node_id: str, *, request_preview: bool = True) -> None:
         if not node_id:
+            self._stop_elapsed_clock()
+            self._elapsed_state = "idle"
             self._current_node_id = None
             self._current_image = None
             self._pixel_coord = "--"
@@ -337,6 +350,8 @@ class WorkspaceWidget(QWidget):
             self._param_session_old = {}
         self.center_stack.setCurrentWidget(self.graph_view)
         self._current_node_id = node_id
+        self._stop_elapsed_clock()
+        self._elapsed_state = "idle"
         self._last_elapsed_ms = None
         self._current_image = None
         self._pixel_coord = "--"
@@ -454,6 +469,9 @@ class WorkspaceWidget(QWidget):
             QMessageBox.warning(self, "算子不存在", f"找不到算子：{node.op_id}\n请刷新算子库。")
             return
         self._current_node_id = node_id
+        self._stop_elapsed_clock()
+        self._elapsed_state = "idle"
+        self._last_elapsed_ms = None
         self._param_node_id = node_id
         self._param_session_old = copy.deepcopy(node.params)
         self.param_panel.load_node(node, entry.operator)
@@ -490,6 +508,9 @@ class WorkspaceWidget(QWidget):
             # 参数 revision 变化后 preview_node 会让该节点与全部下游快照失效，
             # 并递归重算下游，保证画布上的数据始终与参数一致。
             self.workspace.graph.set_node_params(node_id, params)
+            self._stop_elapsed_clock()
+            self._elapsed_state = "idle"
+            self._last_elapsed_ms = None
             self.engine.preview_node(node_id)
             self._mark_dirty()
             self._emit_status()
@@ -501,6 +522,9 @@ class WorkspaceWidget(QWidget):
         if node.params != params:
             self.workspace.graph.set_node_params(node_id, params)
         self._push_param_session()
+        self._stop_elapsed_clock()
+        self._elapsed_state = "idle"
+        self._last_elapsed_ms = None
         self.engine.commit_node(node_id)
         self._param_session_old = copy.deepcopy(node.params)
         self._mark_dirty()
@@ -534,6 +558,9 @@ class WorkspaceWidget(QWidget):
             return
         # 撤销/重做可能改变参数或连线；清空所有快照后重新计算当前节点。
         self.engine.invalidate_all()
+        self._stop_elapsed_clock()
+        self._elapsed_state = "idle"
+        self._last_elapsed_ms = None
         if self._pending_connection_roots:
             # 连线变化已经安排了延迟更新：把当前节点并入同一批请求，
             # 避免两次请求互相取消。
@@ -632,6 +659,11 @@ class WorkspaceWidget(QWidget):
         node = self.workspace.graph.nodes.get(node_id)
         if node:
             self.status_message.emit(f"正在计算：{node.display_title()}")
+        # 画布卡片对每个节点独立计时；状态栏只跟随当前选中的节点。
+        self.graph_view.notify_started(node_id)
+        if node_id == self._current_node_id:
+            self._start_elapsed_clock()
+            self._emit_status()
 
     def _on_node_finished(self, result: NodeResult) -> None:
         node = self.workspace.graph.nodes.get(result.node_id)
@@ -639,6 +671,8 @@ class WorkspaceWidget(QWidget):
             return
         self.graph_view.notify_result(node.id, result)
         if node.id == self._current_node_id:
+            self._stop_elapsed_clock()
+            self._elapsed_state = "done"
             self._show_result(result, node)
         if node.id == self._param_node_id:
             self.param_panel.set_result(result)
@@ -666,6 +700,8 @@ class WorkspaceWidget(QWidget):
             self._current_image = None
             self.preview.set_image(None, title, f"计算失败：{message}")
             self._last_elapsed_ms = None
+            self._stop_elapsed_clock()
+            self._elapsed_state = "idle"
         if node_id == self._param_node_id:
             self.param_panel.set_result(None)
         self.status_message.emit(message)
@@ -681,7 +717,43 @@ class WorkspaceWidget(QWidget):
     def _on_busy_changed(self, busy: bool) -> None:
         if busy:
             self.status_message.emit("后台并行计算中…")
+        else:
+            # 正常结束时运行中集合已经清空；这里兜底清理被取消的请求。
+            self.graph_view.clear_running()
+            if self._elapsed_state == "running":
+                # 请求被取消（例如快速切换节点）时可能收不到 finished / failed。
+                self._stop_elapsed_clock()
+                self._elapsed_state = "idle"
         self._emit_status()
+
+    def _on_engine_request_started(self, _generation: int) -> None:
+        """新请求会取代旧请求：清掉旧请求遗留的“运行中”计时。"""
+
+        self.graph_view.clear_running()
+        if self._elapsed_state == "running":
+            self._stop_elapsed_clock()
+            self._elapsed_state = "idle"
+
+    # ------------------------------------------------------------------ 耗时
+    def _running_elapsed_text(self) -> str | None:
+        """运行中的实时耗时文本；数字随 tick 增加。"""
+
+        if self._run_started_at is None:
+            return None
+        seconds = max(0.0, time.monotonic() - self._run_started_at)
+        if seconds < 1.0:
+            return f"{seconds * 1000.0:.0f} ms"
+        return f"{seconds:.1f} s"
+
+    def _start_elapsed_clock(self) -> None:
+        self._run_started_at = time.monotonic()
+        self._elapsed_state = "running"
+        if not self._elapsed_timer.isActive():
+            self._elapsed_timer.start()
+
+    def _stop_elapsed_clock(self) -> None:
+        self._elapsed_timer.stop()
+        self._run_started_at = None
 
     # ------------------------------------------------------------------ 状态
     def _on_pixel_info(self, sample) -> None:
@@ -704,13 +776,21 @@ class WorkspaceWidget(QWidget):
         if image is not None:
             size = f"{image.width}×{image.height}"
         zoom = f"{self.preview.zoom_percent():.0f}%"
+        elapsed = self._running_elapsed_text()
+        if elapsed is None:
+            elapsed = (
+                f"{self._last_elapsed_ms:.1f} ms"
+                if self._last_elapsed_ms is not None
+                else "--"
+            )
         info = {
             "node": node.display_title() if node else "--",
             "size": size,
             "zoom": zoom,
             "coord": self._pixel_coord,
             "pixel": self._pixel_value,
-            "elapsed": f"{self._last_elapsed_ms:.1f} ms" if self._last_elapsed_ms is not None else "--",
+            "elapsed": elapsed,
+            "elapsed_state": self._elapsed_state,
             "busy": self.engine.busy,
             "mode": self._compare_mode,
             "display": self.workspace.display_mode,
