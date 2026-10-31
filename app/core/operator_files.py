@@ -1,11 +1,12 @@
-"""用户算子文件的新建 / 重命名 / 删除等文件操作。
+"""用户算子文件与用户分类目录的新建 / 重命名 / 移动 / 删除等文件操作。
 
-界面里「新建算子」「在分类下新建」「重命名」「删除」都走这些函数，保证：
+界面里「新建算子」「新建分类」「重命名」「拖动整理」「删除」都走这些函数，保证：
 
 * 文件名与分类目录使用同一套清洗 / 校验规则（Windows 非法字符、首尾空格与点、
   下划线开头的文件会被 loader 忽略等）；
 * 新建的文件写入带 ``MINEIMAGE_UI_CREATED`` 标记的空白模板，重命名文件时能同步
   模板里的 ``OperatorSpec.name``；
+* 移动 / 重命名用户分类目录时，按 AST 安全同步目录内源码的字面量 ``category``；
 * 写入使用“同目录临时文件 + 原子替换”，避免算子扫描读到半截文件。
 
 所有错误信息都是可以直接展示给用户的中文，调用方只需 ``str(exc)``。
@@ -17,6 +18,7 @@ import ast
 import hashlib
 import os
 import re
+import shutil
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -616,6 +618,84 @@ def move_operator_file(
     return MoveOutcome(target)
 
 
+def _user_category_source(
+    root: Path | str,
+    path: Path | str,
+) -> tuple[Path, tuple[str, ...]]:
+    """校验“重命名 / 删除分类”的源目录，返回解析后的目录与相对路径。"""
+
+    base = _resolve_user_root(root)
+    source = Path(path).expanduser()
+    if not source.is_dir():
+        raise FileNotFoundError(f"分类目录不存在：{source}")
+    source = source.resolve()
+    _ensure_inside(base, source, "分类目录")
+    if source == base:
+        raise ValueError("用户算子根目录不能作为分类操作。")
+    parts = _relative_parts(base, source)
+    if not parts:
+        raise ValueError("用户算子根目录不能作为分类操作。")
+    if parts[0] == "custom":
+        raise ValueError("custom 是算子组保留目录，不能重命名或删除。")
+    if _has_reserved_parts(parts):
+        raise ValueError("隐藏或保留目录不能重命名或删除。")
+    return source, parts
+
+
+def _count_loadable_py(directory: Path) -> int:
+    """统计目录内按 loader 规则可加载的 ``*.py`` 文件数。"""
+
+    return sum(
+        1
+        for file_path in directory.rglob("*.py")
+        if "__pycache__" not in file_path.parts
+        and not file_path.name.startswith("_")
+    )
+
+
+def _move_category_directory(
+    source: Path,
+    target: Path,
+    old_prefix: tuple[str, ...],
+    new_prefix: tuple[str, ...],
+    *,
+    action: str,
+) -> tuple[str, ...]:
+    """移动 / 重命名分类目录并同步字面量 ``category``，返回 warnings。"""
+
+    originals, updates, warnings = _category_move_updates(
+        source, old_prefix, new_prefix
+    )
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise OSError(f"无法创建目标分类目录：{exc}") from exc
+    try:
+        source.rename(target)
+    except OSError as exc:
+        raise OSError(f"{action}分类目录失败：{exc}") from exc
+
+    written: list[Path] = []
+    try:
+        for relative, data in updates.items():
+            _write_bytes_atomic(target / relative, data)
+            written.append(relative)
+    except Exception:
+        # 目录移动成功但某个文件的分类同步失败：退回目录并恢复已改写内容。
+        try:
+            target.rename(source)
+        except OSError:
+            pass
+        else:
+            for relative in written:
+                try:
+                    _write_bytes_atomic(source / relative, originals[relative])
+                except OSError:
+                    pass
+        raise
+    return tuple(warnings)
+
+
 def move_category_dir(
     root: Path | str,
     path: Path | str,
@@ -659,37 +739,56 @@ def move_category_dir(
         raise FileExistsError(f"目标位置已存在同名分类或文件：{new_path.name}")
 
     new_parts = target_parts + (source.name,)
-    originals, updates, warnings = _category_move_updates(
-        source, source_parts, new_parts
+    warnings = _move_category_directory(
+        source, new_path, source_parts, new_parts, action="移动"
     )
-    try:
-        target_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise OSError(f"无法创建目标分类目录：{exc}") from exc
-    try:
-        source.rename(new_path)
-    except OSError as exc:
-        raise OSError(f"移动分类目录失败：{exc}") from exc
+    return MoveOutcome(new_path, warnings)
 
-    written: list[Path] = []
+
+def rename_category_dir(
+    root: Path | str,
+    path: Path | str,
+    new_name: str,
+) -> MoveOutcome:
+    """重命名 ``root`` 下的用户分类目录（保持在同一父级）。
+
+    目录内 ``OperatorSpec(category=...)`` 字面量会按“旧相对路径前缀 → 新相对
+    路径前缀”重映射；没有声明分类的算子由 loader 按新目录自动推导；非字面量
+    分类不修改，仅写入 ``warnings``。目标同名、非法名称、``custom`` 保留目录等
+    会抛中文异常。
+    """
+
+    source, source_parts = _user_category_source(root, path)
+    name = _validate_component(new_name)
+    if name == source.name:
+        return MoveOutcome(source)
+    target = source.with_name(name)
+    if target.exists():
+        raise FileExistsError(f"目标位置已存在同名分类或文件：{name}")
+    new_parts = source_parts[:-1] + (name,)
+    warnings = _move_category_directory(
+        source, target, source_parts, new_parts, action="重命名"
+    )
+    return MoveOutcome(target, warnings)
+
+
+def delete_category_dir(root: Path | str, path: Path | str) -> int:
+    """递归删除 ``root`` 下的用户分类目录，返回删除的可加载算子数量。
+
+    目录内全部子分类 / 算子 / 缓存都会被删除；``root`` 本身、``custom`` 保留
+    目录、隐藏 / 下划线目录与 root 外路径都会抛中文错误。
+    """
+
+    source, _parts = _user_category_source(root, path)
     try:
-        for relative, data in updates.items():
-            _write_bytes_atomic(new_path / relative, data)
-            written.append(relative)
-    except Exception:
-        # 目录移动成功但某个文件的分类同步失败：退回目录并恢复已改写内容。
-        try:
-            new_path.rename(source)
-        except OSError:
-            pass
-        else:
-            for relative in written:
-                try:
-                    _write_bytes_atomic(source / relative, originals[relative])
-                except OSError:
-                    pass
-        raise
-    return MoveOutcome(new_path, tuple(warnings))
+        count = _count_loadable_py(source)
+    except OSError as exc:
+        raise OSError(f"无法读取分类目录：{exc}") from exc
+    try:
+        shutil.rmtree(source)
+    except OSError as exc:
+        raise OSError(f"删除分类目录失败：{exc}") from exc
+    return count
 
 
 __all__ = [
@@ -698,10 +797,12 @@ __all__ = [
     "category_directory",
     "create_category_dir",
     "create_operator_file",
+    "delete_category_dir",
     "delete_operator_file",
     "move_category_dir",
     "move_operator_file",
     "normalize_category",
+    "rename_category_dir",
     "rename_operator_file",
     "sanitize_component",
     "unique_path",

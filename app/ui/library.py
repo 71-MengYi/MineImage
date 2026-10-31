@@ -1016,7 +1016,7 @@ class OperatorLibrary(QWidget):
             category.setSizeHint(0, QSize(0, 36))
             tooltip = f"{name} · 单击展开 / 折叠 · 右键新建"
             if category_draggable:
-                tooltip += " · 可拖动到其它分类"
+                tooltip += " · 可拖动到其它分类 · 右键可重命名 / 删除"
             category.setToolTip(0, tooltip)
             tree.addTopLevelItem(category)
             total = self._populate_tree(category, root, (), name)
@@ -1059,7 +1059,7 @@ class OperatorLibrary(QWidget):
             group.setSizeHint(0, QSize(0, 28))
             group_tooltip = "分类：" + " / ".join((top_name,) + group_path)
             if group_draggable:
-                group_tooltip += " · 可拖动到其它分类"
+                group_tooltip += " · 可拖动到其它分类 · 右键可重命名 / 删除"
             group.setToolTip(0, group_tooltip)
             parent.addChild(group)
             count = self._populate_tree(group, child, group_path, top_name)
@@ -1228,6 +1228,24 @@ class OperatorLibrary(QWidget):
                 "create_category",
                 category,
             )
+            # 只有磁盘上真实存在于用户扫描根下的分类目录才能重命名 / 删除；
+            # 空白处、虚拟分组、内置分类不显示这两个动作。
+            if category and self._user_category_root(category) is not None:
+                menu.addSeparator()
+                self._add_menu_action(
+                    menu,
+                    "重命名分类…",
+                    lambda: self._prompt_rename_category(category),
+                    "rename_category",
+                    category,
+                )
+                self._add_menu_action(
+                    menu,
+                    "删除分类…",
+                    lambda: self.delete_category(category),
+                    "delete_category",
+                    category,
+                )
             return menu
         entry = self._entry_for_item(item)
         if entry is None:
@@ -1414,6 +1432,140 @@ class OperatorLibrary(QWidget):
             return parent + (name,)
         parts = tuple(part for part in relative.parts if part not in ("", "."))
         return parts or (parent + (name,))
+
+    def _category_edit_root(
+        self,
+        category: str | tuple[str, ...] | list[str] | None,
+        action: str,
+    ) -> tuple[tuple[str, ...], Path] | None:
+        """重命名 / 删除分类前定位其所属用户扫描根；失败时发中文状态提示。"""
+
+        path = _normalize_category(category)
+        if not path:
+            self.status_message.emit(f"{action}失败：分类路径不能为空。")
+            return None
+        root = self._user_category_root(path)
+        if root is None:
+            if self._category_in_builtin(path):
+                self.status_message.emit(f"{action}失败：内置分类不能{action}。")
+            else:
+                self.status_message.emit(
+                    f"{action}失败：该分类没有对应的用户目录，不能{action}。"
+                )
+            return None
+        return path, root
+
+    def rename_category_to(
+        self,
+        category: str | tuple[str, ...] | list[str] | None,
+        new_name: str,
+    ) -> bool:
+        """重命名用户分类目录并同步内部算子的分类；失败只发状态提示，不弹窗。"""
+
+        located = self._category_edit_root(category, "重命名")
+        if located is None:
+            return False
+        path, root = located
+        name = str(new_name or "").strip()
+        if not name:
+            self.status_message.emit("重命名失败：分类名称不能为空。")
+            return False
+        source_dir = root.joinpath(*path)
+        try:
+            from app.core import operator_files
+        except Exception as exc:  # noqa: BLE001 - 并行开发期文件服务可能尚未就绪
+            self.status_message.emit(f"重命名失败：文件服务不可用（{exc}）")
+            return False
+        try:
+            outcome = operator_files.rename_category_dir(root, source_dir, name)
+        except Exception as exc:  # noqa: BLE001 - 中文错误直接展示到状态栏
+            self.status_message.emit(f"重命名失败：{exc}")
+            return False
+        renamed_path = Path(getattr(outcome, "path", source_dir))
+        if self._same_path(renamed_path, source_dir):
+            self._select_category_path(path)
+            self.status_message.emit("分类名称未变化。")
+            return True
+        self.refresh_requested.emit()
+        new_path = self._category_path_from_directory(renamed_path, root)
+        if not new_path:
+            new_path = path[:-1] + (name,)
+        self._select_category_path(new_path)
+        message = (
+            f"已重命名分类“{' / '.join(path)}”为"
+            f"“{self._category_display(new_path)}”。"
+        )
+        self.status_message.emit(self._move_success_message(message, outcome))
+        return True
+
+    def _prompt_rename_category(
+        self, category: str | tuple[str, ...] | list[str] | None
+    ) -> bool:
+        """右键「重命名分类…」：输入新名称后执行重命名；取消返回 False。"""
+
+        located = self._category_edit_root(category, "重命名")
+        if located is None:
+            return False
+        path, _root = located
+        name, accepted = QInputDialog.getText(
+            self,
+            "重命名分类",
+            "分类名称：",
+            QLineEdit.EchoMode.Normal,
+            path[-1],
+        )
+        if not accepted:
+            return False
+        return self.rename_category_to(path, name)
+
+    def delete_category(
+        self,
+        category: str | tuple[str, ...] | list[str] | None,
+        confirm: bool = True,
+    ) -> bool:
+        """删除用户分类目录（含子分类与算子）；``confirm=True`` 时先确认。"""
+
+        located = self._category_edit_root(category, "删除")
+        if located is None:
+            return False
+        path, root = located
+        source_dir = root.joinpath(*path)
+        display = self._category_display(path)
+        if confirm:
+            answer = QMessageBox.question(
+                self,
+                "删除分类",
+                f"确定删除用户分类“{display}”吗？\n"
+                f"{source_dir}\n"
+                "该目录下的全部用户算子（含子分类）将一并删除，且无法恢复。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+        try:
+            from app.core import operator_files
+        except Exception as exc:  # noqa: BLE001 - 并行开发期文件服务可能尚未就绪
+            self.status_message.emit(f"删除失败：文件服务不可用（{exc}）")
+            return False
+        try:
+            removed = operator_files.delete_category_dir(root, source_dir)
+        except Exception as exc:  # noqa: BLE001 - 中文错误直接展示到状态栏
+            self.status_message.emit(f"删除失败：{exc}")
+            return False
+        self.refresh_requested.emit()
+        parent_path = path[:-1]
+        if parent_path:
+            self._select_category_path(parent_path)
+        else:
+            self.tree.clearSelection()
+            self._current_category = None
+            self._refresh_category_styles()
+            self._update_tree_label()
+        count = int(removed) if isinstance(removed, int) else 0
+        detail = f"含 {count} 个用户算子" if count else "空分类"
+        self.status_message.emit(f"已删除分类“{display}”（{detail}）。")
+        return True
 
     def rename_operator_to(self, op_id: str, new_stem: str) -> bool:
         """原地重命名用户算子文件；失败时只发 :attr:`status_message`，不弹窗。"""

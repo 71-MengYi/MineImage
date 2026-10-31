@@ -1355,11 +1355,17 @@ class OperatorLibraryCreateTests(unittest.TestCase):
         self.assertTrue((self.root / CUSTOM_OPERATOR_CATEGORY).is_dir())
         self.assertFalse((self.root / "基础调整").exists())
 
-        # 分类行右键：动作携带该分类完整路径。
+        # 分类行右键：动作携带该分类完整路径；用户分类目录额外有重命名 / 删除。
         category_item = self.library._category_items[CUSTOM_OPERATOR_CATEGORY]
         menu = self.library.build_context_menu(category_item)
         self.assertEqual(
-            self._actions(menu), ["create_operator", "create_category"]
+            self._actions(menu),
+            [
+                "create_operator",
+                "create_category",
+                "rename_category",
+                "delete_category",
+            ],
         )
         payload = next(
             action.data()["payload"]
@@ -1376,7 +1382,13 @@ class OperatorLibraryCreateTests(unittest.TestCase):
 
         menu = self.library.build_context_menu(empty_item)
         self.assertEqual(
-            self._actions(menu), ["create_operator", "create_category"]
+            self._actions(menu),
+            [
+                "create_operator",
+                "create_category",
+                "rename_category",
+                "delete_category",
+            ],
         )
         create_action = next(
             action
@@ -1401,13 +1413,22 @@ class OperatorLibraryCreateTests(unittest.TestCase):
             if parent_item.child(index).text(0) == "子分组"
         )
         menu = self.library.build_context_menu(group_item)
+        self.assertEqual(
+            self._actions(menu),
+            [
+                "create_operator",
+                "create_category",
+                "rename_category",
+                "delete_category",
+            ],
+        )
         payloads = [
             tuple(action.data()["payload"])
             for action in menu.actions()
             if action.data()
         ]
         self.assertEqual(
-            payloads, [("父分类", "子分组"), ("父分类", "子分组")]
+            payloads, [("父分类", "子分组")] * 4
         )
 
     def test_user_and_builtin_leaf_context_menu_actions(self) -> None:
@@ -2227,6 +2248,432 @@ class OperatorLibraryMoveTests(unittest.TestCase):
             self.assertTrue(
                 any("内置分类不能移动" in message for message in self.messages)
             )
+
+
+# ---------------------------------------------------------------------------
+# OperatorLibrary：用户分类右键重命名 / 删除
+# ---------------------------------------------------------------------------
+class OperatorLibraryCategoryEditTests(unittest.TestCase):
+    """覆盖用户分类右键菜单、重命名目录、删除目录与失败分支。"""
+
+    def setUp(self) -> None:
+        self.root = _workspace_tempdir()
+        self.addCleanup(_cleanup_tempdir, self.root)
+        self.scan_roots = [self.root]
+        self.settings = AppSettings(self.root / "settings.ini")
+        self.registry = OperatorRegistry.build(self.scan_roots, include_builtin=False)
+        self.library = OperatorLibrary(
+            settings=self.settings, user_operator_dir=self.root
+        )
+        self.library.resize(360, 720)
+        self.library.show()
+        self.library.set_registry(self.registry)
+        self.messages: list[str] = []
+        self.library.status_message.connect(self.messages.append)
+        self.refreshes = QSignalSpy(self.library.refresh_requested)
+        self.library.refresh_requested.connect(self._reload)
+        QApplication.processEvents()
+
+    def tearDown(self) -> None:
+        self.library.deleteLater()
+
+    def _reload(self) -> None:
+        self.registry = OperatorRegistry.build(
+            self.scan_roots, include_builtin=False
+        )
+        self.library.set_registry(self.registry)
+        QApplication.processEvents()
+
+    def _seed(
+        self,
+        relative: str,
+        *,
+        op_id: str,
+        name: str | None = None,
+        category=("基础调整",),
+        dynamic: bool = False,
+    ) -> Path:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if dynamic:
+            content = _DYNAMIC_CATEGORY_TEMPLATE.format(
+                op_id=op_id, name=name or op_id, category=category
+            )
+        else:
+            content = _OPERATOR_TEMPLATE.format(
+                op_id=op_id,
+                name=name or op_id,
+                category=category,
+                description="分类编辑测试算子",
+                keyword="分类编辑",
+            )
+        path.write_text(content, encoding="utf-8")
+        self._reload()
+        return path
+
+    def _category_item(self, path):
+        item = self.library._category_items[path[0]]  # noqa: SLF001 - 测试内部定位
+        for part in path[1:]:
+            found = None
+            for index in range(item.childCount()):
+                child = item.child(index)
+                if child.text(0) == part:
+                    found = child
+                    break
+            self.assertIsNotNone(found, f"分类 {path} 缺少子项 {part}")
+            item = found
+        return item
+
+    def _last_message(self) -> str:
+        return self.messages[-1] if self.messages else ""
+
+    @staticmethod
+    def _actions(menu) -> list[str]:
+        return [
+            str(action.data()["action"])
+            for action in menu.actions()
+            if action.data() and action.data().get("action")
+        ]
+
+    # ------------------------------------------------------------ 右键菜单
+    def test_user_category_menu_has_edit_actions(self) -> None:
+        self._seed("A/B/op.py", op_id="test.cat", category=("A", "B"))
+        self._seed("virtual.py", op_id="test.virtual", category=("虚拟", "分组"))
+
+        expected = [
+            "create_operator",
+            "create_category",
+            "rename_category",
+            "delete_category",
+        ]
+        top_menu = self.library.build_context_menu(self._category_item(("A",)))
+        self.assertEqual(self._actions(top_menu), expected)
+        top_actions = [
+            action
+            for action in top_menu.actions()
+            if action.data() and action.data().get("action")
+        ]
+        self.assertEqual(
+            [action.text() for action in top_actions[2:]],
+            ["重命名分类…", "删除分类…"],
+        )
+        self.assertEqual(
+            [tuple(action.data()["payload"]) for action in top_actions],
+            [("A",)] * 4,
+        )
+        self.assertIn(
+            "右键可重命名 / 删除", self._category_item(("A",)).toolTip(0)
+        )
+
+        group_menu = self.library.build_context_menu(
+            self._category_item(("A", "B"))
+        )
+        self.assertEqual(self._actions(group_menu), expected)
+        self.assertEqual(
+            [
+                tuple(action.data()["payload"])
+                for action in group_menu.actions()
+                if action.data()
+            ],
+            [("A", "B")] * 4,
+        )
+
+        # 空白处、虚拟分组、内置分类不提供重命名 / 删除。
+        self.assertEqual(
+            self._actions(self.library.build_context_menu(None)),
+            ["create_operator", "create_category"],
+        )
+        virtual_menu = self.library.build_context_menu(
+            self._category_item(("虚拟", "分组"))
+        )
+        self.assertEqual(
+            self._actions(virtual_menu), ["create_operator", "create_category"]
+        )
+        self.assertNotIn(
+            "右键可重命名 / 删除", self._category_item(("虚拟",)).toolTip(0)
+        )
+
+        # 用户算子叶子菜单保持原样。
+        leaf_menu = self.library.build_context_menu(
+            self.library._entry_items["test.cat"]  # noqa: SLF001
+        )
+        self.assertEqual(
+            self._actions(leaf_menu),
+            ["rename_operator", "open_editor", "delete_operator"],
+        )
+
+    def test_empty_user_category_menu_has_edit_actions(self) -> None:
+        self.assertIsNotNone(self.library.create_category_named(None, "空分类"))
+        item = self.library._category_items["空分类"]  # noqa: SLF001
+        self.assertEqual(
+            self._actions(self.library.build_context_menu(item)),
+            [
+                "create_operator",
+                "create_category",
+                "rename_category",
+                "delete_category",
+            ],
+        )
+        self.assertIn("右键可重命名 / 删除", item.toolTip(0))
+
+    # ------------------------------------------------------------ 重命名
+    def test_rename_category_renames_directory_and_selects(self) -> None:
+        self._seed("A/B/op.py", op_id="test.child", category=("A", "B"))
+        before = self.refreshes.count()
+        self.assertTrue(
+            self.library.rename_category_to(("A", "B"), "新分组")
+        )
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertFalse((self.root / "A" / "B").exists())
+        self.assertTrue((self.root / "A" / "新分组" / "op.py").is_file())
+        entry = self.registry.entry("test.child")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("A", "新分组"))
+        group = self._category_item(("A", "新分组"))
+        self.assertEqual(self.library.tree.currentItem(), group)
+        self.assertEqual(self.library.current_category(), "A")
+        message = self._last_message()
+        self.assertIn("已重命名分类", message)
+        self.assertIn("A / B", message)
+        self.assertIn("A / 新分组", message)
+
+    def test_rename_category_reports_dynamic_category_warnings(self) -> None:
+        self._seed("A/B/static.py", op_id="test.static", category=("A", "B"))
+        self._seed(
+            "A/B/dynamic.py",
+            op_id="test.dynamic",
+            category=("A", "B"),
+            dynamic=True,
+        )
+        before = self.refreshes.count()
+        self.assertTrue(self.library.rename_category_to(("A", "B"), "新名"))
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertTrue((self.root / "A" / "新名" / "static.py").is_file())
+        self.assertTrue((self.root / "A" / "新名" / "dynamic.py").is_file())
+        entry = self.registry.entry("test.static")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("A", "新名"))
+        message = self._last_message()
+        self.assertIn("已重命名分类", message)
+        self.assertIn("提示：", message)
+        self.assertIn("未自动同步", message)
+
+    def test_rename_category_same_name_is_noop(self) -> None:
+        path = self._seed("A/B/op.py", op_id="test.same", category=("A", "B"))
+        before = self.refreshes.count()
+        self.assertTrue(self.library.rename_category_to(("A", "B"), "B"))
+        self.assertEqual(self.refreshes.count(), before)
+        self.assertTrue(path.is_file())
+        self.assertIn("分类名称未变化。", self._last_message())
+
+    def test_rename_category_failures(self) -> None:
+        self._seed("A/B/op.py", op_id="test.b", category=("A", "B"))
+        self._seed("A/C/other.py", op_id="test.c", category=("A", "C"))
+        self._seed("virtual.py", op_id="test.virtual", category=("虚拟", "分组"))
+        before = self.refreshes.count()
+
+        self.assertFalse(self.library.rename_category_to(("A", "B"), "a/b"))
+        self.assertIn("重命名失败：", self._last_message())
+        self.assertTrue((self.root / "A" / "B" / "op.py").is_file())
+
+        self.assertFalse(self.library.rename_category_to(("A", "B"), "C"))
+        self.assertIn("重命名失败：", self._last_message())
+        self.assertTrue((self.root / "A" / "B" / "op.py").is_file())
+        self.assertTrue((self.root / "A" / "C" / "other.py").is_file())
+
+        self.assertFalse(
+            self.library.rename_category_to(("虚拟", "分组"), "新名")
+        )
+        self.assertIn("没有对应的用户目录", self._last_message())
+
+        self.assertFalse(self.library.rename_category_to(("A", "B"), "   "))
+        self.assertIn("分类名称不能为空", self._last_message())
+
+        self.assertFalse(self.library.rename_category_to(("不存在",), "新名"))
+        self.assertIn("重命名失败：", self._last_message())
+        self.assertEqual(self.refreshes.count(), before)
+
+    def test_prompt_rename_category(self) -> None:
+        self._seed("A/B/op.py", op_id="test.b", category=("A", "B"))
+        self._seed("A/C/other.py", op_id="test.c", category=("A", "C"))
+
+        with patch(
+            "app.ui.library.QInputDialog.getText",
+            return_value=("改名分组", True),
+        ) as get_text:
+            self.assertTrue(self.library._prompt_rename_category(("A", "B")))
+        self.assertEqual(get_text.call_args.args[1], "重命名分类")
+        self.assertEqual(get_text.call_args.args[4], "B")
+        self.assertTrue((self.root / "A" / "改名分组" / "op.py").is_file())
+
+        before = self.refreshes.count()
+        messages_before = len(self.messages)
+        with patch(
+            "app.ui.library.QInputDialog.getText",
+            return_value=("", False),
+        ):
+            self.assertFalse(self.library._prompt_rename_category(("A", "C")))
+        self.assertEqual(self.refreshes.count(), before)
+        self.assertEqual(len(self.messages), messages_before)
+        self.assertTrue((self.root / "A" / "C" / "other.py").is_file())
+
+        # 没有用户目录的分类不会弹出输入框。
+        with patch(
+            "app.ui.library.QInputDialog.getText",
+            side_effect=AssertionError("不应弹出输入框"),
+        ):
+            self.assertFalse(
+                self.library._prompt_rename_category(("虚拟",))
+            )
+        self.assertIn("重命名失败：", self._last_message())
+
+    # ------------------------------------------------------------ 删除
+    def test_delete_category_deletes_subtree_and_selects_parent(self) -> None:
+        self._seed("A/B/op.py", op_id="test.b1", category=("A", "B"))
+        self._seed("A/B/子/op2.py", op_id="test.b2", category=("A", "B", "子"))
+        before = self.refreshes.count()
+        self.assertTrue(
+            self.library.delete_category(("A", "B"), confirm=False)
+        )
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertFalse((self.root / "A" / "B").exists())
+        self.assertIsNone(self.registry.entry("test.b1"))
+        self.assertIsNone(self.registry.entry("test.b2"))
+        self.assertEqual(
+            self.library.tree.currentItem(),
+            self.library._category_items["A"],  # noqa: SLF001
+        )
+        self.assertEqual(self.library.current_category(), "A")
+        self.assertIn("已删除分类“A / B”", self._last_message())
+        self.assertIn("含 2 个用户算子", self._last_message())
+
+        # 父分类已空：删除后清空选择，提示「空分类」。
+        before = self.refreshes.count()
+        self.assertTrue(self.library.delete_category(("A",), confirm=False))
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertFalse((self.root / "A").exists())
+        self.assertIsNone(self.library.tree.currentItem())
+        self.assertIsNone(self.library.current_category())
+        self.assertIn("空分类", self._last_message())
+
+    def test_delete_category_confirmation(self) -> None:
+        self._seed("A/B/op.py", op_id="test.b", category=("A", "B"))
+        source_dir = self.root / "A" / "B"
+        before = self.refreshes.count()
+
+        with patch(
+            "app.ui.library.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ) as question:
+            self.assertFalse(self.library.delete_category(("A", "B")))
+        self.assertEqual(self.refreshes.count(), before)
+        self.assertTrue(source_dir.is_dir())
+        self.assertIn(str(source_dir), question.call_args.args[2])
+        self.assertIn("无法恢复", question.call_args.args[2])
+        self.assertEqual(
+            question.call_args.args[4], QMessageBox.StandardButton.No
+        )
+
+        with patch(
+            "app.ui.library.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.assertTrue(self.library.delete_category(("A", "B")))
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertFalse(source_dir.exists())
+        self.assertIn("已删除分类", self._last_message())
+
+    def test_delete_category_failures(self) -> None:
+        self._seed("A/B/op.py", op_id="test.b", category=("A", "B"))
+        self._seed("virtual.py", op_id="test.virtual", category=("虚拟", "分组"))
+        before = self.refreshes.count()
+
+        self.assertFalse(self.library.delete_category(("虚拟", "分组"), confirm=False))
+        self.assertIn("删除失败：", self._last_message())
+        self.assertFalse(
+            self.library.delete_category(("不存在",), confirm=False)
+        )
+        self.assertIn("删除失败：", self._last_message())
+        self.assertTrue((self.root / "A" / "B" / "op.py").is_file())
+        self.assertEqual(self.refreshes.count(), before)
+
+    # ------------------------------------------------------------ 内置 / 多根
+    def test_builtin_category_has_no_edit_actions(self) -> None:
+        builtin_dir = _workspace_tempdir()
+        self.addCleanup(_cleanup_tempdir, builtin_dir)
+        (builtin_dir / "内置分类").mkdir()
+        (builtin_dir / "内置分类" / "builtin_op.py").write_text(
+            _OPERATOR_TEMPLATE.format(
+                op_id="builtin.demo",
+                name="内置示例",
+                category=("内置分类",),
+                description="内置测试算子",
+                keyword="内置",
+            ),
+            encoding="utf-8",
+        )
+        with patch("app.operators.loader.BUILTIN_DIR", builtin_dir):
+            self.registry = OperatorRegistry.build(
+                [self.root], include_builtin=True
+            )
+            self.library.set_registry(self.registry)
+            QApplication.processEvents()
+            item = self._category_item(("内置分类",))
+            menu = self.library.build_context_menu(item)
+            self.assertEqual(
+                self._actions(menu),
+                ["create_operator", "create_category"],
+            )
+            self.assertNotIn("右键可重命名 / 删除", item.toolTip(0))
+
+            before = self.refreshes.count()
+            self.assertFalse(
+                self.library.rename_category_to(("内置分类",), "新名")
+            )
+            self.assertFalse(
+                self.library.delete_category(("内置分类",), confirm=False)
+            )
+            self.assertEqual(self.refreshes.count(), before)
+            self.assertTrue(
+                any("内置分类不能重命名" in message for message in self.messages)
+            )
+            self.assertTrue(
+                any("内置分类不能删除" in message for message in self.messages)
+            )
+            self.assertTrue(
+                (builtin_dir / "内置分类" / "builtin_op.py").is_file()
+            )
+
+    def test_category_edit_uses_owning_user_root(self) -> None:
+        root_a = self.root / "root_a"
+        root_b = self.root / "root_b"
+        root_a.mkdir()
+        (root_b / "A").mkdir(parents=True)
+        (root_b / "A" / "op.py").write_text(
+            _OPERATOR_TEMPLATE.format(
+                op_id="test.multi",
+                name="多根算子",
+                category=("A",),
+                description="多扫描根测试",
+                keyword="多根",
+            ),
+            encoding="utf-8",
+        )
+        self.scan_roots = [root_a, root_b]
+        self._reload()
+        before = self.refreshes.count()
+        self.assertTrue(self.library.rename_category_to(("A",), "B"))
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertTrue((root_b / "B" / "op.py").is_file())
+        self.assertFalse((root_a / "B").exists())
+
+        before = self.refreshes.count()
+        self.assertTrue(self.library.delete_category(("B",), confirm=False))
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertFalse((root_b / "B").exists())
+        self.assertFalse((root_a / "B").exists())
 
 
 # ---------------------------------------------------------------------------

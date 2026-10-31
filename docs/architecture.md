@@ -568,6 +568,11 @@ move_operator_to_category(op_id, category) -> bool
 move_category_to_category(category, target_parent=None) -> bool
 # 只拖到画布的兼容入口：mime_data_for(op_id) / begin_operator_drag(source, op_id)
 
+# 分类右键重命名 / 删除（真实文件操作，不进入撤销栈）
+rename_category_to(category, new_name) -> bool
+delete_category(category, confirm=True) -> bool
+# 私有：_prompt_rename_category(category) -> bool（QInputDialog 输入新名，取消返回 False）
+
 # 拖拽数据 MIME（app/core/constants.py）：
 #   MIME_OPERATOR      payload {"id": op_id}                                  拖到画布建节点
 #   MIME_LIBRARY_MOVE  payload {"kind": "operator", "id": op_id} 或
@@ -600,6 +605,17 @@ AST 改写与源分类完全相等的 `OperatorSpec(category=...)` 字面量（�
 只提示「已在目标分类中」且不刷新，`MoveOutcome.warnings` 合并进成功提示。
 **不提供同级排序，也不进入撤销栈**（文件系统操作不是 `QUndoCommand`）；拖错只能
 再拖回去。
+
+分类右键重命名 / 删除复用同一套文件能力：`rename_category_to()` 调用
+`app/core/operator_files.rename_category_dir()` —— 同父级目录改名，并把目录内以旧
+相对路径为前缀的 `OperatorSpec(category=...)` 字面量重映射到新前缀（无字面量的
+文件由 loader 按新目录推导，非字面量 `category` 只写进 `MoveOutcome.warnings`）；
+`delete_category()` 二次确认后调用 `delete_category_dir()` 递归删除该用户分类目录，
+返回删除前可加载的 `.py` 数量（跳过 `__pycache__` 与 `_` 开头文件），供状态栏显示
+「含 N 个用户算子」或「空分类」。两者都经 `_user_category_root()` 定位分类所属的
+用户扫描根，只在该根内操作；内置分类、仅由 `spec.category` 形成的虚拟分组与没有
+用户目录的分类行不提供菜单动作。成功后发 `refresh_requested` 并恢复选中（重命名
+选新路径、删除选父分类），**不进入撤销栈**、不提供同级排序。
 
 ### ReplaceOperatorDialog（`app/ui/replace_operator.py`）
 

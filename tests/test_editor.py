@@ -37,10 +37,12 @@ from app.core.operator_files import (  # noqa: E402
     category_directory,
     create_category_dir,
     create_operator_file,
+    delete_category_dir,
     delete_operator_file,
     move_category_dir,
     move_operator_file,
     normalize_category,
+    rename_category_dir,
     rename_operator_file,
     sanitize_component,
     update_generated_operator_name,
@@ -722,6 +724,169 @@ class MoveCategoryDirTests(_TempDirTestCase):
         self.assertEqual(len(outcome.warnings), 1)
         self.assertIn("dynamic.py", outcome.warnings[0])
         self.assertIn("CATEGORY", moved.read_text(encoding="utf-8"))
+
+
+class RenameCategoryDirTests(_TempDirTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = self.tmp / "operators"
+
+    def _registry(self) -> OperatorRegistry:
+        return OperatorRegistry.build([str(self.root)], include_builtin=False)
+
+    def test_rename_moves_directory_and_remaps_categories(self) -> None:
+        top = create_operator_file(self.root, ("旧分类",))
+        nested = create_operator_file(self.root, ("旧分类", "子分类"))
+        outcome = rename_category_dir(self.root, self.root / "旧分类", "新分类")
+        expected = self.root.resolve() / "新分类"
+        self.assertEqual(outcome.path, expected)
+        self.assertFalse((self.root / "旧分类").exists())
+        self.assertTrue((expected / top.path.name).is_file())
+        self.assertTrue((expected / "子分类" / nested.path.name).is_file())
+        self.assertEqual(outcome.warnings, ())
+
+        registry = self._registry()
+        top_entry = registry.entry(top.operator_id)
+        nested_entry = registry.entry(nested.operator_id)
+        self.assertIsNotNone(top_entry)
+        self.assertIsNotNone(nested_entry)
+        assert top_entry is not None and nested_entry is not None
+        self.assertEqual(top_entry.spec.category, ("新分类",))
+        self.assertEqual(nested_entry.spec.category, ("新分类", "子分类"))
+
+    def test_rename_nested_category_only_changes_that_level(self) -> None:
+        created = create_operator_file(self.root, ("父分类", "旧子分类"))
+        outcome = rename_category_dir(
+            self.root, self.root / "父分类" / "旧子分类", "新子分类"
+        )
+        self.assertEqual(outcome.path, self.root.resolve() / "父分类" / "新子分类")
+        entry = self._registry().entry(created.operator_id)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("父分类", "新子分类"))
+
+    def test_rename_empty_category_and_same_name_noop(self) -> None:
+        folder = create_category_dir(self.root, None, "空分类")
+        outcome = rename_category_dir(self.root, folder, "改名的空分类")
+        self.assertTrue(outcome.path.is_dir())
+        self.assertEqual(outcome.path.name, "改名的空分类")
+        noop = rename_category_dir(self.root, outcome.path, "改名的空分类")
+        self.assertEqual(noop.path, outcome.path.resolve())
+
+    def test_rename_invalid_names_raise_and_keep_directory(self) -> None:
+        folder = create_category_dir(self.root, None, "分类")
+        for name in (
+            "",
+            "  ",
+            "a/b",
+            "a\\b",
+            "bad:name",
+            ".hidden",
+            "_private",
+            "CON",
+            " leading",
+            "trailing ",
+        ):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                rename_category_dir(self.root, folder, name)
+        self.assertTrue(folder.is_dir())
+
+    def test_rename_to_existing_name_raises(self) -> None:
+        source = create_category_dir(self.root, None, "源分类")
+        create_category_dir(self.root, None, "目标分类")
+        with self.assertRaises(FileExistsError):
+            rename_category_dir(self.root, source, "目标分类")
+        self.assertTrue(source.is_dir())
+
+    def test_rename_forbidden_sources_raise(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        custom = self.root / "custom"
+        hidden = self.root / "_hidden"
+        custom.mkdir()
+        hidden.mkdir()
+        for label, folder in (("root", self.root), ("custom", custom), ("hidden", hidden)):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                rename_category_dir(self.root, folder, "新名字")
+        with self.assertRaises(FileNotFoundError):
+            rename_category_dir(self.root, self.root / "missing", "新名字")
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        with self.assertRaises(ValueError):
+            rename_category_dir(self.root, outside, "新名字")
+        self.assertTrue(outside.is_dir())
+
+    def test_rename_dynamic_category_keeps_file_and_warns(self) -> None:
+        manual = self.make_file(
+            "operators/旧分类/dynamic.py",
+            textwrap.dedent(
+                """\
+                from app.operators.spec import Operator, OperatorSpec
+
+                CATEGORY = ("旧分类",)
+
+
+                class Manual(Operator):
+                    spec = OperatorSpec(id="manual.dynamic", name="动态", category=CATEGORY)
+
+                    def process(self, image=None, **_):
+                        return image.array if image is not None else None
+
+
+                OPERATOR = Manual
+                """
+            ),
+        )
+        outcome = rename_category_dir(self.root, self.root / "旧分类", "新分类")
+        moved = outcome.path / manual.name
+        self.assertTrue(moved.is_file())
+        self.assertEqual(len(outcome.warnings), 1)
+        self.assertIn("dynamic.py", outcome.warnings[0])
+        self.assertIn("CATEGORY", moved.read_text(encoding="utf-8"))
+
+
+class DeleteCategoryDirTests(_TempDirTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = self.tmp / "operators"
+
+    def test_delete_removes_tree_and_counts_loadable_operators(self) -> None:
+        create_operator_file(self.root, ("旧分类",))
+        create_operator_file(self.root, ("旧分类", "子分类"))
+        ignored = self.root / "旧分类" / "_ignored.py"
+        ignored.write_text("VALUE = 1\n", encoding="utf-8")
+        cache = self.root / "旧分类" / "__pycache__"
+        cache.mkdir()
+        (cache / "cached.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+        count = delete_category_dir(self.root, self.root / "旧分类")
+        self.assertEqual(count, 2)
+        self.assertFalse((self.root / "旧分类").exists())
+        registry = OperatorRegistry.build([str(self.root)], include_builtin=False)
+        self.assertEqual(registry.entries, {})
+
+    def test_delete_empty_category_returns_zero(self) -> None:
+        folder = create_category_dir(self.root, None, "空分类")
+        self.assertEqual(delete_category_dir(self.root, folder), 0)
+        self.assertFalse(folder.exists())
+
+    def test_delete_forbidden_sources_raise(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        custom = self.root / "custom"
+        hidden = self.root / "_hidden"
+        custom.mkdir()
+        hidden.mkdir()
+        for label, folder in (("root", self.root), ("custom", custom), ("hidden", hidden)):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                delete_category_dir(self.root, folder)
+        with self.assertRaises(FileNotFoundError):
+            delete_category_dir(self.root, self.root / "missing")
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        keep = outside / "keep.py"
+        keep.write_text("VALUE = 1\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            delete_category_dir(self.root, outside)
+        self.assertTrue(keep.is_file())
 
 
 class UpdateGeneratedNameTests(_TempDirTestCase):
