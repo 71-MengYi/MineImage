@@ -21,6 +21,7 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, Qt, QTimer
 from PySide6.QtGui import QKeyEvent, QMouseEvent, QPalette, QWheelEvent
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QDialog,
     QLineEdit,
@@ -30,7 +31,11 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import AppSettings
-from app.core.constants import CUSTOM_OPERATOR_CATEGORY, MIME_OPERATOR
+from app.core.constants import (
+    CUSTOM_OPERATOR_CATEGORY,
+    MIME_LIBRARY_MOVE,
+    MIME_OPERATOR,
+)
 from app.core.editor import EditorInfo
 from app.core.model import NodeModel
 from app.core.types import ImageData
@@ -1603,6 +1608,625 @@ class OperatorLibraryCreateTests(unittest.TestCase):
         self.assertTrue(any("新建分类失败" in message for message in self.messages))
         self.assertIsNone(self.library.create_category_named(None, "我的分类"))
         self.assertTrue(any("已存在" in message for message in self.messages))
+
+
+# ---------------------------------------------------------------------------
+# OperatorLibrary：库内拖动整理用户算子 / 用户分类
+# ---------------------------------------------------------------------------
+_DYNAMIC_CATEGORY_TEMPLATE = '''\
+from app.operators.spec import Operator, OperatorSpec
+
+CATEGORY = {category!r}
+
+
+class _TestOperator(Operator):
+    spec = OperatorSpec(
+        id="{op_id}",
+        name="{name}",
+        category=CATEGORY,
+        description="动态分类测试算子",
+    )
+
+    def process(self, image, **kwargs):
+        return image
+
+
+OPERATOR = _TestOperator
+'''
+
+_NO_CATEGORY_TEMPLATE = '''\
+from app.operators.spec import Operator, OperatorSpec
+
+
+class _TestOperator(Operator):
+    spec = OperatorSpec(
+        id="{op_id}",
+        name="{name}",
+        description="无分类声明的旧版测试算子",
+    )
+
+    def process(self, image, **kwargs):
+        return image
+
+
+OPERATOR = _TestOperator
+'''
+
+
+class OperatorLibraryMoveTests(unittest.TestCase):
+    """覆盖算子库内拖动整理的 payload / 移动 / no-op / 失败分支。"""
+
+    def setUp(self) -> None:
+        self.root = _workspace_tempdir()
+        self.addCleanup(_cleanup_tempdir, self.root)
+        self.scan_roots = [self.root]
+        self.settings = AppSettings(self.root / "settings.ini")
+        self.registry = OperatorRegistry.build(self.scan_roots, include_builtin=False)
+        self.library = OperatorLibrary(
+            settings=self.settings, user_operator_dir=self.root
+        )
+        self.library.resize(360, 720)
+        self.library.show()
+        self.library.set_registry(self.registry)
+        self.messages: list[str] = []
+        self.library.status_message.connect(self.messages.append)
+        self.refreshes = QSignalSpy(self.library.refresh_requested)
+        self.library.refresh_requested.connect(self._reload)
+        QApplication.processEvents()
+
+    def tearDown(self) -> None:
+        self.library.deleteLater()
+
+    def _reload(self) -> None:
+        self.registry = OperatorRegistry.build(
+            self.scan_roots, include_builtin=False
+        )
+        self.library.set_registry(self.registry)
+        QApplication.processEvents()
+
+    def _seed(
+        self,
+        relative: str,
+        *,
+        op_id: str,
+        name: str | None = None,
+        category=("基础调整",),
+        dynamic: bool = False,
+    ) -> Path:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if dynamic:
+            content = _DYNAMIC_CATEGORY_TEMPLATE.format(
+                op_id=op_id, name=name or op_id, category=category
+            )
+        else:
+            content = _OPERATOR_TEMPLATE.format(
+                op_id=op_id,
+                name=name or op_id,
+                category=category,
+                description="移动整理测试算子",
+                keyword="移动",
+            )
+        path.write_text(content, encoding="utf-8")
+        self._reload()
+        return path
+
+    def _category_item(self, path):
+        item = self.library._category_items[path[0]]  # noqa: SLF001 - 测试内部定位
+        for part in path[1:]:
+            found = None
+            for index in range(item.childCount()):
+                child = item.child(index)
+                if child.text(0) == part:
+                    found = child
+                    break
+            self.assertIsNotNone(found, f"分类 {path} 缺少子项 {part}")
+            item = found
+        return item
+
+    def _last_message(self) -> str:
+        return self.messages[-1] if self.messages else ""
+
+    # ------------------------------------------------------------ payload / MIME
+    def test_user_operator_mime_has_both_formats(self) -> None:
+        self._seed("A/op.py", op_id="test.move", name="移动算子", category=("A",))
+        item = self.library._entry_items["test.move"]  # noqa: SLF001
+        self.assertEqual(
+            self.library.library_drag_payload(item),
+            {"kind": "operator", "id": "test.move"},
+        )
+        mime = self.library.mime_data_for_item(item)
+        self.assertTrue(mime.hasFormat(MIME_OPERATOR))
+        self.assertTrue(mime.hasFormat(MIME_LIBRARY_MOVE))
+        self.assertEqual(
+            json.loads(bytes(mime.data(MIME_OPERATOR)).decode("utf-8")),
+            {"id": "test.move"},
+        )
+        self.assertEqual(
+            json.loads(bytes(mime.data(MIME_LIBRARY_MOVE)).decode("utf-8")),
+            {"kind": "operator", "id": "test.move"},
+        )
+        # 兼容旧接口：mime_data_for 仍只返回 MIME_OPERATOR。
+        legacy = self.library.mime_data_for("test.move")
+        self.assertTrue(legacy.hasFormat(MIME_OPERATOR))
+        self.assertFalse(legacy.hasFormat(MIME_LIBRARY_MOVE))
+
+    def test_category_payload_and_virtual_group_not_draggable(self) -> None:
+        self._seed("A/B/op.py", op_id="test.cat", category=("A", "B"))
+        self._seed("C/other.py", op_id="test.c", category=("C",))
+        self._seed("virtual.py", op_id="test.virtual", category=("虚拟", "分组"))
+
+        group = self._category_item(("A", "B"))
+        self.assertEqual(
+            self.library.library_drag_payload(group),
+            {"kind": "category", "path": ["A", "B"]},
+        )
+        self.assertTrue(group.flags() & Qt.ItemFlag.ItemIsDragEnabled)
+        mime = self.library.mime_data_for_item(group)
+        self.assertTrue(mime.hasFormat(MIME_LIBRARY_MOVE))
+        self.assertFalse(mime.hasFormat(MIME_OPERATOR))
+        self.assertEqual(
+            json.loads(bytes(mime.data(MIME_LIBRARY_MOVE)).decode("utf-8")),
+            {"kind": "category", "path": ["A", "B"]},
+        )
+        self.assertEqual(
+            self.library.library_drag_payload(self._category_item(("A",))),
+            {"kind": "category", "path": ["A"]},
+        )
+
+        # 仅由 spec.category 形成的虚拟分组没有对应目录，不可拖动。
+        virtual_top = self._category_item(("虚拟",))
+        virtual_group = self._category_item(("虚拟", "分组"))
+        self.assertIsNone(self.library.library_drag_payload(virtual_top))
+        self.assertIsNone(self.library.library_drag_payload(virtual_group))
+        self.assertFalse(virtual_top.flags() & Qt.ItemFlag.ItemIsDragEnabled)
+        self.assertFalse(virtual_group.flags() & Qt.ItemFlag.ItemIsDragEnabled)
+
+        tree = self.library.current_tree()
+        self.assertIsNotNone(tree)
+        assert tree is not None
+        self.assertEqual(
+            tree.dragDropMode(), QAbstractItemView.DragDropMode.DragDrop
+        )
+        self.assertTrue(tree.acceptDrops())
+
+    def test_start_drag_uses_library_payloads(self) -> None:
+        self._seed("A/B/op.py", op_id="test.cat", category=("A", "B"))
+        self._seed("virtual.py", op_id="test.virtual", category=("虚拟", "分组"))
+        tree = self.library.current_tree()
+        self.assertIsNotNone(tree)
+        assert tree is not None
+        captured: dict[str, object] = {}
+
+        class _FakeDrag:
+            def __init__(self, source):
+                captured["source"] = source
+
+            def setMimeData(self, mime_data):
+                captured["mime"] = mime_data
+
+            def setPixmap(self, pixmap):
+                captured["pixmap"] = pixmap
+
+            def setHotSpot(self, point):
+                captured["hotspot"] = point
+
+            def exec(self, action):
+                captured["action"] = action
+                return Qt.DropAction.CopyAction
+
+        leaf = self.library._entry_items["test.cat"]  # noqa: SLF001
+        tree.setCurrentItem(leaf)
+        with patch("app.ui.library.QDrag", _FakeDrag):
+            tree.startDrag(Qt.DropAction.CopyAction)
+        mime = captured["mime"]
+        self.assertTrue(mime.hasFormat(MIME_OPERATOR))
+        self.assertTrue(mime.hasFormat(MIME_LIBRARY_MOVE))
+
+        captured.clear()
+        category = self._category_item(("A", "B"))
+        tree.setCurrentItem(category)
+        with patch("app.ui.library.QDrag", _FakeDrag):
+            tree.startDrag(Qt.DropAction.CopyAction)
+        mime = captured["mime"]
+        self.assertTrue(mime.hasFormat(MIME_LIBRARY_MOVE))
+        self.assertFalse(mime.hasFormat(MIME_OPERATOR))
+
+        # 虚拟分组没有库内 payload，也不会发起拖动。
+        captured.clear()
+        tree.setCurrentItem(self._category_item(("虚拟",)))
+        with patch("app.ui.library.QDrag", _FakeDrag):
+            tree.startDrag(Qt.DropAction.CopyAction)
+        self.assertNotIn("mime", captured)
+
+    def test_can_accept_library_drop(self) -> None:
+        self._seed("A/B/op.py", op_id="test.ab", category=("A", "B"))
+        self._seed("C/op.py", op_id="test.c", category=("C",))
+        op_payload = self.library.library_drag_payload(
+            self.library._entry_items["test.ab"]  # noqa: SLF001
+        )
+        self.assertIsNotNone(op_payload)
+        self.assertTrue(
+            self.library.can_accept_library_drop(
+                op_payload, self._category_item(("C",))
+            )
+        )
+        self.assertTrue(self.library.can_accept_library_drop(op_payload, None))
+        self.assertFalse(self.library.can_accept_library_drop(None, None))
+
+        payload = {"kind": "category", "path": ["A", "B"]}
+        self.assertTrue(
+            self.library.can_accept_library_drop(payload, self._category_item(("C",)))
+        )
+        self.assertTrue(self.library.can_accept_library_drop(payload, None))
+        # 分类不能拖进自身或后代。
+        self.assertFalse(
+            self.library.can_accept_library_drop(
+                payload, self._category_item(("A", "B"))
+            )
+        )
+        self.assertFalse(
+            self.library.can_accept_library_drop(
+                payload, self.library._entry_items["test.ab"]  # noqa: SLF001
+            )
+        )
+        # 拖到算子行时目标分类 = 该算子所在分类。
+        self.assertEqual(
+            self.library.drop_target_category(
+                self.library._entry_items["test.ab"]  # noqa: SLF001
+            ),
+            ("A", "B"),
+        )
+        self.assertFalse(
+            self.library.can_accept_library_drop(
+                {"kind": "category", "path": ["虚拟"]}, None
+            )
+        )
+
+    # ------------------------------------------------------------ 移动成功
+    def test_move_operator_moves_file_and_selects_new_category(self) -> None:
+        old = self._seed(
+            "旧分类/op.py",
+            op_id="test.move",
+            name="移动算子",
+            category=("旧分类",),
+        )
+        before = self.refreshes.count()
+        self.assertTrue(
+            self.library.move_operator_to_category(
+                "test.move", ("基础调整", "颜色")
+            )
+        )
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertFalse(old.exists())
+        self.assertTrue((self.root / "基础调整" / "颜色" / "op.py").is_file())
+
+        entry = self.registry.entry("test.move")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("基础调整", "颜色"))
+        item = self.library._entry_items["test.move"]  # noqa: SLF001
+        self.assertEqual(item.parent().text(0), "颜色")
+        self.assertEqual(item.parent().parent().text(0), "基础调整")
+        self.assertTrue(item.isSelected())
+        self.assertEqual(self.library.current_category(), "基础调整")
+        self.assertIn("已移动用户算子", self._last_message())
+        self.assertIn("基础调整 / 颜色", self._last_message())
+
+    def test_move_operator_to_blank_moves_to_root(self) -> None:
+        old = self._seed("旧分类/op.py", op_id="test.root", category=("旧分类",))
+        before = self.refreshes.count()
+        self.assertTrue(self.library.move_operator_to_category("test.root", ()))
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertFalse(old.exists())
+        self.assertTrue((self.root / "op.py").is_file())
+        self.assertIn("根目录", self._last_message())
+        # 根目录下的算子由 loader 归入「其他」。
+        self.assertIn("其他", self.library.category_names())
+
+    def test_virtual_category_operator_moves_into_directory(self) -> None:
+        # 文件在根目录、但 spec.category 已声明分类：拖到同分类会真实移动文件。
+        self._seed("root_level.py", op_id="test.virtual", category=("基础调整",))
+        before = self.refreshes.count()
+        self.assertTrue(
+            self.library.move_operator_to_category("test.virtual", ("基础调整",))
+        )
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertTrue(
+            (self.root / "基础调整" / "root_level.py").is_file()
+        )
+
+    def test_legacy_operator_without_category_can_move(self) -> None:
+        # 旧算子 / 手写算子没有 category 声明：移动到分类后由 loader 按新目录推导。
+        legacy = self.root / "legacy.py"
+        legacy.write_text(
+            _NO_CATEGORY_TEMPLATE.format(op_id="legacy.demo", name="旧版算子"),
+            encoding="utf-8",
+        )
+        self._reload()
+        entry = self.registry.entry("legacy.demo")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("其他",))
+
+        before = self.refreshes.count()
+        self.assertTrue(
+            self.library.move_operator_to_category(
+                "legacy.demo", ("基础调整", "颜色")
+            )
+        )
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertFalse(legacy.exists())
+        self.assertTrue(
+            (self.root / "基础调整" / "颜色" / "legacy.py").is_file()
+        )
+        entry = self.registry.entry("legacy.demo")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("基础调整", "颜色"))
+        item = self.library._entry_items["legacy.demo"]  # noqa: SLF001
+        self.assertTrue(item.isSelected())
+        self.assertEqual(item.parent().text(0), "颜色")
+        self.assertIn("已移动用户算子", self._last_message())
+
+    def test_operator_can_move_out_of_root_after_blank_drop(self) -> None:
+        # 先拖到空白处（根目录，归入「其他」），再拖到别的分类。
+        self._seed("A/op.py", op_id="test.roundtrip", category=("A",))
+        before = self.refreshes.count()
+        self.assertTrue(
+            self.library.move_operator_to_category("test.roundtrip", ())
+        )
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertTrue((self.root / "op.py").is_file())
+        self.assertIn("其他", self.library.category_names())
+        entry = self.registry.entry("test.roundtrip")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("其他",))
+        self.assertEqual(self.library.current_category(), "其他")
+
+        before = self.refreshes.count()
+        self.assertTrue(
+            self.library.move_operator_to_category("test.roundtrip", ("B",))
+        )
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertFalse((self.root / "op.py").exists())
+        self.assertTrue((self.root / "B" / "op.py").is_file())
+        entry = self.registry.entry("test.roundtrip")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("B",))
+        item = self.library._entry_items["test.roundtrip"]  # noqa: SLF001
+        self.assertTrue(item.isSelected())
+        self.assertEqual(item.parent().text(0), "B")
+        self.assertEqual(self.library.current_category(), "B")
+
+    def test_move_category_moves_directory_and_children(self) -> None:
+        self._seed("A/B/op.py", op_id="test.child", category=("A", "B"))
+        self._seed("C/other.py", op_id="test.other", category=("C",))
+        before = self.refreshes.count()
+        self.assertTrue(self.library.move_category_to_category(("A", "B"), ("C",)))
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertFalse((self.root / "A" / "B").exists())
+        self.assertTrue((self.root / "C" / "B" / "op.py").is_file())
+        entry = self.registry.entry("test.child")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("C", "B"))
+
+        group = self._category_item(("C", "B"))
+        self.assertEqual(group.text(1), "1")
+        self.assertEqual(self.library.tree.currentItem(), group)
+        self.assertEqual(self.library.current_category(), "C")
+        message = self._last_message()
+        self.assertIn("已移动分类", message)
+        self.assertIn("A / B", message)
+        self.assertIn("C", message)
+
+        # 分类拖到空白处 = 移到根目录。
+        before = self.refreshes.count()
+        self.assertTrue(self.library.move_category_to_category(("C", "B"), ()))
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertTrue((self.root / "B" / "op.py").is_file())
+        entry = self.registry.entry("test.child")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("B",))
+        self.assertEqual(
+            self.library.tree.currentItem(), self.library._category_items["B"]  # noqa: SLF001
+        )
+        self.assertIn("根目录", self._last_message())
+
+    def test_move_category_uses_owning_user_root(self) -> None:
+        root_a = self.root / "root_a"
+        root_b = self.root / "root_b"
+        root_a.mkdir()
+        (root_b / "A").mkdir(parents=True)
+        (root_b / "A" / "op.py").write_text(
+            _OPERATOR_TEMPLATE.format(
+                op_id="test.multi",
+                name="多根算子",
+                category=("A",),
+                description="多扫描根测试",
+                keyword="多根",
+            ),
+            encoding="utf-8",
+        )
+        self.scan_roots = [root_a, root_b]
+        self._reload()
+        before = self.refreshes.count()
+        self.assertTrue(
+            self.library.move_operator_to_category("test.multi", ("基础调整",))
+        )
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertTrue((root_b / "基础调整" / "op.py").is_file())
+        # 不能把算子搬到默认目录 root_a。
+        self.assertFalse((root_a / "基础调整").exists())
+
+        before = self.refreshes.count()
+        self.assertTrue(self.library.move_category_to_category(("A",), ("基础调整",)))
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertTrue((root_b / "基础调整" / "A").is_dir())
+        self.assertFalse((root_a / "基础调整" / "A").exists())
+
+    def test_move_category_reports_dynamic_category_warnings(self) -> None:
+        self._seed("A/static.py", op_id="test.static", category=("A",))
+        self._seed(
+            "A/dynamic.py",
+            op_id="test.dynamic",
+            category=("A",),
+            dynamic=True,
+        )
+        before = self.refreshes.count()
+        self.assertTrue(self.library.move_category_to_category(("A",), ("B",)))
+        self.assertEqual(self.refreshes.count(), before + 1)
+        self.assertTrue((self.root / "B" / "A" / "static.py").is_file())
+        self.assertTrue((self.root / "B" / "A" / "dynamic.py").is_file())
+        message = self._last_message()
+        self.assertIn("已移动分类", message)
+        self.assertIn("提示：", message)
+        self.assertIn("未自动同步", message)
+
+    # ------------------------------------------------------------ no-op
+    def test_move_operator_noop_does_not_refresh(self) -> None:
+        path = self._seed("A/op.py", op_id="test.same", category=("A",))
+        before = self.refreshes.count()
+        self.assertTrue(self.library.move_operator_to_category("test.same", ("A",)))
+        self.assertEqual(self.refreshes.count(), before)
+        self.assertTrue(path.is_file())
+        self.assertIn("已在目标分类中", self._last_message())
+
+    def test_move_category_noop_does_not_refresh(self) -> None:
+        self._seed("A/B/op.py", op_id="test.same", category=("A", "B"))
+        before = self.refreshes.count()
+        self.assertTrue(
+            self.library.move_category_to_category(("A", "B"), ("A",))
+        )
+        self.assertEqual(self.refreshes.count(), before)
+        self.assertTrue((self.root / "A" / "B" / "op.py").is_file())
+        self.assertIn("已在目标分类中", self._last_message())
+
+    # ------------------------------------------------------------ 失败分支
+    def test_move_operator_failures_leave_files_untouched(self) -> None:
+        self.assertFalse(
+            self.library.move_operator_to_category("missing", ("A",))
+        )
+        self.assertIn("找不到该算子", self._last_message())
+
+        dynamic = self._seed(
+            "动态/op.py",
+            op_id="test.dynamic",
+            category=("动态",),
+            dynamic=True,
+        )
+        before = self.refreshes.count()
+        self.assertFalse(
+            self.library.move_operator_to_category("test.dynamic", ("目标",))
+        )
+        self.assertEqual(self.refreshes.count(), before)
+        self.assertTrue(dynamic.is_file())
+        self.assertFalse((self.root / "目标").exists())
+        self.assertIn("移动失败", self._last_message())
+        self.assertIn("category 不是字面量", self._last_message())
+
+        source = self._seed("A/dup.py", op_id="test.dup.a", category=("A",))
+        target = self._seed("B/dup.py", op_id="test.dup.b", category=("B",))
+        target_text = target.read_text(encoding="utf-8")
+        before = self.refreshes.count()
+        self.assertFalse(
+            self.library.move_operator_to_category("test.dup.a", ("B",))
+        )
+        self.assertEqual(self.refreshes.count(), before)
+        self.assertTrue(source.is_file())
+        self.assertEqual(target.read_text(encoding="utf-8"), target_text)
+        self.assertIn("移动失败", self._last_message())
+        self.assertIn("同名", self._last_message())
+
+    def test_move_category_failures_leave_directory_untouched(self) -> None:
+        self._seed("A/B/op.py", op_id="test.child", category=("A", "B"))
+        self._seed("virtual.py", op_id="test.virtual", category=("虚拟", "分组"))
+
+        before = self.refreshes.count()
+        self.assertFalse(
+            self.library.move_category_to_category(("虚拟", "分组"), ("A",))
+        )
+        self.assertEqual(self.refreshes.count(), before)
+        self.assertIn("没有对应的用户目录", self._last_message())
+
+        self.assertFalse(
+            self.library.move_category_to_category(("A", "B"), ("A", "B"))
+        )
+        self.assertIn("不能把分类移动到自身或子分类中", self._last_message())
+        self.assertFalse(
+            self.library.move_category_to_category(("A", "B"), ("A", "B", "C"))
+        )
+        self.assertIn("不能把分类移动到自身或子分类中", self._last_message())
+        self.assertTrue((self.root / "A" / "B" / "op.py").is_file())
+
+        # 目标父级下已有同名目录 → 失败且源目录不动。
+        (self.root / "C" / "B").mkdir(parents=True)
+        before = self.refreshes.count()
+        self.assertFalse(self.library.move_category_to_category(("A", "B"), ("C",)))
+        self.assertEqual(self.refreshes.count(), before)
+        self.assertTrue((self.root / "A" / "B" / "op.py").is_file())
+        self.assertIn("移动失败", self._last_message())
+        self.assertIn("同名", self._last_message())
+
+    def test_builtin_operator_and_category_not_movable(self) -> None:
+        builtin_dir = _workspace_tempdir()
+        self.addCleanup(_cleanup_tempdir, builtin_dir)
+        # 内置分类目录：分类行来自磁盘目录，而不是仅由 spec.category 形成。
+        (builtin_dir / "内置分类").mkdir()
+        (builtin_dir / "内置分类" / "builtin_op.py").write_text(
+            _OPERATOR_TEMPLATE.format(
+                op_id="builtin.demo",
+                name="内置示例",
+                category=("内置分类",),
+                description="内置测试算子",
+                keyword="内置",
+            ),
+            encoding="utf-8",
+        )
+        with patch("app.operators.loader.BUILTIN_DIR", builtin_dir):
+            self.registry = OperatorRegistry.build(
+                [self.root], include_builtin=True
+            )
+            self.library.set_registry(self.registry)
+            QApplication.processEvents()
+
+            entry = self.registry.entry("builtin.demo")
+            self.assertIsNotNone(entry)
+            assert entry is not None
+            self.assertTrue(entry.builtin)
+            leaf = self.library._entry_items["builtin.demo"]  # noqa: SLF001
+            self.assertIsNone(self.library.library_drag_payload(leaf))
+            mime = self.library.mime_data_for_item(leaf)
+            self.assertTrue(mime.hasFormat(MIME_OPERATOR))
+            self.assertFalse(mime.hasFormat(MIME_LIBRARY_MOVE))
+
+            category_item = self._category_item(("内置分类",))
+            self.assertIsNone(self.library.library_drag_payload(category_item))
+            self.assertFalse(category_item.flags() & Qt.ItemFlag.ItemIsDragEnabled)
+
+            before = self.refreshes.count()
+            self.assertFalse(
+                self.library.move_operator_to_category("builtin.demo", ("用户分类",))
+            )
+            self.assertFalse(
+                self.library.move_category_to_category(("内置分类",), ("目标",))
+            )
+            self.assertEqual(self.refreshes.count(), before)
+            self.assertTrue(
+                (builtin_dir / "内置分类" / "builtin_op.py").is_file()
+            )
+            self.assertFalse((self.root / "用户分类").exists())
+            self.assertFalse((self.root / "目标").exists())
+            self.assertTrue(
+                any("内置算子不能移动" in message for message in self.messages)
+            )
+            self.assertTrue(
+                any("内置分类不能移动" in message for message in self.messages)
+            )
 
 
 # ---------------------------------------------------------------------------

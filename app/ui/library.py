@@ -6,6 +6,10 @@
 * 搜索跨所有分类过滤，命中项自动展开并在列表中定位；
 * 将算子叶子拖到画布时使用 :data:`app.core.constants.MIME_OPERATOR`，
   payload 为 ``{"id": op_id}`` 的 UTF-8 JSON；
+* 用户算子叶子拖动时同时携带 :data:`app.core.constants.MIME_LIBRARY_MOVE`，
+  可在算子库内拖到其它分类整理；磁盘上确实存在于用户扫描根下的用户分类
+  （分组）也能拖动，内置算子 / 内置分类 / 仅由 ``spec.category`` 形成的虚拟
+  分组不可拖动。移动只在算子文件 / 分类目录所属的用户扫描根内进行；
 * 单击算子叶子在库底部弹出说明浮层（名称 / 分类 / 描述 / 参数 / 端口），
   点击浮层外部或按 Esc 关闭；
 * 右键分类 / 分组 / 空白处可直接新建用户算子或分类，右键用户算子可原地改名、
@@ -39,6 +43,7 @@ from PySide6.QtGui import (
     QFontMetrics,
     QKeySequence,
     QPainter,
+    QPen,
     QPixmap,
     QShortcut,
 )
@@ -68,7 +73,13 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import AppSettings, default_user_operator_dir
-from app.core.constants import CATEGORY_ORDER, CUSTOM_OPERATOR_CATEGORY, MIME_OPERATOR
+from app.core.constants import (
+    CATEGORY_ORDER,
+    CUSTOM_OPERATOR_CATEGORY,
+    MIME_LIBRARY_MOVE,
+    MIME_OPERATOR,
+)
+from app.operators import loader as operator_loader
 from app.operators.loader import OperatorEntry, OperatorRegistry
 from app.operators.spec import ParamSpec
 
@@ -187,6 +198,14 @@ def _normalize_category(
     return tuple(part.strip() for part in parts if part and part.strip())
 
 
+def _is_same_or_descendant(
+    candidate: tuple[str, ...], parent: tuple[str, ...]
+) -> bool:
+    """``candidate`` 是否等于 ``parent`` 或位于其下。"""
+
+    return len(candidate) >= len(parent) and candidate[: len(parent)] == parent
+
+
 def _category_sort_key(name: str) -> tuple[int, str]:
     """一级分类排序：CATEGORY_ORDER 内按声明顺序，未知分类按名称排最后。"""
 
@@ -250,7 +269,11 @@ class _OperatorTree(QTreeWidget):
 
     * 第一列：分类 / 分组 / 算子名；第二列：分类或分组的算子数量；
     * 非叶子条目单击整行即可原地展开 / 折叠（箭头仍由 Qt 原生处理）；
-    * 只有算子叶子允许拖拽，payload 为 ``MIME_OPERATOR``。
+    * 所有算子叶子拖动时携带 ``MIME_OPERATOR``（拖到画布创建节点）；用户
+      算子 / 用户分类额外携带 ``MIME_LIBRARY_MOVE``，可在库内拖动整理。
+      这里自行处理 drop，只接受 ``MIME_LIBRARY_MOVE``，不启用 Qt 默认的
+      InternalMove（否则会由模型移动行）；
+    * 拖动中在合法目标行上画虚线高亮，非法目标不接收。
     """
 
     def __init__(self, library: "OperatorLibrary", parent: QWidget | None = None) -> None:
@@ -267,7 +290,11 @@ class _OperatorTree(QTreeWidget):
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setDragEnabled(True)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        # 允许“拖出到画布”与“拖入库内整理”，但 drop 逻辑完全自行处理；
+        # 不使用 InternalMove，避免 Qt 在模型层移动 / 复制行。
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self.setDropIndicatorShown(False)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu_requested)
@@ -278,6 +305,7 @@ class _OperatorTree(QTreeWidget):
         self.setColumnWidth(1, 52)
         self.setMouseTracking(True)
         self._hover_item: QTreeWidgetItem | None = None
+        self._drop_target_item: QTreeWidgetItem | None = None
         self.itemClicked.connect(self._on_item_clicked)
         self.itemActivated.connect(self._on_item_activated)
 
@@ -287,6 +315,8 @@ class _OperatorTree(QTreeWidget):
 
         if item is None:
             return None
+        if item is self._drop_target_item:
+            return QColor("#dbeafe")
         if item.parent() is None:
             return QColor("#eaf2ff") if item.isExpanded() else QColor("#f8fafc")
         if item.isSelected():
@@ -345,6 +375,23 @@ class _OperatorTree(QTreeWidget):
             )
             painter.restore()
 
+        # 库内拖动整理：合法目标行画虚线框，提示“松手会移到这里”。
+        if item is not None and item is self._drop_target_item:
+            painter.save()
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#2563eb"), 1.5, Qt.PenStyle.DashLine))
+            painter.drawRoundedRect(
+                QRectF(
+                    1.0,
+                    float(option.rect.top()) + 1.5,
+                    float(self.viewport().width()) - 3.0,
+                    float(option.rect.height()) - 3.0,
+                ),
+                6.0,
+                6.0,
+            )
+            painter.restore()
+
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         item = self.itemAt(event.position().toPoint())
         if item is not self._hover_item:
@@ -362,10 +409,94 @@ class _OperatorTree(QTreeWidget):
         item = self.currentItem()
         if item is None:
             return
-        op_id = item.data(0, ROLE_OP_ID)
-        if not op_id:
+        # 算子叶子（含内置）允许拖到画布；带库内移动 payload 的用户算子 /
+        # 用户分类才允许发起库内整理拖动。
+        if not item.data(0, ROLE_OP_ID) and self._library.library_drag_payload(item) is None:
             return
-        self._library.begin_operator_drag(self, str(op_id))
+        self._library.begin_library_drag(self, item)
+
+    # ------------------------------------------------------------ 库内拖动整理
+    @staticmethod
+    def _payload_from_mime(mime: QMimeData) -> dict[str, Any] | None:
+        if mime is None or not mime.hasFormat(MIME_LIBRARY_MOVE):
+            return None
+        try:
+            raw = bytes(mime.data(MIME_LIBRARY_MOVE)).decode("utf-8")
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, ValueError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("kind") not in ("operator", "category"):
+            return None
+        return payload
+
+    def _set_drop_target(self, item: QTreeWidgetItem | None) -> None:
+        if item is self._drop_target_item:
+            return
+        self._drop_target_item = item
+        self.viewport().update()
+
+    def _auto_scroll_for_drag(self, pos: QPoint) -> None:
+        """拖动到视口上下边缘时滚动，便于把算子拖到远处的分类。"""
+
+        margin = 24
+        step = 18
+        bar = self.verticalScrollBar()
+        if pos.y() < margin and bar.value() > bar.minimum():
+            bar.setValue(max(bar.minimum(), bar.value() - step))
+        elif (
+            pos.y() > self.viewport().height() - margin
+            and bar.value() < bar.maximum()
+        ):
+            bar.setValue(min(bar.maximum(), bar.value() + step))
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        payload = self._payload_from_mime(event.mimeData())
+        item = self.itemAt(event.position().toPoint())
+        if payload is not None and self._library.can_accept_library_drop(payload, item):
+            self._set_drop_target(item)
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
+        self._set_drop_target(None)
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        payload = self._payload_from_mime(event.mimeData())
+        pos = event.position().toPoint()
+        if payload is not None:
+            self._auto_scroll_for_drag(pos)
+        item = self.itemAt(pos)
+        if payload is not None and self._library.can_accept_library_drop(payload, item):
+            self._set_drop_target(item)
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
+        self._set_drop_target(None)
+        event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        self._set_drop_target(None)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        payload = self._payload_from_mime(event.mimeData())
+        item = self.itemAt(event.position().toPoint())
+        if payload is None or not self._library.can_accept_library_drop(payload, item):
+            self._set_drop_target(None)
+            event.ignore()
+            return
+        target = self._library.drop_target_category(item)
+        self._set_drop_target(None)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        if payload.get("kind") == "operator":
+            self._library.move_operator_to_category(str(payload.get("id") or ""), target)
+        else:
+            self._library.move_category_to_category(
+                _normalize_category(payload.get("path")), target
+            )
 
     def _on_context_menu_requested(self, pos: QPoint) -> None:
         item = self.itemAt(pos)
@@ -868,7 +999,11 @@ class OperatorLibrary(QWidget):
             category.setData(0, ROLE_OP_ID, None)
             category.setData(0, ROLE_KIND, _KIND_CATEGORY)
             category.setData(0, ROLE_CATEGORY_PATH, (name,))
-            category.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            category_draggable = self._user_category_root((name,)) is not None
+            category_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            if category_draggable:
+                category_flags |= Qt.ItemFlag.ItemIsDragEnabled
+            category.setFlags(category_flags)
             category_font = category.font(0)
             category_font.setBold(True)
             category_font.setPointSizeF(max(10.0, category_font.pointSizeF()))
@@ -879,7 +1014,10 @@ class OperatorLibrary(QWidget):
                 int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
             )
             category.setSizeHint(0, QSize(0, 36))
-            category.setToolTip(0, f"{name} · 单击展开 / 折叠 · 右键新建")
+            tooltip = f"{name} · 单击展开 / 折叠 · 右键新建"
+            if category_draggable:
+                tooltip += " · 可拖动到其它分类"
+            category.setToolTip(0, tooltip)
             tree.addTopLevelItem(category)
             total = self._populate_tree(category, root, (), name)
             category.setText(1, str(total))
@@ -901,7 +1039,13 @@ class OperatorLibrary(QWidget):
             group.setData(0, ROLE_OP_ID, None)
             group.setData(0, ROLE_KIND, _KIND_GROUP)
             group.setData(0, ROLE_CATEGORY_PATH, (top_name,) + group_path)
-            group.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            group_draggable = (
+                self._user_category_root((top_name,) + group_path) is not None
+            )
+            group_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            if group_draggable:
+                group_flags |= Qt.ItemFlag.ItemIsDragEnabled
+            group.setFlags(group_flags)
             group_font = group.font(0)
             group_font.setBold(True)
             group.setFont(0, group_font)
@@ -913,7 +1057,10 @@ class OperatorLibrary(QWidget):
             )
             group.setForeground(1, QBrush(QColor("#94a3b8")))
             group.setSizeHint(0, QSize(0, 28))
-            group.setToolTip(0, "分类：" + " / ".join((top_name,) + group_path))
+            group_tooltip = "分类：" + " / ".join((top_name,) + group_path)
+            if group_draggable:
+                group_tooltip += " · 可拖动到其它分类"
+            group.setToolTip(0, group_tooltip)
             parent.addChild(group)
             count = self._populate_tree(group, child, group_path, top_name)
             group.setText(1, str(count))
@@ -1570,9 +1717,287 @@ class OperatorLibrary(QWidget):
                 return False
         return super().eventFilter(obj, event)
 
+    # ------------------------------------------------------------------ 库内拖动整理
+    def _is_builtin_root(self, root: Path | str) -> bool:
+        """判断扫描根是否为内置算子目录（与 loader 保持同一来源）。"""
+
+        try:
+            candidate = Path(root).expanduser().resolve()
+            builtin = operator_loader.BUILTIN_DIR.expanduser().resolve()
+        except OSError:
+            return False
+        return candidate == builtin
+
+    def _user_scan_roots(self) -> list[Path]:
+        """用户扫描根：``registry.scan_roots`` 中排除内置目录，保持扫描顺序。"""
+
+        registry = self._registry
+        if registry is not None:
+            roots: list[Path] = []
+            for raw in registry.scan_roots:
+                path = Path(raw).expanduser()
+                if self._is_builtin_root(path):
+                    continue
+                try:
+                    resolved = path.resolve()
+                except OSError:
+                    resolved = path
+                if resolved not in roots:
+                    roots.append(resolved)
+            return roots
+        try:
+            return [self.user_operator_root().expanduser().resolve()]
+        except OSError:
+            return [self.user_operator_root().expanduser()]
+
+    def _user_root_for_path(self, path: Path | str) -> Path | None:
+        """返回包含该文件 / 目录的用户扫描根（嵌套根取最具体的一个）。"""
+
+        try:
+            target = Path(path).expanduser().resolve()
+        except OSError:
+            return None
+        matches: list[Path] = []
+        for root in self._user_scan_roots():
+            try:
+                target.relative_to(root)
+            except ValueError:
+                continue
+            matches.append(root)
+        if not matches:
+            return None
+        return max(matches, key=lambda item: len(item.parts))
+
+    @staticmethod
+    def _category_path_from_directory(
+        directory: Path | str, root: Path | str
+    ) -> tuple[str, ...]:
+        try:
+            relative = Path(directory).expanduser().resolve().relative_to(
+                Path(root).expanduser().resolve()
+            )
+        except (OSError, ValueError):
+            return ()
+        return tuple(part for part in relative.parts if part not in ("", "."))
+
+    def _user_category_root(
+        self, category: str | tuple[str, ...] | list[str] | None
+    ) -> Path | None:
+        """分类目录实际存在于哪个用户扫描根下；不存在 / 仅在内置根下返回 None。"""
+
+        parts = _normalize_category(category)
+        if not parts:
+            return None
+        for root in self._user_scan_roots():
+            try:
+                if root.joinpath(*parts).is_dir():
+                    return root
+            except OSError:
+                continue
+        return None
+
+    def _category_in_builtin(
+        self, category: str | tuple[str, ...] | list[str] | None
+    ) -> bool:
+        parts = _normalize_category(category)
+        if not parts:
+            return False
+        try:
+            builtin = operator_loader.BUILTIN_DIR.expanduser()
+            return builtin.joinpath(*parts).is_dir()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _same_path(left: Path | str, right: Path | str) -> bool:
+        try:
+            return Path(left).expanduser().resolve() == Path(right).expanduser().resolve()
+        except OSError:
+            return Path(left) == Path(right)
+
+    @staticmethod
+    def _category_display(category: str | tuple[str, ...] | list[str] | None) -> str:
+        parts = _normalize_category(category)
+        return " / ".join(parts) if parts else "根目录"
+
+    @staticmethod
+    def _move_success_message(base: str, outcome) -> str:
+        """把核心返回的 warnings 合并进成功提示。"""
+
+        warnings: list[str] = []
+        for warning in getattr(outcome, "warnings", ()) or ():
+            text = str(warning).strip().rstrip("。；; ")
+            if text:
+                warnings.append(text)
+        if not warnings:
+            return base
+        return f"{base} 提示：{'；'.join(warnings)}。"
+
+    def drop_target_category(
+        self, item: QTreeWidgetItem | None
+    ) -> tuple[str, ...]:
+        """拖放到某条目时的目标分类路径；空白处返回 ``()``。"""
+
+        if item is None:
+            return ()
+        path = self._category_path_for_item(item)
+        return path or ()
+
+    def library_drag_payload(
+        self, item: QTreeWidgetItem | None
+    ) -> dict[str, Any] | None:
+        """条目可做库内整理拖动时的 payload；内置 / 虚拟条目返回 None。"""
+
+        if item is None:
+            return None
+        op_id = item.data(0, ROLE_OP_ID)
+        if op_id:
+            entry = self._entry(str(op_id))
+            if entry is None or entry.builtin:
+                return None
+            if self._user_root_for_path(entry.path) is None:
+                return None
+            return {"kind": "operator", "id": entry.id}
+        kind = item.data(0, ROLE_KIND)
+        if kind not in (_KIND_CATEGORY, _KIND_GROUP):
+            return None
+        path = self._category_path_for_item(item)
+        if not path or self._user_category_root(path) is None:
+            return None
+        return {"kind": "category", "path": list(path)}
+
+    def can_accept_library_drop(
+        self,
+        payload: dict[str, Any] | None,
+        target_item: QTreeWidgetItem | None,
+    ) -> bool:
+        """判断某个库内拖动 payload 能否落在目标条目上。"""
+
+        if not isinstance(payload, dict):
+            return False
+        kind = payload.get("kind")
+        target = self.drop_target_category(target_item)
+        if kind == "operator":
+            entry = self._entry(str(payload.get("id") or ""))
+            if entry is None or entry.builtin:
+                return False
+            return self._user_root_for_path(entry.path) is not None
+        if kind == "category":
+            path = _normalize_category(payload.get("path"))
+            if not path or self._user_category_root(path) is None:
+                return False
+            # 不能把分类拖进自身或后代（含目标行就是自身分类）。
+            return not _is_same_or_descendant(target, path)
+        return False
+
+    def move_operator_to_category(
+        self,
+        op_id: str,
+        category: str | tuple[str, ...] | list[str] | None,
+    ) -> bool:
+        """把用户算子文件移动到目标分类目录；失败只发中文状态提示，不弹窗。"""
+
+        entry = self._entry(str(op_id))
+        if entry is None:
+            self.status_message.emit("移动失败：找不到该算子。")
+            return False
+        if entry.builtin:
+            self.status_message.emit("移动失败：内置算子不能移动。")
+            return False
+        root = self._user_root_for_path(entry.path)
+        if root is None:
+            self.status_message.emit("移动失败：找不到该算子所属的用户算子目录。")
+            return False
+        target = _normalize_category(category)
+        try:
+            from app.core import operator_files
+        except Exception as exc:  # noqa: BLE001 - 并行开发期文件服务可能尚未就绪
+            self.status_message.emit(f"移动失败：文件服务不可用（{exc}）")
+            return False
+        try:
+            outcome = operator_files.move_operator_file(
+                root,
+                entry.path,
+                target,
+                current_category=tuple(entry.spec.category),
+            )
+        except Exception as exc:  # noqa: BLE001 - 中文错误直接展示到状态栏
+            self.status_message.emit(f"移动失败：{exc}")
+            return False
+        moved_path = Path(getattr(outcome, "path", entry.path))
+        if self._same_path(moved_path, entry.path):
+            # 目标目录就是源目录：不刷新、不打扰树，只恢复选中并提示。
+            self.select_operator(str(op_id))
+            self.status_message.emit(
+                f"用户算子“{entry.display_name}”已在目标分类中。"
+            )
+            return True
+        self.refresh_requested.emit()
+        self.select_operator(str(op_id))
+        message = (
+            f"已移动用户算子“{entry.display_name}”到"
+            f"“{self._category_display(target)}”。"
+        )
+        self.status_message.emit(self._move_success_message(message, outcome))
+        return True
+
+    def move_category_to_category(
+        self,
+        category: str | tuple[str, ...] | list[str] | None,
+        target_parent: str | tuple[str, ...] | list[str] | None = None,
+    ) -> bool:
+        """把用户分类目录移动到目标父分类下；失败只发中文状态提示，不弹窗。"""
+
+        source_path = _normalize_category(category)
+        if not source_path:
+            self.status_message.emit("移动失败：分类路径不能为空。")
+            return False
+        target = _normalize_category(target_parent)
+        root = self._user_category_root(source_path)
+        if root is None:
+            if self._category_in_builtin(source_path):
+                self.status_message.emit("移动失败：内置分类不能移动。")
+            else:
+                self.status_message.emit(
+                    "移动失败：该分类没有对应的用户目录，不能移动。"
+                )
+            return False
+        if _is_same_or_descendant(target, source_path):
+            self.status_message.emit("移动失败：不能把分类移动到自身或子分类中。")
+            return False
+        source_dir = root.joinpath(*source_path)
+        try:
+            from app.core import operator_files
+        except Exception as exc:  # noqa: BLE001 - 并行开发期文件服务可能尚未就绪
+            self.status_message.emit(f"移动失败：文件服务不可用（{exc}）")
+            return False
+        try:
+            outcome = operator_files.move_category_dir(root, source_dir, target)
+        except Exception as exc:  # noqa: BLE001 - 中文错误直接展示到状态栏
+            self.status_message.emit(f"移动失败：{exc}")
+            return False
+        moved_path = Path(getattr(outcome, "path", source_dir))
+        if self._same_path(moved_path, source_dir):
+            self._select_category_path(source_path)
+            self.status_message.emit(
+                f"分类“{' / '.join(source_path)}”已在目标分类中。"
+            )
+            return True
+        self.refresh_requested.emit()
+        new_path = self._category_path_from_directory(moved_path, root)
+        if not new_path:
+            new_path = target + (source_path[-1],)
+        self._select_category_path(new_path)
+        message = (
+            f"已移动分类“{' / '.join(source_path)}”到"
+            f"“{self._category_display(target)}”。"
+        )
+        self.status_message.emit(self._move_success_message(message, outcome))
+        return True
+
     # ------------------------------------------------------------------ 拖拽
     def mime_data_for(self, op_id: str) -> QMimeData:
-        """构造拖拽算子使用的 MIME 数据（便于测试与复用）。"""
+        """构造拖拽算子使用的 MIME 数据（仅 ``MIME_OPERATOR``，保持兼容）。"""
         mime = QMimeData()
         payload = json.dumps({"id": op_id}, ensure_ascii=False).encode("utf-8")
         mime.setData(MIME_OPERATOR, payload)
@@ -1580,6 +2005,54 @@ class OperatorLibrary(QWidget):
         if entry is not None:
             mime.setText(getattr(entry, "display_name", entry.name))
         return mime
+
+    def mime_data_for_item(self, item: QTreeWidgetItem | None) -> QMimeData:
+        """按条目构造拖拽 MIME：用户算子带两种格式，用户分类只带库内移动。"""
+
+        mime = QMimeData()
+        payload = self.library_drag_payload(item)
+        if payload is not None:
+            mime.setData(
+                MIME_LIBRARY_MOVE,
+                json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            )
+            if payload.get("kind") == "operator":
+                op_id = str(payload.get("id") or "")
+                mime.setData(
+                    MIME_OPERATOR,
+                    json.dumps({"id": op_id}, ensure_ascii=False).encode("utf-8"),
+                )
+                entry = self._entry(op_id)
+                if entry is not None:
+                    mime.setText(getattr(entry, "display_name", entry.name))
+            else:
+                mime.setText(" / ".join(payload.get("path") or []))
+            return mime
+        # 内置算子不允许库内移动，但仍要能拖到画布创建节点。
+        op_id = item.data(0, ROLE_OP_ID) if item is not None else None
+        if op_id:
+            return self.mime_data_for(str(op_id))
+        return mime
+
+    def begin_library_drag(self, source: QWidget, item: QTreeWidgetItem) -> None:
+        """从树条目开始拖动：用户条目带库内 payload，内置算子只带画布 payload。"""
+
+        mime = self.mime_data_for_item(item)
+        if not (mime.hasFormat(MIME_OPERATOR) or mime.hasFormat(MIME_LIBRARY_MOVE)):
+            return
+        op_id = item.data(0, ROLE_OP_ID)
+        if op_id:
+            entry = self._entry(str(op_id))
+            name = getattr(entry, "display_name", None) or item.text(0)
+            prefix = "＋ "
+        else:
+            name = self._category_display(self._category_path_for_item(item) or ())
+            prefix = "↦ "
+        drag = QDrag(source)
+        drag.setMimeData(mime)
+        drag.setPixmap(self._drag_pixmap(name, prefix=prefix))
+        drag.setHotSpot(QPoint(24, 16))
+        drag.exec(Qt.DropAction.CopyAction)
 
     def begin_operator_drag(self, source: QWidget, op_id: str) -> None:
         """开始拖拽（使用 ``MIME_OPERATOR``）。"""
@@ -1594,12 +2067,12 @@ class OperatorLibrary(QWidget):
         drag.setHotSpot(QPoint(24, 16))
         drag.exec(Qt.DropAction.CopyAction)
 
-    def _drag_pixmap(self, name: str) -> QPixmap:
+    def _drag_pixmap(self, name: str, *, prefix: str = "＋ ") -> QPixmap:
         font = QFont(self.font())
         font.setBold(True)
         font.setPointSizeF(9.0)
         metrics = QFontMetrics(font)
-        width = max(150, metrics.horizontalAdvance("＋ " + name) + 32)
+        width = max(150, metrics.horizontalAdvance(prefix + name) + 32)
         height = 34
         pixmap = QPixmap(width, height)
         pixmap.fill(Qt.GlobalColor.transparent)
@@ -1613,7 +2086,7 @@ class OperatorLibrary(QWidget):
         painter.drawText(
             QRectF(12.0, 0.0, width - 24.0, float(height)),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            "＋ " + name,
+            prefix + name,
         )
         painter.end()
         return pixmap

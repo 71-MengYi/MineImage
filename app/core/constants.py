@@ -8,6 +8,10 @@ APP_VERSION = "0.1.0"
 
 #: 拖拽算子时使用的自定义 MIME 类型，payload 为 UTF-8 JSON: {"id": "<operator id>"}
 MIME_OPERATOR = "application/x-mineimage-operator"
+#: 算子库内部拖动整理用户算子 / 用户分类时使用，payload 为 UTF-8 JSON：
+#: * 用户算子：``{"kind": "operator", "id": "<operator id>"}``
+#: * 用户分类：``{"kind": "category", "path": ["一级", "二级"]}``
+MIME_LIBRARY_MOVE = "application/x-mineimage-library-move"
 #: 从外部拖入图像文件时使用
 MIME_IMAGE_PATHS = "application/x-mineimage-image-paths"
 #: 从节点内部的图像矩阵缩略图拖出时使用，payload 为 UTF-8 JSON: {"token": "<临时载荷>"}

@@ -33,10 +33,13 @@ from app.core.editor import (  # noqa: E402
     resolve_editor,
 )
 from app.core.operator_files import (  # noqa: E402
+    MoveOutcome,
     category_directory,
     create_category_dir,
     create_operator_file,
     delete_operator_file,
+    move_category_dir,
+    move_operator_file,
     normalize_category,
     rename_operator_file,
     sanitize_component,
@@ -420,6 +423,305 @@ class RenameDeleteOperatorTests(_TempDirTestCase):
         self.assertFalse(created.path.exists())
         with self.assertRaises(FileNotFoundError):
             delete_operator_file(created.path)
+
+
+class MoveOperatorFileTests(_TempDirTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = self.tmp / "operators"
+
+    def _registry(self) -> OperatorRegistry:
+        return OperatorRegistry.build([str(self.root)], include_builtin=False)
+
+    def test_move_generated_operator_updates_file_and_category(self) -> None:
+        created = create_operator_file(self.root, ("源分类", "子分类"))
+        outcome = move_operator_file(
+            self.root,
+            created.path,
+            ("目标分类", "深层"),
+            current_category=("源分类", "子分类"),
+        )
+        self.assertIsInstance(outcome, MoveOutcome)
+        expected = (
+            self.root.resolve()
+            / "目标分类"
+            / "深层"
+            / created.path.name
+        )
+        self.assertEqual(outcome.path, expected)
+        self.assertFalse(created.path.exists())
+        self.assertTrue(expected.is_file())
+        content = expected.read_text(encoding="utf-8")
+        self.assertIn("category=('目标分类', '深层')", content)
+        self.assertNotIn("category=('源分类', '子分类')", content)
+        self.assertEqual(outcome.warnings, ())
+
+        entry = self._registry().entry(created.operator_id)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("目标分类", "深层"))
+
+    def test_move_manual_literal_category_is_synced(self) -> None:
+        manual = self.make_file(
+            "operators/源分类/manual.py",
+            textwrap.dedent(
+                """\
+                from app.operators.spec import Operator, OperatorSpec
+
+
+                class Manual(Operator):
+                    spec = OperatorSpec(
+                        id="manual.move_me",
+                        name="手写算子",
+                        category=("源分类",),
+                    )
+
+                    def process(self, image=None, **_):
+                        return image.array if image is not None else None
+
+
+                OPERATOR = Manual
+                """
+            ),
+        )
+        outcome = move_operator_file(
+            self.root, manual, ("目标分类",), current_category=("源分类",)
+        )
+        self.assertTrue(outcome.path.is_file())
+        content = outcome.path.read_text(encoding="utf-8")
+        self.assertIn("category=('目标分类',)", content)
+        entry = self._registry().entry("manual.move_me")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("目标分类",))
+
+    def test_move_operator_to_root_rewrites_empty_category(self) -> None:
+        created = create_operator_file(self.root, ("源分类",))
+        outcome = move_operator_file(
+            self.root, created.path, (), current_category=("源分类",)
+        )
+        self.assertEqual(outcome.path, self.root.resolve() / created.path.name)
+        content = outcome.path.read_text(encoding="utf-8")
+        self.assertIn("category=(),", content)
+        entry = self._registry().entry(created.operator_id)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("其他",))
+
+    def test_move_legacy_operator_without_category_allows_move(self) -> None:
+        legacy = self.make_file(
+            "operators/legacy.py",
+            textwrap.dedent(
+                """\
+                from app.operators.spec import Operator, OperatorSpec
+
+
+                class Legacy(Operator):
+                    spec = OperatorSpec(id="legacy.one", name="旧算子")
+
+                    def process(self, image=None, **_):
+                        return image.array if image is not None else None
+
+
+                OPERATOR = Legacy
+                """
+            ),
+        )
+        entry = self._registry().entry("legacy.one")
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("其他",))
+
+        outcome = move_operator_file(
+            self.root, legacy, ("新分类",), current_category=("其他",)
+        )
+        self.assertEqual(outcome.path, self.root.resolve() / "新分类" / legacy.name)
+        self.assertTrue(outcome.path.is_file())
+        moved_entry = self._registry().entry("legacy.one")
+        self.assertIsNotNone(moved_entry)
+        assert moved_entry is not None
+        self.assertEqual(moved_entry.spec.category, ("新分类",))
+
+    def test_move_operator_out_of_root_category_again(self) -> None:
+        created = create_operator_file(self.root, ("源分类",))
+        first = move_operator_file(
+            self.root, created.path, (), current_category=("源分类",)
+        )
+        self.assertIn("category=(),", first.path.read_text(encoding="utf-8"))
+
+        second = move_operator_file(
+            self.root, first.path, ("目标分类",), current_category=("其他",)
+        )
+        self.assertEqual(
+            second.path, self.root.resolve() / "目标分类" / created.path.name
+        )
+        content = second.path.read_text(encoding="utf-8")
+        self.assertIn("category=('目标分类',)", content)
+        entry = self._registry().entry(created.operator_id)
+        self.assertIsNotNone(entry)
+        assert entry is not None
+        self.assertEqual(entry.spec.category, ("目标分类",))
+
+    def test_move_same_directory_is_noop(self) -> None:
+        created = create_operator_file(self.root, ("源分类",))
+        before = created.path.read_bytes()
+        outcome = move_operator_file(
+            self.root, created.path, ("源分类",), current_category=("源分类",)
+        )
+        self.assertEqual(outcome.path, created.path.resolve())
+        self.assertEqual(created.path.read_bytes(), before)
+
+    def test_move_to_existing_name_raises_and_keeps_source(self) -> None:
+        create_operator_file(self.root, ("目标分类",))
+        created = create_operator_file(self.root, ("源分类",))
+        with self.assertRaises(FileExistsError):
+            move_operator_file(
+                self.root, created.path, ("目标分类",), current_category=("源分类",)
+            )
+        self.assertTrue(created.path.is_file())
+
+    def test_move_outside_root_raises(self) -> None:
+        outside = self.make_file("outside.py", "VALUE = 1\n")
+        with self.assertRaises(ValueError):
+            move_operator_file(self.root, outside, ("目标分类",), current_category=())
+
+    def test_move_dynamic_category_raises_before_moving(self) -> None:
+        manual = self.make_file(
+            "operators/源分类/dynamic.py",
+            textwrap.dedent(
+                """\
+                from app.operators.spec import Operator, OperatorSpec
+
+                CATEGORY = ("源分类",)
+
+
+                class Manual(Operator):
+                    spec = OperatorSpec(id="manual.dynamic", name="动态", category=CATEGORY)
+
+                    def process(self, image=None, **_):
+                        return image.array if image is not None else None
+
+
+                OPERATOR = Manual
+                """
+            ),
+        )
+        with self.assertRaises(ValueError) as context:
+            move_operator_file(
+                self.root, manual, ("目标分类",), current_category=("源分类",)
+            )
+        self.assertIn("category", str(context.exception))
+        self.assertTrue(manual.is_file())
+        self.assertFalse((self.root / "目标分类" / manual.name).exists())
+
+    def test_move_missing_file_raises(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            move_operator_file(
+                self.root,
+                self.root / "missing.py",
+                ("目标分类",),
+                current_category=(),
+            )
+
+
+class MoveCategoryDirTests(_TempDirTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = self.tmp / "operators"
+
+    def _registry(self) -> OperatorRegistry:
+        return OperatorRegistry.build([str(self.root)], include_builtin=False)
+
+    def test_move_category_moves_tree_and_remaps_categories(self) -> None:
+        top = create_operator_file(self.root, ("旧分类",))
+        nested = create_operator_file(self.root, ("旧分类", "子分类"))
+        outcome = move_category_dir(self.root, self.root / "旧分类", ("新父分类",))
+        expected = self.root.resolve() / "新父分类" / "旧分类"
+        self.assertEqual(outcome.path, expected)
+        self.assertFalse((self.root / "旧分类").exists())
+        self.assertTrue((expected / top.path.name).is_file())
+        self.assertTrue((expected / "子分类" / nested.path.name).is_file())
+        self.assertEqual(outcome.warnings, ())
+
+        registry = self._registry()
+        top_entry = registry.entry(top.operator_id)
+        nested_entry = registry.entry(nested.operator_id)
+        self.assertIsNotNone(top_entry)
+        self.assertIsNotNone(nested_entry)
+        assert top_entry is not None and nested_entry is not None
+        self.assertEqual(top_entry.spec.category, ("新父分类", "旧分类"))
+        self.assertEqual(
+            nested_entry.spec.category, ("新父分类", "旧分类", "子分类")
+        )
+
+    def test_move_empty_category(self) -> None:
+        folder = create_category_dir(self.root, None, "空分类")
+        outcome = move_category_dir(self.root, folder, ("父分类",))
+        self.assertTrue(outcome.path.is_dir())
+        self.assertTrue((self.root / "父分类" / "空分类").is_dir())
+
+    def test_move_category_same_parent_is_noop(self) -> None:
+        folder = create_category_dir(self.root, None, "分类")
+        outcome = move_category_dir(self.root, folder, ())
+        self.assertEqual(outcome.path, folder.resolve())
+
+    def test_move_category_into_descendant_raises(self) -> None:
+        create_category_dir(self.root, None, "父")
+        create_category_dir(self.root, ("父",), "子")
+        with self.assertRaises(ValueError):
+            move_category_dir(self.root, self.root / "父", ("父", "子"))
+        self.assertTrue((self.root / "父" / "子").is_dir())
+
+    def test_move_category_to_existing_name_raises(self) -> None:
+        create_category_dir(self.root, ("目标",), "分类")
+        source = create_category_dir(self.root, None, "分类")
+        with self.assertRaises(FileExistsError):
+            move_category_dir(self.root, source, ("目标",))
+        self.assertTrue(source.is_dir())
+
+    def test_move_custom_and_hidden_directories_raise(self) -> None:
+        custom = self.root / "custom"
+        custom.mkdir(parents=True)
+        hidden = self.root / "_hidden"
+        hidden.mkdir(parents=True)
+        for folder in (custom, hidden):
+            with self.subTest(folder=folder.name), self.assertRaises(ValueError):
+                move_category_dir(self.root, folder, ("目标",))
+
+    def test_move_root_or_missing_directory_raises(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self.assertRaises(ValueError):
+            move_category_dir(self.root, self.root, ("目标",))
+        with self.assertRaises(FileNotFoundError):
+            move_category_dir(self.root, self.root / "missing", ("目标",))
+
+    def test_move_category_keeps_dynamic_category_file_and_warns(self) -> None:
+        manual = self.make_file(
+            "operators/旧分类/dynamic.py",
+            textwrap.dedent(
+                """\
+                from app.operators.spec import Operator, OperatorSpec
+
+                CATEGORY = ("旧分类",)
+
+
+                class Manual(Operator):
+                    spec = OperatorSpec(id="manual.dynamic", name="动态", category=CATEGORY)
+
+                    def process(self, image=None, **_):
+                        return image.array if image is not None else None
+
+
+                OPERATOR = Manual
+                """
+            ),
+        )
+        outcome = move_category_dir(self.root, self.root / "旧分类", ("新父",))
+        moved = outcome.path / manual.name
+        self.assertTrue(moved.is_file())
+        self.assertEqual(len(outcome.warnings), 1)
+        self.assertIn("dynamic.py", outcome.warnings[0])
+        self.assertIn("CATEGORY", moved.read_text(encoding="utf-8"))
 
 
 class UpdateGeneratedNameTests(_TempDirTestCase):

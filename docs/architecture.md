@@ -546,7 +546,7 @@ OperatorLibrary(parent=None, *, settings: AppSettings | None = None,
                 user_operator_dir: Path | str | None = None)
 
 set_registry(registry) -> None
-refresh_requested = Signal()          # 新建 / 改名 / 删除后请求上层重扫
+refresh_requested = Signal()          # 新建 / 改名 / 删除 / 移动后请求上层重扫
 status_message = Signal(str)          # 文件操作失败提示（主窗口转状态栏）
 
 # 右键菜单与可测试入口
@@ -558,7 +558,20 @@ delete_operator(op_id, confirm=True) -> bool
 open_editor(op_id) -> bool
 select_operator(op_id) -> bool
 begin_rename_operator(op_id) -> bool
-# 拖拽数据 MIME: app.core.constants.MIME_OPERATOR，payload JSON {"id": op_id}
+
+# 库内拖动整理（真实移动文件 / 目录，不进入撤销栈）
+library_drag_payload(item) -> dict | None     # {"kind": "operator", "id": ...} / {"kind": "category", "path": [...]}
+mime_data_for_item(item) -> QMimeData         # 用户算子同时带 MIME_OPERATOR 与 MIME_LIBRARY_MOVE
+can_accept_library_drop(payload, target_item) -> bool   # 拖动中目标行高亮判定
+drop_target_category(item) -> tuple[str, ...]           # 空白处为 ()
+move_operator_to_category(op_id, category) -> bool
+move_category_to_category(category, target_parent=None) -> bool
+# 只拖到画布的兼容入口：mime_data_for(op_id) / begin_operator_drag(source, op_id)
+
+# 拖拽数据 MIME（app/core/constants.py）：
+#   MIME_OPERATOR      payload {"id": op_id}                                  拖到画布建节点
+#   MIME_LIBRARY_MOVE  payload {"kind": "operator", "id": op_id} 或
+#                              {"kind": "category", "path": ["一级", "二级"]}   拖到库内移动
 ```
 
 一级分类顺序来自 `OperatorRegistry.tabs()`（`CATEGORY_ORDER` 决定），并把
@@ -567,6 +580,26 @@ begin_rename_operator(op_id) -> bool
 `OperatorEntry.display_name`：界面新建（带 `MINEIMAGE_UI_CREATED` 标记）的算子
 跟随文件 stem，其余仍显示 `spec.name`；原地改名只改文件名（必要时同步模板
 `name`），不改变算子 id。
+
+库内拖动整理由 `app/core/operator_files.py` 落地，语义是**文件 / 目录重命名 +
+字面量 `category` 同步**：`move_operator_file()` 把 `.py` 移到目标分类目录，并用
+AST 改写与源分类完全相等的 `OperatorSpec(category=...)` 字面量（元组 / 列表 /
+字符串，不导入用户文件）；`move_category_dir()` 移动整个用户分类目录，把目录内以
+源相对路径为前缀的字面量 `category` 重映射到新前缀。非字面量 `category` 无法安全
+改写：单个算子移动会直接拒绝并提示，分类移动不改这些文件，把说明放进
+`MoveOutcome.warnings` 合并到状态栏。移动只在算子 / 分类所属的那个用户扫描根内
+进行，不跨根；内置算子与没有用户目录的分类行（含只含内置算子的分类与仅由
+`spec.category` 形成的虚拟分组）不可拖，与内置分类同名的用户目录行只移动其中
+的用户文件；分类不能移入自身 / 后代，目标重名会报错；`custom/` 保留目录不能作为
+分类移动，隐藏 / 下划线目录也不参与分类整理。
+
+用户算子叶子拖动时 `MIME_OPERATOR` 与 `MIME_LIBRARY_MOVE` 同时存在：拖到画布由
+`GraphView` 按 `MIME_OPERATOR` 建节点，拖到库内由 OperatorLibrary 按
+`MIME_LIBRARY_MOVE` 移动，互不影响。移动成功后发 `refresh_requested`，按算子 id /
+新分类路径恢复选中，并通过 `status_message` 报告结果；同目录 / 同父级视为 no-op，
+只提示「已在目标分类中」且不刷新，`MoveOutcome.warnings` 合并进成功提示。
+**不提供同级排序，也不进入撤销栈**（文件系统操作不是 `QUndoCommand`）；拖错只能
+再拖回去。
 
 ### ReplaceOperatorDialog（`app/ui/replace_operator.py`）
 
